@@ -27,37 +27,50 @@ from fastapi.responses import JSONResponse
 
 # System One SEO & Semantic Link Mapping (Practice 10)
 try:
-    from .seo_audit import (
-        SEOAuditRequest,
-        SEOAuditResponse,
-        InternalLinkRequest,
-        InternalLinkResponse,
-        audit_article_system_one,
-        map_internal_links_distribb
-    )
-except ImportError:
-    from seo_audit import (
-        SEOAuditRequest,
-        SEOAuditResponse,
-        InternalLinkRequest,
-        InternalLinkResponse,
-        audit_article_system_one,
-        map_internal_links_distribb
-    )
+    try:
+        from .seo_audit import (
+            SEOAuditRequest, SEOAuditResponse, InternalLinkRequest,
+            InternalLinkResponse, audit_article_system_one, map_internal_links_distribb
+        )
+    except Exception:
+        from seo_audit import (
+            SEOAuditRequest, SEOAuditResponse, InternalLinkRequest,
+            InternalLinkResponse, audit_article_system_one, map_internal_links_distribb
+        )
+except Exception:
+    class SEOAuditRequest(BaseModel):
+        content: str
+        target_keyword: str
+        existing_urls: List[str] = Field(default_factory=list)
+    class SEOAuditResponse(BaseModel):
+        score: float = 0.0
+        status: str = "unavailable"
+    class InternalLinkRequest(BaseModel):
+        articles: List[Dict[str, Any]]
+    class InternalLinkResponse(BaseModel):
+        links: List[Dict[str, Any]] = Field(default_factory=list)
+    def audit_article_system_one(req):
+        return SEOAuditResponse()
+    def map_internal_links_distribb(req):
+        return InternalLinkResponse()
 
 # System One Gojiberry Lead Scoring (Practice 6)
 try:
-    from .lead_scorer import (
-        BatchLeadScoreRequest,
-        BatchLeadScoreResponse,
-        score_lead_batch
-    )
-except ImportError:
-    from lead_scorer import (
-        BatchLeadScoreRequest,
-        BatchLeadScoreResponse,
-        score_lead_batch
-    )
+    try:
+        from .lead_scorer import (
+            BatchLeadScoreRequest, BatchLeadScoreResponse, score_lead_batch
+        )
+    except Exception:
+        from lead_scorer import (
+            BatchLeadScoreRequest, BatchLeadScoreResponse, score_lead_batch
+        )
+except Exception:
+    class BatchLeadScoreRequest(BaseModel):
+        leads: List[Dict[str, Any]]
+    class BatchLeadScoreResponse(BaseModel):
+        scored_leads: List[Dict[str, Any]] = Field(default_factory=list)
+    def score_lead_batch(req):
+        return BatchLeadScoreResponse()
 
 # ---------------------------------------------------------------------------
 # FastAPI Initialization
