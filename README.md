@@ -5,7 +5,7 @@
 [![Tests](https://img.shields.io/badge/tests-9%20passed-brightgreen.svg)]()
 [![Latency](https://img.shields.io/badge/latency-10.8ms%20MPS-blue.svg)]()
 [![Model](https://img.shields.io/badge/model-DeBERTa--v3--small-orange.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)]()
+[![License](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE.md)
 [![Status](https://img.shields.io/badge/repo-public-success.svg)](https://github.com/Vibherpunk/hardtruth)
 
 ---
@@ -271,4 +271,4 @@ if res["probabilities"]["contradiction"] > 0.60:
 
 ## License
 
-MIT License. Open source and sovereign.
+Governed by the **PolyForm Noncommercial License 1.0.0**. Free for individuals, students, researchers, and personal noncommercial use. Commercial use by businesses, corporations, or revenue-generating entities requires an active **HardTruth Commercial Enterprise License**. See [LICENSE.md](LICENSE.md) for details.
