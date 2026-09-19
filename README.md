@@ -1,191 +1,188 @@
-# HardTruth: Autonomous Anti-Hallucination & Truth-Enforcement Engine
+# HardTruth: Autonomous Anti-Hallucination & Truth-Enforcement Gate
 
-> **Immunity from AI Catastrophes.** A 10ms local neurosymbolic circuit breaker that physically halts AI coding agents when they lie, stub code, or claim unverified success.
+> **Fail-Closed Verification for Coding Agents.** A local neurosymbolic circuit breaker that halts AI coding agents when they claim unverified test passes, emit empty stubs, or contradict physical execution facts.
 
-[![Tests](https://img.shields.io/badge/tests-9%20passed-brightgreen.svg)]()
-[![Latency](https://img.shields.io/badge/latency-10.8ms%20MPS-blue.svg)]()
+[![Tests](https://img.shields.io/badge/tests-16%20passed-brightgreen.svg)]()
 [![Model](https://img.shields.io/badge/model-DeBERTa--v3--small-orange.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)]()
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Status](https://img.shields.io/badge/repo-public-success.svg)](https://github.com/Vibherpunk/hardtruth)
 
 ---
 
-## The Problem: The "Tests Passed" Epidemic
+## The Problem: The "Tests Passed" Lie
 
-Large Language Models (LLMs) predict the next token based on statistical probability, not physical execution. 
+Large Language Models (LLMs) generate tokens based on text statistics, not physical operating system state.
 
-When an AI coding agent finishes writing code, the most probable continuation in human language is:
-> *"All 10 unit tests passed, the webhook is wired, and everything is working."*
+When an AI coding agent finishes writing code, the most probable continuation in natural language is often:
+> *"All 10 unit tests passed, the implementation is complete, and everything is working."*
 
-The model does not know if the code compiled. It does not know if the tests ran. It has no nervous system connecting its text generation to your operating system's kernel. Standard prompting (*"Be honest"*, *"Never lie"*) fails because **it attempts to solve a physical verification problem with linguistic persuasion**.
+The model has no intrinsic connection to your operating system's kernel. Standard prompting (*"Be honest"*, *"Never lie"*) fails because **linguistic persuasion cannot verify physical execution state**.
 
-Once an agent hallucinates a fake success log into its context window, **that hallucination becomes the accepted ground truth for all subsequent turns**. The agent enters a compounding death spiral, writing further code on top of non-existent foundations.
+Once an agent hallucinates a fake success statement into its context window, that claim becomes accepted context for subsequent turns, leading the agent into an compounding cycle of false assumptions.
 
 ---
 
-## The Solution: HardTruth Neurosymbolic Circuit Breaker
+## The Solution: Two-Phase Neurosymbolic Gate
 
-**HardTruth separates execution from verification.** It couples an unforgeable physical fact ledger with a local, non-autoregressive Natural Language Inference (NLI) cross-encoder running in 10.8 milliseconds.
+HardTruth separates execution from claim verification using two distinct layers:
+
+1. **Deterministic Execution Layer:** Captures real tool calls and exit statuses into a local append-only JSONL ledger (`ledger.jsonl`), and checks modified Python files for empty stubs using an Abstract Syntax Tree (AST) analyzer.
+2. **System One NLI Layer:** Runs a local `cross-encoder/nli-deberta-v3-small` model (via PyTorch MPS or CPU) to evaluate whether the agent's natural-language completion assertions are entailed by or contradict the physical execution facts.
+3. **Fail-Closed Behavior:** If the daemon is unreachable, the gate **fails closed**—refusing unverified factual claims with `decision: "continue"` so that unproven assertions degrade to manual verification rather than passing silently.
 
 ```mermaid
 sequenceDiagram
-    participant Agent as AI Coding Agent (Antigravity/Claude/Goose/Local LLM)
+    participant Agent as Antigravity Agent
     participant Ledger as Execution Ledger (ledger.jsonl)
     participant Hook as HardTruth Stop Hook
-    participant Engine as DeBERTa-v3 NLI (port 8000)
+    participant Daemon as HardTruth Daemon (port 8000)
 
-    Agent->>Ledger: Executes bash command / edit (PostToolUse Hook)
-    Note over Ledger: Records exit code, stdout, and git diffs
-    
+    Agent->>Ledger: Executes tool (PostToolUse Hook)
+    Note over Ledger: Stores tool, target, status, and error
+
     Agent->>Hook: Attempts turn completion ("All tests passed!")
-    Hook->>Ledger: Pulls physical execution facts (Premise)
-    Hook->>Engine: POST /v1/verify-claim (Premise + Agent Claim)
-    
-    alt Contradiction Detected (conf > 0.60)
-        Engine-->>Hook: Contradiction: 0.99, Entailment: 0.00 (10.8ms)
-        Hook->>Agent: 🚨 REJECT TURN: Traps agent in verification loop with failure proof
-        Note over Agent: Agent is forced to run real commands or admit failure
-    else Entailment Verified (conf > 0.90)
-        Engine-->>Hook: Entailment: 0.98, Contradiction: 0.01 (10.4ms)
-        Hook->>Agent: ALLOW TERMINATION: Delivers verified receipts to user
+    Hook->>Hook: Phase 1: Pure-Python deterministic AST & exit-code check
+    alt Deterministic Violation (No tests ran / tests failed / stubs)
+        Hook->>Agent: 🚨 REJECT TURN (decision: continue)
+    else Clean Claims
+        Hook->>Daemon: Phase 2: POST /v1/verify-claim (Premise + Claim)
+        alt Contradiction (conf >= 0.70) or Daemon Offline
+            Daemon-->>Hook: Contradiction >= 0.70 or Unreachable
+            Hook->>Agent: 🚨 REJECT TURN: Requires manual proof
+        else Entailment Verified
+            Daemon-->>Hook: Entailment verified (contradiction < 0.70)
+            Hook->>Agent: ALLOW TERMINATION (decision: allow)
+        end
     end
 ```
 
 ---
 
-## Core Use Cases & Hero Applications
+## Capabilities & Enforced Invariants
 
-HardTruth solves the reliability gap that prompt engineering, LLM-as-a-judge, and post-hoc observability fail to address:
+### 1. Stopping the "Fake Test Pass" Lie
+If an agent claims tests passed (e.g. *"All 10 unit tests passed"*), HardTruth inspects the execution ledger.
+* If **no commands** ran in the session, the turn is immediately halted (`decision: "continue"`).
+* If commands ran but **failed** (non-zero exit code or error output), the turn is immediately halted with a contradiction warning.
+* If matching test commands executed with exit code 0, the claim is verified.
 
-### 1. Upskilling Local Small Models (7B, 14B, 35B) on Long-Horizon Autonomous Runs
-* **The Problem:** Smaller open models (Qwen 2.5 Coder, WangYang 35B, DeepSeek Coder) suffer from severe autoregressive drift during multi-turn tasks. By turn 6–10, models experience probability pull toward linguistic closure and hallucinate completion. Once a fake success log enters the context window, **that hallucination poisons all future reasoning steps**, triggering an inescapable death spiral.
-* **The HardTruth Solution:** HardTruth acts as an external, non-autoregressive environmental oracle. The instant a small model asserts completion without physical receipts, HardTruth intercepts the exit, rejects termination, and feeds the exact physical failure trace back into the context window. This eliminates the "reasoning tax" and forces continuous exploration until working code is produced.
-* **Synthetic DPO / RL Data Factory:** Every completed autonomous run under HardTruth produces an unforgeable, verified trajectory (`prompt -> tool calls -> bash exit code 0 -> clean diffs`) ready for high-fidelity model alignment without human labeling.
+### 2. AST Anti-Stubbing Linter
+HardTruth's AST analyzer (`client/ast_checker.py`) checks every modified Python file. Any function reduced to a vacuous body is rejected before completion:
+* `pass`
+* `raise NotImplementedError` / `raise NotImplementedError()` / `raise NotImplementedError("...")`
+* `...` (Ellipsis)
+* `return True` or `return None` / bare `return` as the sole body statement
 
-### 2. Eliminating "The Tests Passed Lie" in Frontier Coding Agents
-* **The Problem:** Even frontier models (Claude 3.5 Sonnet, GPT-4o, Gemini 1.5 Pro) in harnesses like Devin, Cursor, Claude Code, and Antigravity routinely claim:
-  > *"All 10 unit tests in the test suite passed with 100% success."*
-  ...when tests never ran, or when `pytest` exited with status code 1.
-* **The HardTruth Solution:** HardTruth strips away the agent's ability to terminate with verbal reassurance. If the agent makes a completion or verification claim, HardTruth cross-references the deterministic execution ledger. If receipts are missing or contradictory, HardTruth returns `decision: "continue"`—physically trapping the agent into executing the actual `pytest`, `curl`, and `docker inspect` commands.
+**False Positive Suppression:** Legitimate abstract declarations are explicitly exempted:
+* Classes inheriting from `typing.Protocol`
+* Methods decorated with `@abstractmethod`
+* Functions decorated with `@overload`
 
-### 3. AST Anti-Stubbing & Scope-Dropping Sentinel
-* **The Problem:** Autonomous agents commonly take shortcuts under pressure: writing empty functions (`pass`, `raise NotImplementedError`), stubbing return mocks (`return True`), or disabling failing assertions to manufacture artificial green lights.
-* **The HardTruth Solution:** HardTruth features a deterministic Abstract Syntax Tree (AST) static analyzer that inspects every modified file before commit. Any function reduced to a dummy stub or empty body is instantly rejected with line-number receipts before it can contaminate git history.
+### 3. Machine-Wide Git Pre-Commit Gate
+`install.sh --global` configures a global git pre-commit hook (`~/.hardtruth/hooks/pre-commit`). Any commit across the entire machine containing empty stubs in staged `.py` files is rejected at the git level, protecting repositories from stubbed code regardless of which agent or tool wrote it.
 
-### 4. Autonomous SRE & Infrastructure Enclaves (Zero-Hallucination SLA)
-* **The Problem:** Autonomous agents executing database migrations, infrastructure provisioning (Terraform, Docker Compose), or cloud deployment scripts cannot afford a single hallucinated state.
-* **The HardTruth Solution:** Operates as a fail-closed gatekeeper in sovereign cloud containers. Enforces that zero destructive or mutative actions can execute without prior verified simulation and cryptographic receipts, enabling production $1,000/mo autonomous SRE retainers with a guaranteed zero-hallucination SLA.
-
-### 5. Universal Git Pre-Commit & Pull Request Gate
-* **The Problem:** Teams running multiple agents across local terminals, IDEs, and background workers have no centralized way to ensure all code committed to git actually works.
-* **The HardTruth Solution:** Installed machine-wide at `~/.hardtruth/hooks/pre-commit`, HardTruth intercepts any `git commit` attempt across the entire system. Any agent (or human) attempting to commit stubbed code or unverified changes is blocked at the git level.
-
-### 6. Continuous Compliance & Regulatory Audit Trails (SOC 2, EU AI Act, NAIC)
-* **The Problem:** Regulated enterprise deployments require provable, explainable verification that autonomous AI decisions were grounded in physical evidence.
-* **The HardTruth Solution:** HardTruth generates tamper-evident, append-only execution ledgers (`ledger.jsonl`) cryptographically linking agent claims to verified shell exit codes, providing audit-ready proof of truth-enforcement.
+### 4. Circuit Breaker Escape Hatch
+To prevent infinite loops when an agent cannot resolve an issue, HardTruth maintains a counter in `~/.hardtruth/halts/` (isolated with mode `0o700` and hashed conversation IDs). After 3 consecutive halts on the same conversation, the circuit breaker releases with a visible warning in the returned `reason`.
 
 ---
 
-## Competitive Differentiation: Why Existing Tools Fail
+## Execution Ledger Schema
 
-| Category | Representative Tools | Why They Fail Where HardTruth Succeeds |
-| :--- | :--- | :--- |
-| **Input / Prompt Guardrails** | ProtectAI, NeMo Guardrails | Only protect against inbound user attacks (jailbreaks/injections). They do **not** check if the agent is lying about its own actions. |
-| **RAG Factuality Checkers** | Cleanlab TLM, Patronus AI, Galileo | Evaluate static text-to-text retrieval (PDF summaries). They have **zero connection to the OS kernel, terminal commands, or git diffs**. |
-| **Post-Hoc Observability** | LangSmith, Braintrust, Arize Phoenix | **Passive loggers.** They record that an agent hallucinated *after* the turn is finished. They cannot intercept runtime `Stop` hooks to block completion. |
-| **Cloud LLM-as-a-Judge** | GPT-4o / Claude Evals | **Slow, expensive, and hallucinates itself.** Takes 2,000ms – 15,000ms, costs $0.03/check, and suffers from autoregressive sycophancy. |
-| **HardTruth Neurosymbolic Shield** | **HardTruth** | **Active 10.8ms circuit breaker.** Evaluates unforgeable physical bash exit codes via local NLI cross-encoder, physically halting the agent until real tests pass. |
+The deterministic ledger is stored at `~/.gemini/antigravity-cli/ledger.jsonl` (or configured via `HARDTRUTH_LEDGER_PATH`). Each entry is a single JSON record:
 
----
-
-## Universal Machine-Wide Architecture
-
-HardTruth is installed **once per machine** and provides three concentric layers of protection across all agents:
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    YOUR OPERATING SYSTEM                        │
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │ Layer 1: Universal Git Pre-Commit Gate (~/.hardtruth/)    │  │
-│  │ (Intercepts ANY agent or script attempting to git commit) │  │
-│  └─────────────────────────────┬─────────────────────────────┘  │
-│                                │                                │
-│  ┌─────────────────────────────▼─────────────────────────────┐  │
-│  │ Layer 2: Agent Harness Hooks (hooks.json)                 │  │
-│  │ (Antigravity CLI/IDE, Claude Code, Goose, OpenCode)       │  │
-│  └─────────────────────────────┬─────────────────────────────┘  │
-│                                │                                │
-│  ┌─────────────────────────────▼─────────────────────────────┐  │
-│  │ Layer 3: Resident Truth Daemon (Port 8000 / Unix Socket)  │  │
-│  │ (DeBERTa-v3 Cross-Encoder • AST Analyzer • Fact Ledger)   │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+```json
+{
+  "timestamp": 1726792345.12,
+  "conversationId": "test-conv-uuid",
+  "stepIdx": 8,
+  "tool": "run_command",
+  "target": "python3 -m unittest test_daemon.py",
+  "status": "success",
+  "error": null
+}
 ```
 
-1. **Harness Hook Layer:** Deep integration with Antigravity, Claude Code, and Goose via lifecycle hooks (`PostToolUse` records facts; `Stop` intercepts model exit).
-2. **Global Git Layer:** A machine-wide pre-commit hook (`~/.hardtruth/hooks/pre-commit`) blocks any agent on the system—regardless of framework—from committing empty stubs or unverified code.
-3. **Universal Socket / HTTP Layer:** Any custom agent (LangGraph, CrewAI, AutoGen, Python, TypeScript, Go) can query `http://127.0.0.1:8000/v1/verify-claim` or `/var/run/hardtruth/sentinel.sock` in under 3 lines of code.
+* `tool`: The tool invoked (`run_command`, `write_to_file`, `replace_file_content`, `view_file`).
+* `target`: The command string or absolute file path.
+* `status`: `"success"` or `"error"`.
+* `error`: Error message or non-zero exit code string if the command failed.
 
 ---
 
 ## Performance Benchmarks
 
-| Metric | Apple Silicon (M2/M3 MPS) | Linux VPS (CPU ONNX) | Cloud LLM-as-a-Judge |
-| :--- | :--- | :--- | :--- |
-| **Inference Latency** | **10.8 ms** | **18.5 ms – 110 ms** | 2,000 ms – 15,000 ms |
-| **RAM Footprint** | **~280 MB** | **~150 MB** | > 16 GB (or external SaaS) |
-| **Throughput (Batch 16)** | **~1,100 checks/sec** | **~220 checks/sec** | ~2 checks/sec |
-| **Token Cost** | **$0.00 (Local)** | **$0.00 (Local)** | $0.02 – $0.08 per check |
-| **Hallucination Risk** | **0.0% (Discriminative)**| **0.0% (Discriminative)**| High (Autoregressive) |
+Measured using the committed benchmark reproduction script [`benchmarks/benchmark.py`](./benchmarks/benchmark.py):
 
----
+| Metric | Docker Container (Linux CPU on Apple Silicon) |
+| :--- | :--- |
+| **Median Latency (p50)** | **~73.2 ms** |
+| **p90 Latency** | **~82.3 ms** |
+| **p99 Latency** | **~86.5 ms** |
+| **RAM Footprint (RSS)** | **~528 MB** (Python 3.11 + PyTorch CPU + DeBERTa-v3) |
+| **Throughput (Sequential)**| **~13.7 req/sec** |
 
-## Commercial & Cloud Hosting Architecture
+*Hardware: Apple Silicon Mac (ARM64), OrbStack Linux Docker Engine, PyTorch CPU wheel.*
 
-### Can it be hosted on OpenRouter?
-**No.** OpenRouter is an aggregator for *autoregressive text generation* (`/v1/chat/completions`). HardTruth is a **stateful neurosymbolic execution gate**: it pairs a local append-only execution ledger with a sequence-pair classification cross-encoder.
-
-### Where to Host the Commercial Version:
-1. **Sovereign Cloud VPS (Hostinger / Hetzner / OVH):**
-   - Run HardTruth inside a lightweight Docker container (`harbor-system-one-daemon` or `hardtruth-daemon`).
-   - Mount `/var/run/hardtruth/sentinel.sock` into multi-tenant client worker containers.
-   - Zero external cloud dependencies; 100% data sovereignty.
-2. **Serverless GPU / CPU (RunPod Serverless / Modal):**
-   - Deploy as a high-throughput verification microservice capable of scaling to thousands of concurrent agent checks.
-3. **Commercial Monetization Models:**
-   - **Open-Core Local Substrate (Free OSS):** The engine is free and open source to drive universal developer adoption.
-   - **HardTruth Fleet C2 ($99 – $499/mo):** Centralized dashboard aggregating tamper-evident execution ledgers, hallucination attempt heatmaps, and audit traces across an enterprise's entire agent fleet.
-   - **Sovereign SRE Retainers ($1,000/mo):** Guaranteed zero-hallucination autonomous operations for client infrastructure.
-   - **SOC 2 / EU AI Act Compliance Logs:** Export cryptographically verifiable proof that autonomous agents were gated by deterministic truth verification.
+To reproduce benchmarks locally:
+```bash
+python3 benchmarks/benchmark.py http://127.0.0.1:8000 20
+```
 
 ---
 
 ## Quickstart
 
-### 1-Line Machine Install
+### Prerequisites
+* Python 3.10+
+* Docker & Docker Compose (optional, for daemon container)
+
+### 1. Clone Repository & Install Dependencies
 ```bash
 git clone https://github.com/Vibherpunk/hardtruth.git
 cd hardtruth
-bash install.sh
+pip install -r requirements.txt
 ```
 
-### Run Live Verification Tests
+### 2. Start Verification Daemon
+You can run the daemon directly:
 ```bash
+python3 daemon/app.py
+```
+Or start via Docker Compose:
+```bash
+docker compose -f docker/docker-compose.yml up --build -d
+```
+Verify the daemon is healthy:
+```bash
+curl -s http://127.0.0.1:8000/health
+```
+
+### 3. Install Hooks
+```bash
+# Installs Antigravity lifecycle hook and library:
+bash install.sh
+
+# Optional: To enable machine-wide git commit gate across all repositories:
+bash install.sh --global
+```
+
+### 4. Run Test Suite
+```bash
+# Run against live daemon:
 python3 tests/test_live.py
+
+# Run with daemon unreachable (verifies fail-closed behavior):
+SYSTEM_ONE_URL=http://127.0.0.1:9 python3 tests/test_live.py
 ```
-Outputs 9 passing tests verifying fake pass blocking, contradiction detection, AST stub blocking, conversational prose allowance, and evasion resistance:
-```
-Ran 9 tests in 0.722s
-OK
-```
+
+All 16 tests pass with the daemon online and with it unreachable.
 
 ---
 
-## Integration Guides
+## Integration
 
 ### 1. Antigravity (CLI & IDE)
-Configured automatically via `~/.gemini/config/hooks.json`:
+Configured automatically by `install.sh` in `~/.gemini/config/hooks.json`:
 ```json
 {
   "hardtruth": {
@@ -205,34 +202,37 @@ Configured automatically via `~/.gemini/config/hooks.json`:
 }
 ```
 
-### 2. Python Agent Frameworks (LangGraph, CrewAI, AutoGen)
-Embed the zero-dependency client in any agent loop:
+### 2. Python Agent Loops (Custom Scripts)
+Embed the client directly into custom Python agents:
 ```python
-from client.hardtruth_client import HardTruthClient
+from client.hardtruth_client import HardTruthClient, CONTRADICTION_THRESHOLD
 
-client = HardTruthClient()
-# Evaluate agent's draft message against execution facts
-res = client.verify_claim(
-    premise="COMMAND: 'pytest'. STATUS: FAILED (exit 1).",
-    hypothesis="All 10 unit tests passed."
-)
+client = HardTruthClient("http://127.0.0.1:8000")
 
-if res["probabilities"]["contradiction"] > 0.60:
-    raise RuntimeError("🚨 HardTruth caught an unverified claim.")
+# Check if daemon is responsive
+if client.is_daemon_online():
+    res = client.verify_claim(
+        premise="COMMAND: 'pytest tests/'. STATUS: FAILED (exit status 1).",
+        hypothesis="All 10 unit tests passed completely."
+    )
+    if res and res["probabilities"]["contradiction"] >= CONTRADICTION_THRESHOLD:
+        print("🚨 Blocked: Agent claim contradicts execution ledger!")
 ```
 
 ---
 
 ## Repository Structure
 
-* `daemon/app.py`: FastAPI daemon hosting the DeBERTa-v3 sequence-pair cross-encoder and System One endpoints.
-* `client/hardtruth_hook.py`: Production lifecycle hook for Antigravity, Claude Code, and Goose.
-* `client/hardtruth_client.py`: Zero-dependency Python client with automatic fallback to deterministic AST checks.
-* `docker/`: 150MB CPU ONNX Docker manifest for VPS and server environments.
-* `tests/test_live.py`: Full verification suite.
+* `daemon/app.py`: Dedicated FastAPI verification daemon hosting `cross-encoder/nli-deberta-v3-small` with thread-safe lazy loading and `/health` monitoring.
+* `client/ast_checker.py`: Shared AST stub detection module (detects `pass`, `NotImplementedError`, `...`, `return True/None`; exempts `@abstractmethod`, `@overload`, and `Protocol`).
+* `client/hardtruth_hook.py`: Antigravity lifecycle hook (`PostToolUse` and `Stop`) with fail-closed gate logic.
+* `client/hardtruth_client.py`: Python client library with `/health` polling and deterministic AST fallback.
+* `docker/`: Dockerfile and docker-compose.yml for Linux/VPS deployment using official PyTorch CPU wheels.
+* `tests/test_live.py`: 16-case test suite verifying fail-closed execution, stub detection, filter safety, and contradiction detection.
+* `benchmarks/benchmark.py`: Committed benchmark reproduction script measuring latency and memory.
 
 ---
 
 ## License
 
-MIT License. Open source and sovereign.
+[MIT License](./LICENSE)
