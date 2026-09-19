@@ -238,7 +238,7 @@ def handle_stop(payload: dict) -> dict:
         re.IGNORECASE
     )
     descriptive_filter = re.compile(
-        r"^\s*(?:quote:|example:|sample:|(?:when|if|for example|e\.g\.|every time|how |the system|the hook|this means|in order to|as an example|such as|to prevent|by default|instead of|note that)\b)",
+        r"^\s*(?:quote:|example:|sample:|(?:when|if|for example|e\.g\.|every time|how |the system|the hook|this means|in order to|as an example|such as|to prevent|by default|instead of|note that|on x\b|on twitter|in our search|in research|search results|discussions across|discussions on|users report|practitioners note|engineers note|people are|the community|articles|papers|studies)\b)",
         re.IGNORECASE
     )
     imperative_filter = re.compile(
