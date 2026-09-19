@@ -76,7 +76,7 @@ sequenceDiagram
 
 ### 1-Line Machine Install
 ```bash
-git clone https://github.com/adamrmatar/hardtruth.git
+git clone https://github.com/Vibherpunk/hardtruth.git
 cd hardtruth
 bash install.sh
 ```
