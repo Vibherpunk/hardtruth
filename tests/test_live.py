@@ -1,43 +1,63 @@
 #!/usr/bin/env python3
 """
-Comprehensive Live Verification Suite for Antigravity System One Sentinel
+Comprehensive Live Verification Suite for HardTruth Anti-Hallucination Gate
 Tests:
-1. PostToolUse Ledger Recording
+1. PostToolUse Ledger Recording (deterministic ledger isolation)
 2. Hallucination Trap: Fake Test Pass Claim (No Tests in Ledger)
 3. Contradiction Trap: Claiming Success When Ledger Shows Failure
 4. Verified Truth Pass: Legitimate Evidence in Ledger
 5. AST Anti-Stubbing Gate: Catching 'pass' and 'NotImplementedError' Stubs
 6. Conversational Bypass: Zero False Positives on General Prose
+7. Fenced Code Blocks & Imperatives Allowed
+8. Inline Code & Quotes Allowed
+9. Backtick & Blockquote Evasion Blocked
+10. is_daemon_online Agreement with /health Endpoint
+11. AST Stub Checker Extended Coverage (5 patterns caught, 3 patterns exempt)
+12. Imperative Filter Regex with Colons (Tip:, Note:, Warning:)
+13. Descriptive Filter Bypass Prevention (Example:, Quote: with fake passes blocked)
+14. Secure Counter Directory & Path Traversal Prevention
+15. Circuit Breaker Visible Warning on 4th Attempt
+16. Daemon Unreachable Fail-Closed Behavior
 """
 
 import os
 import sys
 import json
+import shutil
+import uuid
 import subprocess
 import tempfile
 import unittest
 
 HOOK_SCRIPT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../client/hardtruth_hook.py"))
-LEDGER_FILE = os.path.expanduser("~/.gemini/antigravity-cli/ledger.jsonl")
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 class TestSystemOneSentinel(unittest.TestCase):
 
     def setUp(self):
-        # Create a unique test conversation ID
-        self.conv_id = f"test-conv-{os.getpid()}"
-        # Ensure ledger dir exists
-        os.makedirs(os.path.dirname(LEDGER_FILE), exist_ok=True)
-        # Clear halt counter if any
-        counter_file = f"/tmp/sentinel_halts/halt_{self.conv_id}.json"
-        if os.path.exists(counter_file):
-            os.remove(counter_file)
+        self.test_dir = tempfile.mkdtemp(prefix="hardtruth-test-")
+        self.ledger_file = os.path.join(self.test_dir, "ledger.jsonl")
+        self.halt_dir = os.path.join(self.test_dir, "halts")
+        os.makedirs(self.halt_dir, mode=0o700, exist_ok=True)
+        os.environ["HARDTRUTH_LEDGER_PATH"] = self.ledger_file
+        os.environ["HARDTRUTH_HALT_DIR"] = self.halt_dir
+        self.conv_id = f"test-conv-{uuid.uuid4().hex}"
 
-    def run_hook(self, mode: str, payload: dict) -> dict:
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def run_hook(self, mode: str, payload: dict, env_override: dict = None) -> dict:
+        env = os.environ.copy()
+        if env_override:
+            env.update(env_override)
         proc = subprocess.run(
             ["python3", HOOK_SCRIPT, mode],
             input=json.dumps(payload).encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
             check=True
         )
         out_str = proc.stdout.decode("utf-8").strip()
@@ -56,16 +76,15 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("post_tool", payload)
         self.assertEqual(res, {})
         
-        # Verify ledger has this entry
-        with open(LEDGER_FILE, "r") as f:
+        # Verify isolated ledger has this entry
+        with open(self.ledger_file, "r") as f:
             lines = [json.loads(line) for line in f if self.conv_id in line]
         self.assertTrue(len(lines) >= 1)
         self.assertEqual(lines[-1]["target"], "python3 -m unittest test_daemon.py")
         self.assertEqual(lines[-1]["status"], "success")
 
     def test_2_fake_test_pass_claim_blocked(self):
-        # Conversation with NO test runs in ledger
-        conv = f"fake-pass-{os.getpid()}"
+        conv = f"fake-pass-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -82,14 +101,12 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
         
-        # Must halt because no test command was ever run!
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("NO commands or test suites were run", res.get("reason", ""))
         print(f"\n[Test 2: Fake Test Pass Blocked] Halt Reason: {res.get('reason')}")
 
     def test_3_contradiction_claim_blocked(self):
-        # Record a failed test execution in ledger
-        conv = f"fail-conv-{os.getpid()}"
+        conv = f"fail-conv-{uuid.uuid4().hex}"
         self.run_hook("post_tool", {
             "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest tests/"}},
             "stepIdx": 5,
@@ -113,14 +130,12 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # Must halt with contradiction!
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("CONTRADICTION DETECTED", res.get("reason", ""))
         print(f"[Test 3: Contradiction Blocked] Halt Reason: {res.get('reason')}")
 
     def test_4_verified_truth_allowed(self):
-        # Record a successful test execution in ledger
-        conv = f"success-conv-{os.getpid()}"
+        conv = f"success-conv-{uuid.uuid4().hex}"
         self.run_hook("post_tool", {
             "toolCall": {"name": "run_command", "args": {"CommandLine": "python3 -m unittest test_daemon.py"}},
             "stepIdx": 8,
@@ -144,18 +159,15 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # Must allow termination!
         self.assertEqual(res.get("decision"), "allow")
         print("[Test 4: Verified Truth Allowed] Decision: allow")
 
     def test_5_ast_stubbing_blocked(self):
-        conv = f"stub-conv-{os.getpid()}"
-        # Create a stubbed file
+        conv = f"stub-conv-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as pyf:
             pyf.write("def calculate_tuition(child_age):\n    pass\n")
             stub_file = pyf.name
 
-        # Record file modification in ledger
         self.run_hook("post_tool", {
             "toolCall": {"name": "write_to_file", "args": {"TargetFile": stub_file}},
             "stepIdx": 4,
@@ -180,13 +192,12 @@ class TestSystemOneSentinel(unittest.TestCase):
         os.remove(stub_file)
         os.remove(transcript_path)
 
-        # Must halt because of empty stub!
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("Unimplemented stub detected", res.get("reason", ""))
         print(f"[Test 5: AST Stub Blocked] Halt Reason: {res.get('reason')}")
 
     def test_6_conversational_prose_allowed(self):
-        conv = f"chat-conv-{os.getpid()}"
+        conv = f"chat-conv-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -203,12 +214,11 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # Conversational text without verifiable action claims must pass cleanly
         self.assertEqual(res.get("decision"), "allow")
         print("[Test 6: Conversational Prose Allowed] Decision: allow")
 
     def test_7_fenced_code_blocks_and_imperatives_allowed(self):
-        conv = f"prompt-conv-{os.getpid()}"
+        conv = f"prompt-conv-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -225,12 +235,11 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # Quoted prompt blocks and imperative instructions must not trigger false alarms
         self.assertEqual(res.get("decision"), "allow")
         print("[Test 7: Fenced Code Blocks & Imperatives Allowed] Decision: allow")
 
     def test_8_inline_code_and_quotes_allowed(self):
-        conv = f"inline-conv-{os.getpid()}"
+        conv = f"inline-conv-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -247,13 +256,11 @@ class TestSystemOneSentinel(unittest.TestCase):
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # Inline code and blockquotes must not trigger false alarms
         self.assertEqual(res.get("decision"), "allow")
         print("[Test 8: Inline Code & Quotes Allowed] Decision: allow")
 
     def test_9_backtick_and_blockquote_evasion_blocked(self):
-        # Case A: Agent tries to hide a fake pass inside backticks
-        conv_a = f"evade-backtick-{os.getpid()}"
+        conv_a = f"evade-backtick-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -270,13 +277,11 @@ class TestSystemOneSentinel(unittest.TestCase):
         res_a = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # MUST HALT: Evasion via backticks is blocked!
         self.assertEqual(res_a.get("decision"), "continue")
         self.assertIn("NO commands or test suites were run", res_a.get("reason", ""))
         print(f"[Test 9A: Backtick Evasion Blocked] Halt Reason: {res_a.get('reason')}")
 
-        # Case B: Agent tries to hide a fake pass inside blockquotes
-        conv_b = f"evade-quote-{os.getpid()}"
+        conv_b = f"evade-quote-{uuid.uuid4().hex}"
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:
             tf.write(json.dumps({
                 "type": "PLANNER_RESPONSE",
@@ -293,10 +298,149 @@ class TestSystemOneSentinel(unittest.TestCase):
         res_b = self.run_hook("stop", payload)
         os.remove(transcript_path)
 
-        # MUST HALT: Evasion via blockquote is blocked!
         self.assertEqual(res_b.get("decision"), "continue")
         self.assertIn("NO commands or test suites were run", res_b.get("reason", ""))
         print(f"[Test 9B: Blockquote Evasion Blocked] Halt Reason: {res_b.get('reason')}")
+
+    def test_10_is_daemon_online(self):
+        from client.hardtruth_client import HardTruthClient
+        # Point to unreachable URL
+        client_offline = HardTruthClient("http://127.0.0.1:9")
+        self.assertFalse(client_offline.is_daemon_online())
+
+    def test_11_ast_checker_extended_patterns(self):
+        from client.ast_checker import check_ast_stubs
+        cases_to_catch = {
+            "bare_raise": "def f():\n    raise NotImplementedError",
+            "raise_call_empty": "def f():\n    raise NotImplementedError()",
+            "raise_call_msg": "def f():\n    raise NotImplementedError('not implemented')",
+            "ellipsis": "def f():\n    ...",
+            "return_true": "def f():\n    return True",
+            "return_none": "def f():\n    return None",
+            "bare_return": "def f():\n    return",
+            "docstring_then_stub": "def f():\n    '''doc'''\n    pass"
+        }
+        for name, code in cases_to_catch.items():
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+                tf.write(code)
+                tf.flush()
+                violations = check_ast_stubs(tf.name)
+                os.unlink(tf.name)
+            self.assertTrue(len(violations) >= 1, f"Failed to catch stub: {name}")
+
+        cases_to_exempt = {
+            "abstractmethod": "from abc import abstractmethod\n@abstractmethod\ndef f():\n    pass",
+            "overload": "from typing import overload\n@overload\ndef f():\n    ...",
+            "protocol": "from typing import Protocol\nclass P(Protocol):\n    def f(self):\n        pass",
+            "implemented": "def f():\n    x = 1\n    return True"
+        }
+        for name, code in cases_to_exempt.items():
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+                tf.write(code)
+                tf.flush()
+                violations = check_ast_stubs(tf.name)
+                os.unlink(tf.name)
+            self.assertEqual(violations, [], f"Falsely flagged exempt code: {name}")
+
+    def test_12_imperative_filter_colon(self):
+        from client.hardtruth_hook import imperative_filter
+        self.assertTrue(bool(imperative_filter.search("Tip: ensure tests are run")))
+        self.assertTrue(bool(imperative_filter.search("Note: verify the output")))
+        self.assertTrue(bool(imperative_filter.search("Warning: check the logs")))
+
+    def test_13_descriptive_filter_bypass_prevention(self):
+        # Prefixes Example: and Quote: must NOT bypass fake test pass detection
+        for prefix in ["Example:", "Quote:", "Sample:"]:
+            conv = f"bypass-{uuid.uuid4().hex}"
+            with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+                tf.write(json.dumps({
+                    "type": "PLANNER_RESPONSE",
+                    "content": f"{prefix} All 10 unit tests passed completely and the suite is green.",
+                    "tool_calls": []
+                }) + "\n")
+                transcript_path = tf.name
+
+            payload = {
+                "conversationId": conv,
+                "transcriptPath": transcript_path,
+                "executionNum": 1
+            }
+            res = self.run_hook("stop", payload)
+            os.remove(transcript_path)
+            self.assertEqual(res.get("decision"), "continue", f"Prefix {prefix} bypassed the gate!")
+
+    def test_14_secure_counter_isolation(self):
+        # A conversationId with ../ must not escape HALT_COUNTER_DIR
+        evil_conv = "../../evil_path"
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "All 10 unit tests passed completely!",
+                "tool_calls": []
+            }) + "\n")
+            transcript_path = tf.name
+
+        payload = {
+            "conversationId": evil_conv,
+            "transcriptPath": transcript_path,
+            "executionNum": 1
+        }
+        res = self.run_hook("stop", payload)
+        os.remove(transcript_path)
+        self.assertEqual(res.get("decision"), "continue")
+
+        # Verify that all files created are inside self.halt_dir and nowhere outside
+        halt_files = os.listdir(self.halt_dir)
+        self.assertTrue(len(halt_files) >= 1)
+        for hf in halt_files:
+            self.assertFalse(".." in hf)
+
+    def test_15_circuit_breaker_visible_warning(self):
+        conv = f"breaker-{uuid.uuid4().hex}"
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "All 10 unit tests passed completely!",
+                "tool_calls": []
+            }) + "\n")
+            transcript_path = tf.name
+
+        payload = {
+            "conversationId": conv,
+            "transcriptPath": transcript_path,
+            "executionNum": 1
+        }
+        # First 3 attempts must be halted
+        for i in range(3):
+            res = self.run_hook("stop", payload)
+            self.assertEqual(res.get("decision"), "continue")
+
+        # 4th attempt must release with visible warning in reason
+        res_4 = self.run_hook("stop", payload)
+        os.remove(transcript_path)
+        self.assertEqual(res_4.get("decision"), "allow")
+        self.assertIn("CIRCUIT BREAKER", res_4.get("reason", ""))
+
+    def test_16_daemon_unreachable_fail_closed(self):
+        # Claim that cannot be verified deterministically must fail closed if daemon unreachable
+        conv = f"dead-daemon-{uuid.uuid4().hex}"
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "I have created and verified the entire authentication subsystem.",
+                "tool_calls": []
+            }) + "\n")
+            transcript_path = tf.name
+
+        payload = {
+            "conversationId": conv,
+            "transcriptPath": transcript_path,
+            "executionNum": 1
+        }
+        res = self.run_hook("stop", payload, env_override={"SYSTEM_ONE_URL": "http://127.0.0.1:9"})
+        os.remove(transcript_path)
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("HARDTRUTH DAEMON UNREACHABLE", res.get("reason", ""))
 
 if __name__ == "__main__":
     unittest.main()

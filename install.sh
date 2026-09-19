@@ -6,14 +6,30 @@ echo "  HardTruth: Autonomous Anti-Hallucination & Truth Shield"
 echo "=========================================================="
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK_SRC="$REPO_ROOT/client/hardtruth_hook.py"
+HARDTRUTH_DIR="$HOME/.hardtruth"
+HARDTRUTH_LIB="$HARDTRUTH_DIR/lib/hardtruth"
+GLOBAL_HOOKS_DIR="$HARDTRUTH_DIR/hooks"
+HALTS_DIR="$HARDTRUTH_DIR/halts"
 
-# 1. Antigravity Configuration
+# 1. Install library package to ~/.hardtruth/lib
+mkdir -p "$HARDTRUTH_LIB"
+mkdir -p "$GLOBAL_HOOKS_DIR"
+mkdir -p "$HALTS_DIR"
+chmod 700 "$HALTS_DIR"
+
+cp "$REPO_ROOT/client/ast_checker.py" "$HARDTRUTH_LIB/ast_checker.py"
+cp "$REPO_ROOT/client/hardtruth_client.py" "$HARDTRUTH_LIB/hardtruth_client.py"
+cp "$REPO_ROOT/client/hardtruth_hook.py" "$HARDTRUTH_LIB/hardtruth_hook.py"
+touch "$HARDTRUTH_LIB/__init__.py"
+echo "✓ HardTruth client library installed to $HARDTRUTH_LIB"
+
+# 2. Antigravity Configuration
 ANTIGRAVITY_CONFIG_DIR="$HOME/.gemini/config"
 if [ -d "$HOME/.gemini" ]; then
     echo "Configuring Antigravity global hooks..."
     mkdir -p "$ANTIGRAVITY_CONFIG_DIR"
-    cp "$HOOK_SRC" "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
+    cp "$REPO_ROOT/client/hardtruth_hook.py" "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
+    cp "$REPO_ROOT/client/ast_checker.py" "$ANTIGRAVITY_CONFIG_DIR/ast_checker.py"
     chmod +x "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
     
     cat > "$ANTIGRAVITY_CONFIG_DIR/hooks.json" << 'EOF'
@@ -45,32 +61,62 @@ EOF
     echo "✓ Antigravity configured with HardTruth Stop and PostToolUse hooks."
 fi
 
-# 2. Global Git Hooks Configuration
-GLOBAL_HOOKS_DIR="$HOME/.hardtruth/hooks"
-mkdir -p "$GLOBAL_HOOKS_DIR"
-cat > "$GLOBAL_HOOKS_DIR/pre-commit" << EOF
+# 3. Global Git Hooks Configuration
+cat > "$GLOBAL_HOOKS_DIR/pre-commit" << 'EOF'
 #!/bin/bash
 # HardTruth Global Pre-Commit Gate
 python3 -c "
 import sys, os
-sys.path.insert(0, '${REPO_ROOT}')
-from client.hardtruth_client import HardTruthClient
-client = HardTruthClient()
-# Check all staged python files for vacuous stubs
+sys.path.insert(0, os.path.expanduser('~/.hardtruth/lib'))
+from hardtruth.ast_checker import check_ast_stubs
 import subprocess
-files = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+try:
+    files = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
+except Exception:
+    sys.exit(0)
 stubs = []
 for f in files:
     if f.endswith('.py') and os.path.exists(f):
-        stubs.extend(client.check_ast_stubs(f))
+        stubs.extend(check_ast_stubs(f))
 if stubs:
-    print('🚨 HardTruth rejected commit: Unimplemented dummy stub detected:', stubs[0], file=sys.stderr)
+    print('🚨 HardTruth rejected commit: Unimplemented dummy stub detected: ' + stubs[0], file=sys.stderr)
     sys.exit(1)
 "
 EOF
 chmod +x "$GLOBAL_HOOKS_DIR/pre-commit"
-git config --global core.hooksPath "$GLOBAL_HOOKS_DIR"
-echo "✓ Configured global Git pre-commit hook in $GLOBAL_HOOKS_DIR."
+echo "✓ Pre-commit hook written to $GLOBAL_HOOKS_DIR/pre-commit"
+
+# Parse CLI flags for opt-in global git hook installation
+INSTALL_GLOBAL_HOOK=false
+for arg in "$@"; do
+    if [ "$arg" == "--global" ] || [ "$arg" == "--install-global-hook" ]; then
+        INSTALL_GLOBAL_HOOK=true
+    fi
+done
+
+# If not passed via flag and running interactively, prompt user
+if [ "$INSTALL_GLOBAL_HOOK" = false ] && [ -t 0 ]; then
+    echo ""
+    read -p "Install machine-wide git hook via 'git config --global core.hooksPath'? [y/N]: " choice
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        INSTALL_GLOBAL_HOOK=true
+    fi
+fi
+
+if [ "$INSTALL_GLOBAL_HOOK" = true ]; then
+    CURRENT_HOOKS="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+    if [ -n "$CURRENT_HOOKS" ] && [ "$CURRENT_HOOKS" != "$GLOBAL_HOOKS_DIR" ]; then
+        echo "⚠️  WARNING: An existing global core.hooksPath is set: $CURRENT_HOOKS"
+        echo "   Backing up previous hooks path to $HARDTRUTH_DIR/previous_hooksPath"
+        echo "$CURRENT_HOOKS" > "$HARDTRUTH_DIR/previous_hooksPath"
+    fi
+    git config --global core.hooksPath "$GLOBAL_HOOKS_DIR"
+    echo "✓ Enabled machine-wide git commit gate: git config --global core.hooksPath $GLOBAL_HOOKS_DIR"
+else
+    echo "ℹ️  Global git hooksPath not modified."
+    echo "   To enable machine-wide git commit protection, run:"
+    echo "     bash install.sh --global"
+fi
 
 echo "=========================================================="
 echo "✓ HardTruth installed successfully."
