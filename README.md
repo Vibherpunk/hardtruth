@@ -53,24 +53,48 @@ sequenceDiagram
 
 ---
 
-## Four Hero Use Cases
+## Core Use Cases & Hero Applications
 
-### 1. Upskilling Local Small Models (7B, 14B, 35B) on Long-Horizon Runs
-* **The Problem:** Smaller open models (Qwen 2.5 Coder, WangYang 35B, DeepSeek) suffer from severe autoregressive drift on multi-step tasks. By turn 6–10, they prioritize linguistic closure and hallucinate completion, poisoning their context window.
-* **The HardTruth Fix:** HardTruth acts as an external, non-hallucinating environment oracle. The moment a 7B model claims victory without physical receipts, HardTruth rejects the stop, feeds the exact execution error back into context, and forces the model to keep searching. 
-* **Synthetic DPO / RL Data:** Every completed run under HardTruth yields a guaranteed, zero-hallucination execution trajectory (`prompt -> tool calls -> passing bash exit code 0 -> clean diffs`) ready for direct DPO/RL fine-tuning.
+HardTruth solves the reliability gap that prompt engineering, LLM-as-a-judge, and post-hoc observability fail to address:
 
-### 2. Keeping Frontier Cloud Models (Claude 3.5 Sonnet, GPT-4o, Gemini) Honest
-* **The Problem:** Frontier models frequently engage in "scope dropping" and fake pass assertions when context windows grow large or when tasks involve tricky edge cases.
-* **The HardTruth Fix:** Strips away the model's ability to terminate with verbal reassurance. If Claude or GPT claims *"The Docker container is healthy and the API returns 200"*, but the ledger lacks an actual `curl` or `docker inspect` call, HardTruth blocks termination and forces the agent to physically run the check.
+### 1. Upskilling Local Small Models (7B, 14B, 35B) on Long-Horizon Autonomous Runs
+* **The Problem:** Smaller open models (Qwen 2.5 Coder, WangYang 35B, DeepSeek Coder) suffer from severe autoregressive drift during multi-turn tasks. By turn 6–10, models experience probability pull toward linguistic closure and hallucinate completion. Once a fake success log enters the context window, **that hallucination poisons all future reasoning steps**, triggering an inescapable death spiral.
+* **The HardTruth Solution:** HardTruth acts as an external, non-autoregressive environmental oracle. The instant a small model asserts completion without physical receipts, HardTruth intercepts the exit, rejects termination, and feeds the exact physical failure trace back into the context window. This eliminates the "reasoning tax" and forces continuous exploration until working code is produced.
+* **Synthetic DPO / RL Data Factory:** Every completed autonomous run under HardTruth produces an unforgeable, verified trajectory (`prompt -> tool calls -> bash exit code 0 -> clean diffs`) ready for high-fidelity model alignment without human labeling.
 
-### 3. Enterprise CI/CD & AST Anti-Stubbing Sentinel
-* **The Problem:** Agents commonly pass tests by writing empty stubs (`pass`, `raise NotImplementedError`, dummy returns) or by modifying test assertions to match broken code.
-* **The HardTruth Fix:** HardTruth's deterministic AST analyzer inspects every modified file before commit. Any function reduced to a dummy stub or empty body is instantly rejected with line-number receipts before it can contaminate git history.
+### 2. Eliminating "The Tests Passed Lie" in Frontier Coding Agents
+* **The Problem:** Even frontier models (Claude 3.5 Sonnet, GPT-4o, Gemini 1.5 Pro) in harnesses like Devin, Cursor, Claude Code, and Antigravity routinely claim:
+  > *"All 10 unit tests in the test suite passed with 100% success."*
+  ...when tests never ran, or when `pytest` exited with status code 1.
+* **The HardTruth Solution:** HardTruth strips away the agent's ability to terminate with verbal reassurance. If the agent makes a completion or verification claim, HardTruth cross-references the deterministic execution ledger. If receipts are missing or contradictory, HardTruth returns `decision: "continue"`—physically trapping the agent into executing the actual `pytest`, `curl`, and `docker inspect` commands.
 
-### 4. Autonomous SRE & Infrastructure Enclaves
-* **The Problem:** Autonomous agents managing servers, databases, or cloud infrastructure cannot afford a single hallucinated command.
-* **The HardTruth Fix:** Placed as a gatekeeper in front of production deployments, database migrations, and container rollouts. Guarantees that zero destructive actions take place without prior verified simulation and cryptographic receipts.
+### 3. AST Anti-Stubbing & Scope-Dropping Sentinel
+* **The Problem:** Autonomous agents commonly take shortcuts under pressure: writing empty functions (`pass`, `raise NotImplementedError`), stubbing return mocks (`return True`), or disabling failing assertions to manufacture artificial green lights.
+* **The HardTruth Solution:** HardTruth features a deterministic Abstract Syntax Tree (AST) static analyzer that inspects every modified file before commit. Any function reduced to a dummy stub or empty body is instantly rejected with line-number receipts before it can contaminate git history.
+
+### 4. Autonomous SRE & Infrastructure Enclaves (Zero-Hallucination SLA)
+* **The Problem:** Autonomous agents executing database migrations, infrastructure provisioning (Terraform, Docker Compose), or cloud deployment scripts cannot afford a single hallucinated state.
+* **The HardTruth Solution:** Operates as a fail-closed gatekeeper in sovereign cloud containers. Enforces that zero destructive or mutative actions can execute without prior verified simulation and cryptographic receipts, enabling production $1,000/mo autonomous SRE retainers with a guaranteed zero-hallucination SLA.
+
+### 5. Universal Git Pre-Commit & Pull Request Gate
+* **The Problem:** Teams running multiple agents across local terminals, IDEs, and background workers have no centralized way to ensure all code committed to git actually works.
+* **The HardTruth Solution:** Installed machine-wide at `~/.hardtruth/hooks/pre-commit`, HardTruth intercepts any `git commit` attempt across the entire system. Any agent (or human) attempting to commit stubbed code or unverified changes is blocked at the git level.
+
+### 6. Continuous Compliance & Regulatory Audit Trails (SOC 2, EU AI Act, NAIC)
+* **The Problem:** Regulated enterprise deployments require provable, explainable verification that autonomous AI decisions were grounded in physical evidence.
+* **The HardTruth Solution:** HardTruth generates tamper-evident, append-only execution ledgers (`ledger.jsonl`) cryptographically linking agent claims to verified shell exit codes, providing audit-ready proof of truth-enforcement.
+
+---
+
+## Competitive Differentiation: Why Existing Tools Fail
+
+| Category | Representative Tools | Why They Fail Where HardTruth Succeeds |
+| :--- | :--- | :--- |
+| **Input / Prompt Guardrails** | ProtectAI, NeMo Guardrails | Only protect against inbound user attacks (jailbreaks/injections). They do **not** check if the agent is lying about its own actions. |
+| **RAG Factuality Checkers** | Cleanlab TLM, Patronus AI, Galileo | Evaluate static text-to-text retrieval (PDF summaries). They have **zero connection to the OS kernel, terminal commands, or git diffs**. |
+| **Post-Hoc Observability** | LangSmith, Braintrust, Arize Phoenix | **Passive loggers.** They record that an agent hallucinated *after* the turn is finished. They cannot intercept runtime `Stop` hooks to block completion. |
+| **Cloud LLM-as-a-Judge** | GPT-4o / Claude Evals | **Slow, expensive, and hallucinates itself.** Takes 2,000ms – 15,000ms, costs $0.03/check, and suffers from autoregressive sycophancy. |
+| **HardTruth Neurosymbolic Shield** | **HardTruth** | **Active 10.8ms circuit breaker.** Evaluates unforgeable physical bash exit codes via local NLI cross-encoder, physically halting the agent until real tests pass. |
 
 ---
 
