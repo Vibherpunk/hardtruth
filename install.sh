@@ -48,11 +48,12 @@ fi
 # 2. Global Git Hooks Configuration
 GLOBAL_HOOKS_DIR="$HOME/.hardtruth/hooks"
 mkdir -p "$GLOBAL_HOOKS_DIR"
-cat > "$GLOBAL_HOOKS_DIR/pre-commit" << 'EOF'
+cat > "$GLOBAL_HOOKS_DIR/pre-commit" << EOF
 #!/bin/bash
 # HardTruth Global Pre-Commit Gate
 python3 -c "
 import sys, os
+sys.path.insert(0, '${REPO_ROOT}')
 from client.hardtruth_client import HardTruthClient
 client = HardTruthClient()
 # Check all staged python files for vacuous stubs
@@ -68,6 +69,8 @@ if stubs:
 "
 EOF
 chmod +x "$GLOBAL_HOOKS_DIR/pre-commit"
+git config --global core.hooksPath "$GLOBAL_HOOKS_DIR"
+echo "✓ Configured global Git pre-commit hook in $GLOBAL_HOOKS_DIR."
 
 echo "=========================================================="
 echo "✓ HardTruth installed successfully."
