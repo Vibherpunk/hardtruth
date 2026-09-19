@@ -53,6 +53,42 @@ sequenceDiagram
 
 ---
 
+## Why DeBERTa-v3? The Architecture & Physics of Non-Autoregressive Truth
+
+A common question is: *Why not just prompt a fast small model like Llama 3.2 1B or Qwen 0.5B to check if the agent is lying? Why use a specialized cross-encoder like DeBERTa-v3?*
+
+The answer lies in the fundamental architectural difference between **autoregressive generation** and **discriminative sequence-pair cross-encoding**:
+
+### 1. Autoregressive LLMs vs. Sequence-Pair Cross-Encoders
+* **Autoregressive Causal Models (GPT, Llama, Claude):** Process tokens sequentially left-to-right. A token at position $i$ can only attend to previous tokens $< i$. When asked *"Does Premise support Hypothesis?"*, an autoregressive model must generate text tokens (`"Yes"`, `"No"`) based on conditional probability, making it vulnerable to self-confirmation bias, sycophancy, and hallucinating answers.
+* **DeBERTa-v3 Cross-Encoder:** Feeds `[CLS] Premise [SEP] Hypothesis [SEP]` simultaneously into all 12 bidirectional transformer layers. **Every single word in the agent's claim directly cross-attends to every single word in the bash exit code and test output simultaneously.** It computes a dense interaction matrix between claim and physical reality.
+
+### 2. Disentangled Attention Mechanism
+Unlike standard BERT or RoBERTa where a token's content and position embeddings are crudely added into a single vector ($\vec{v} = \vec{c} + \vec{p}$), DeBERTa represents each word with **two separate vectors**:
+* A **content vector** $\vec{c}_i$ representing the semantic meaning of the token.
+* A **relative position vector** $\vec{p}_{i,j}$ representing its relative distance to other tokens.
+
+Self-attention is calculated as the sum of four disentangled attention matrices:
+$$\text{Attention}(i, j) = \underbrace{c_i c_j^T}_{\text{Content-to-Content}} + \underbrace{c_i p_{i,j}^T}_{\text{Content-to-Position}} + \underbrace{p_{i,j} c_j^T}_{\text{Position-to-Content}} + \underbrace{p_{i,j} p_{i,j}^T}_{\text{Position-to-Position}}$$
+
+This allows DeBERTa-v3 to possess extraordinary syntactic sensitivity to temporal and logical ordering: it understands the exact logical difference between *"Tests passed after failure"* vs. *"Tests failed after passing"*, which bi-encoders and naive embedding distance metrics completely blur.
+
+### 3. Enhanced Masked Decoder (EMD)
+Standard relative-position models lose absolute position. DeBERTa re-injects absolute position embeddings immediately before the final classification head, ensuring that the boundary between `Premise` (the immutable OS facts) and `Hypothesis` (the agent's claim) remains razor-sharp.
+
+### 4. Mathematical Softmax (Impossible to Hallucinate Text)
+DeBERTa-v3 does not generate text strings. Its classification head projects directly into a 3-dimensional logit space passed through a softmax function:
+$$P(\text{Contradiction}), P(\text{Entailment}), P(\text{Neutral})$$
+Because it cannot output text, **it is mathematically incapable of hallucinating a conversational excuse**. It outputs pure probability.
+
+### 5. Extreme Efficiency on Consumer Hardware
+* **Parameters:** 141 Million (compact enough to live permanently in RAM).
+* **RAM Footprint:** ~280 MB on Apple Silicon Metal (MPS); ~150 MB on CPU ONNX.
+* **Latency:** **10.8 milliseconds** on Apple Silicon MPS / **18.5 ms** on Linux CPU.
+* **Token Cost:** $0.00 (100% local, zero cloud network calls).
+
+---
+
 ## Core Use Cases & Hero Applications
 
 HardTruth solves the reliability gap that prompt engineering, LLM-as-a-judge, and post-hoc observability fail to address:
