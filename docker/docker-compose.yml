@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  hardtruth-daemon:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: hardtruth-daemon
+    restart: always
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - /var/run/hardtruth:/var/run/hardtruth
+    environment:
+      - SYSTEM_ONE_URL=http://127.0.0.1:8000
