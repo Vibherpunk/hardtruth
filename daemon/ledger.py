@@ -192,7 +192,10 @@ def is_exploratory_command(cmd: str) -> bool:
 def classify_file(filepath: str, workspace_dir: Optional[str] = None) -> str:
     """Returns 'source', 'doc', or 'other'."""
     basename = os.path.basename(filepath or "")
-    if basename in ["Makefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh"]:
+    if basename in [
+        "Makefile", "GNUmakefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh",
+        "setup.py", "setup.cfg", "pyproject.toml", "Cargo.toml", "package.json", "tsconfig.json"
+    ]:
         return "source"
 
     _, ext = os.path.splitext(filepath or "")
@@ -879,9 +882,15 @@ class DaemonLedger:
 
         premise_str = " ".join(premise_sections)[:1500]
 
+        session_start_time = 0.0
+        if conv_records:
+            first_rec = conv_records[0]
+            session_start_time = float(first_rec.get("entry", {}).get("timestamp") or first_rec.get("timestamp") or 0.0)
+
         return {
             "tampered": False,
             "conversationId": conversation_id,
+            "created_at": session_start_time,
             "premise": premise_str,
             "source_files_modified": len(modified_source_files),
             "doc_files_modified": len(modified_doc_files),

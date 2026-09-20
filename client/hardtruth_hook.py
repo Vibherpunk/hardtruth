@@ -60,13 +60,21 @@ except ImportError:
         classify_file = lambda path, workspace_dir=None: "other"
         _IMPORT_DEGRADED = "daemon.ledger module unavailable"
 
-try:
-    from daemon.tier2_runner import run_independent_verification
-except ImportError:
-    try:
-        from tier2_runner import run_independent_verification
-    except ImportError:
-        run_independent_verification = None
+
+
+HARNESS = os.environ.get("HARDTRUTH_HARNESS", "antigravity").lower()
+
+def _halt(reason: str) -> dict:
+    if HARNESS in ("claude_code", "claude"):
+        return {"decision": "block", "reason": reason}
+    if HARNESS == "goose":
+        return {"action": "halt", "message": reason}
+    return {"decision": "continue", "reason": reason}
+
+def _allow() -> dict:
+    if HARNESS == "goose":
+        return {"action": "continue"}
+    return {"decision": "allow"}
 
 CONTRADICTION_THRESHOLD = 0.70
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
@@ -77,6 +85,41 @@ SOURCE_CODE_EXTENSIONS = {
     ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig",
     ".mjs", ".cjs"
 }
+
+IGNORED_BUILD_DIRS = {
+    ".git", ".pytest_cache", "__pycache__", "node_modules", "target", ".venv", "venv",
+    ".tox", ".mypy_cache", "build", "dist", "vendor", ".eggs", ".next", ".nuxt",
+    "site-packages", ".gradle", "Pods", ".terraform"
+}
+
+def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Optional[str] = None) -> Optional[Set[int]]:
+    """
+    Returns set of line numbers in fpath modified since baseline commit (or unstaged working tree changes).
+    Parses git diff -U0 hunk headers: @@ -l,s +start,count @@
+    """
+    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+        return None
+    rel_path = os.path.relpath(fpath, workspace_dir)
+    diff_args = ["git", "-c", "safe.directory=*", "diff", "-U0"]
+    if baseline_sha:
+        diff_args.append(baseline_sha)
+    diff_args.extend(["--", rel_path])
+    try:
+        proc = subprocess.run(diff_args, cwd=workspace_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0)
+        if proc.returncode != 0:
+            return None
+        changed = set()
+        for line in proc.stdout.splitlines():
+            if line.startswith("@@"):
+                m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                if m:
+                    start = int(m.group(1))
+                    count = int(m.group(2)) if m.group(2) is not None else 1
+                    for ln in range(start, start + max(count, 1)):
+                        changed.add(ln)
+        return changed if changed else None
+    except Exception:
+        return None
 
 
 def get_api_token() -> Optional[str]:
@@ -236,7 +279,6 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
     return None
 
 
-IGNORED_BUILD_DIRS = {".git", ".pytest_cache", "__pycache__", "node_modules", "target", ".venv", "venv", ".tox", ".mypy_cache"}
 
 
 def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
@@ -479,7 +521,15 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
         except Exception:
             pass
 
-    # 5. Recurse into nested git repositories and untracked directories
+    # 5. Filter out ignored build directories before expanding paths
+    filtered_rel_paths = set()
+    for filepath_rel in all_rel_paths:
+        parts = set(os.path.normpath(filepath_rel).split(os.sep))
+        if not (parts & IGNORED_BUILD_DIRS):
+            filtered_rel_paths.add(filepath_rel)
+    all_rel_paths = filtered_rel_paths
+
+    # Recurse into nested git repositories and untracked directories
     expanded_paths = set()
     for filepath_rel in all_rel_paths:
         full_p = os.path.join(workspace_dir, filepath_rel)
@@ -800,19 +850,12 @@ def handle_stop(payload: dict) -> dict:
         if remediable:
             record_halt(counter_file, new_count)
         if new_count >= 3:
-            return {
-                "decision": "continue",
-                "reason": (
-                    f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
-                    "HardTruth never fails open. Manual verification or human escalation required.\n"
-                    f"To reset counter after remediation, remove: {counter_file}\n\n"
-                    f"Root Cause: {reason}"
-                )
-            }
-        return {
-            "decision": "continue",
-            "reason": reason
-        }
+            return _halt(
+                f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
+                "HardTruth never fails open. Manual verification or human escalation required.\n\n"
+                f"Root Cause: {reason}"
+            )
+        return _halt(reason)
 
     if _IMPORT_DEGRADED:
         return fail_halt(f"🚨 HARDTRUTH INTEGRITY ERROR: {_IMPORT_DEGRADED}. Install layout degraded, cannot verify truth safely. HardTruth fails closed.", remediable=False)
@@ -925,28 +968,31 @@ def handle_stop(payload: dict) -> dict:
             if stash_res.returncode == 0 and stash_res.stdout.strip():
                 session_start = premise_data.get("created_at", 0)
                 active_stash = False
+                stash_ref = ""
                 for line in stash_res.stdout.splitlines():
                     parts = line.strip().split()
                     if len(parts) >= 2 and parts[1].isdigit():
                         stash_time = int(parts[1])
-                        if session_start <= 0 or stash_time >= (session_start - 5):
+                        if (session_start > 0 and stash_time >= (session_start - 5)) or (session_start <= 0 and (time.time() - stash_time) < 60):
                             active_stash = True
+                            stash_ref = parts[0]
                             break
                     else:
-                        active_stash = True
-                        break
+                        continue
 
                 if active_stash:
-                    return fail_halt("🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected at stop. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed changes with 'git stash pop' and execute tests before completing.")
+                    return fail_halt(f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected ('{stash_ref}') created during this session. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed changes with 'git stash pop' and execute tests before completing.")
         except Exception:
             pass
 
     # -----------------------------------------------------------------------
     # Rule 3: Polyglot Anti-Stubbing Linter on Modified Source Files
     # -----------------------------------------------------------------------
+    baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id) if workspace_dir else None
     for fpath in modified_paths:
         if os.path.exists(fpath):
-            stubs = check_ast_stubs(fpath)
+            mod_lines = get_changed_lines(workspace_dir, fpath, baseline_sha)
+            stubs = check_ast_stubs(fpath, modified_lines=mod_lines)
             if stubs:
                 return fail_halt(f"🚨 HARDTRUTH ENGINE REJECTED: Unimplemented stub detected. {stubs[0]}")
 
@@ -1023,22 +1069,26 @@ def handle_stop(payload: dict) -> dict:
     # Tier 2: External Deterministic Hard Gate Handoff
     # Only triggered if source files were modified or tests were executed
     # -----------------------------------------------------------------------
-    if workspace_dir and (source_files_modified > 0 or test_commands_executed > 0):
+    if (source_files_modified > 0 or test_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+        if not workspace_dir:
+            return fail_halt(
+                "🚨 HARDTRUTH UNDETERMINED: No workspace path was resolvable, so the Tier 2 "
+                "hard gate and git integrity checks could not run. HardTruth never fails open.",
+                remediable=False
+            )
         tier2_result = call_system_one("v1/verify/handoff", {
             "workspace_path": workspace_dir,
-            "conversationId": conv_id
-        }, timeout=65.0)
-
-        if not tier2_result and run_independent_verification:
-            # Fallback to in-process clean runner if daemon endpoint offline
-            try:
-                tier2_result = run_independent_verification(workspace_dir, conv_id=conv_id)
-            except Exception:
-                tier2_result = None
+            "conversationId": conv_id,
+            "timeout_sec": 50
+        }, timeout=55.0)
 
         if tier2_result is None:
-            # A6: Tier 2 produces no verdict -> HardTruth NEVER fails open
-            return fail_halt("🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier produced no verdict (daemon unreachable and in-process runner unavailable). HardTruth never fails open: code modifications require verified test execution.", remediable=False)
+            return fail_halt(
+                f"🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier daemon at {SYSTEM_ONE_URL} is unreachable. "
+                "HardTruth will not execute untrusted workspace test code inside the host agent process. "
+                "Ensure the HardTruth verification daemon is running.",
+                remediable=False
+            )
 
         if not tier2_result.get("success"):
             runner = tier2_result.get("runner", "external runner")
@@ -1053,7 +1103,7 @@ def handle_stop(payload: dict) -> dict:
                 os.remove(counter_file)
             except Exception:
                 pass
-        return {"decision": "allow"}
+        return _allow()
 
     # -----------------------------------------------------------------------
     # Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
@@ -1169,7 +1219,7 @@ def handle_stop(payload: dict) -> dict:
         except Exception:
             pass
 
-    return {"decision": "allow"}
+    return _allow()
 
 
 def record_halt(counter_file: str, new_count: int):
@@ -1199,10 +1249,7 @@ if __name__ == "__main__":
         else:
             out = handle_stop(payload)
     except Exception as e:
-        out = {
-            "decision": "continue",
-            "reason": f"🚨 HARDTRUTH INTERNAL ERROR (FAIL-CLOSED): {e}. Termination forbidden."
-        }
+        out = _halt(f"🚨 HARDTRUTH INTERNAL ERROR (FAIL-CLOSED): {e}. Termination forbidden.")
 
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()

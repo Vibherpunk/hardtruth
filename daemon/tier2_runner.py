@@ -19,12 +19,13 @@ from typing import Optional, Dict, Any, Tuple, List
 
 
 MANIFEST_FILES = [
-    "Makefile", "package.json", "pyproject.toml", "Cargo.toml", "setup.py",
-    "pytest.ini", ".pytest.ini", "tox.ini",
-    "conftest.py", "tests/conftest.py",
+    "Makefile", "GNUmakefile", "package.json", "pyproject.toml", "Cargo.toml", "setup.py", "setup.cfg",
+    "pytest.ini", ".pytest.ini", "tox.ini", "noxfile.py", ".mocharc.json", ".mocharc.yml",
+    "tsconfig.json", "conftest.py", "tests/conftest.py",
     "jest.config.js", "jest.config.ts", "jest.setup.js", "setupTests.js",
     "vite.config.js", "vite.config.ts", "vitest.config.js", "vitest.config.ts"
 ]
+MANIFEST_PATTERNS = MANIFEST_FILES + [":(glob)**/conftest.py", ":(glob)*.mk", ":(glob)Makefile.*"]
 
 
 def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None) -> Tuple[bool, List[str]]:
@@ -40,7 +41,7 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
     # 1. Check working tree for uncommitted manifest edits
     try:
         proc = subprocess.run(
-            ["git", "status", "--porcelain", "--"] + MANIFEST_FILES,
+            ["git", "-c", "safe.directory=*", "status", "--porcelain", "--"] + MANIFEST_PATTERNS,
             cwd=workspace_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -55,8 +56,10 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
                     if " -> " in fname:
                         fname = fname.split(" -> ")[1].strip()
                     modified.add(fname)
-    except Exception:
-        pass
+        elif proc.returncode != 0:
+            return True, [f"<git-status-error: {(proc.stderr or '').strip()[:200]}>"]
+    except Exception as e:
+        return True, [f"<git-exception: {str(e)[:200]}>"]
 
     # 2. Check committed modifications against session baseline commit
     if conv_id:
@@ -105,7 +108,7 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
         if baseline_sha:
             try:
                 proc_diff = subprocess.run(
-                    ["git", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_FILES,
+                    ["git", "-c", "safe.directory=*", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_PATTERNS,
                     cwd=workspace_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -117,8 +120,10 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
                         fname = line.strip()
                         if fname:
                             modified.add(fname)
-            except Exception:
-                pass
+                elif proc_diff.returncode != 0:
+                    return True, [f"<git-diff-error: {(proc_diff.stderr or '').strip()[:200]}>"]
+            except Exception as e:
+                return True, [f"<git-diff-exception: {str(e)[:200]}>"]
 
     if modified:
         return True, sorted(list(modified))
@@ -363,14 +368,59 @@ def run_independent_verification(
                 "isolation": "input_validation"
             }
         base_bin = os.path.basename(parts[0]).lower()
-        allowed_bins = {"pytest", "python", "python3", "npm", "yarn", "bun", "cargo", "make", "go", "jest", "vitest", "tox", "ctest"}
-        if base_bin not in allowed_bins:
+        allowed_bins = {"pytest", "npm", "yarn", "bun", "cargo", "jest", "vitest", "tox", "ctest"}
+        if base_bin in ("python", "python3"):
+            if len(parts) >= 3 and parts[1] == "-m" and parts[2] in ("unittest", "pytest"):
+                pass
+            else:
+                return {
+                    "status": "rejected_unauthorized_runner",
+                    "success": False,
+                    "exit_code": 1,
+                    "runner": "command_sanitizer",
+                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Python runner only allows '-m unittest' or '-m pytest', received: {test_cmd}",
+                    "isolation": "input_validation"
+                }
+        elif base_bin == "go":
+            if len(parts) >= 2 and parts[1] == "test":
+                pass
+            else:
+                return {
+                    "status": "rejected_unauthorized_runner",
+                    "success": False,
+                    "exit_code": 1,
+                    "runner": "command_sanitizer",
+                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Go runner only allows 'go test', received: {test_cmd}",
+                    "isolation": "input_validation"
+                }
+        elif base_bin == "make":
+            if any(a in ("-f", "--file", "--makefile") for a in parts[1:]):
+                return {
+                    "status": "rejected_unauthorized_runner",
+                    "success": False,
+                    "exit_code": 1,
+                    "runner": "command_sanitizer",
+                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Custom makefile flags are rejected: {test_cmd}",
+                    "isolation": "input_validation"
+                }
+        elif base_bin not in allowed_bins:
             return {
                 "status": "rejected_unauthorized_runner",
                 "success": False,
                 "exit_code": 1,
                 "runner": "command_sanitizer",
                 "output": f"🚨 TIER 2 HARD GATE REJECTED: Command binary '{parts[0]}' is not an authorized test runner.",
+                "isolation": "input_validation"
+            }
+
+        # Reject interpreter-escape flags across any runner
+        if any(a in ("-c", "--eval", "-e") for a in parts[1:]):
+            return {
+                "status": "rejected_unauthorized_runner",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Code execution flag detected in '{test_cmd}'.",
                 "isolation": "input_validation"
             }
 

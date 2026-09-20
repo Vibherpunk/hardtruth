@@ -41,6 +41,7 @@ class TestV21Hardening(unittest.TestCase):
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
             "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
+            "HARDTRUTH_SKIP_TIER2": "1",
             "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key")
         }
 
@@ -100,7 +101,7 @@ class TestV21Hardening(unittest.TestCase):
             }) + "\n")
             transcript_path = tf.name
 
-        payload = {"conversationId": conv, "transcriptPath": transcript_path}
+        payload = {"conversationId": conv, "transcriptPath": transcript_path, "workspacePaths": [self.test_dir]}
         res = self.run_hook("stop", payload)
         os.remove(transcript_path)
 

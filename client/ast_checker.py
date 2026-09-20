@@ -12,10 +12,11 @@ import re
 from typing import List, Optional, Set
 
 class PythonStubVisitor(ast.NodeVisitor):
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, modified_lines: Optional[Set[int]] = None):
         self.filename = os.path.basename(filename)
         self.violations: List[str] = []
         self._class_stack: List[ast.ClassDef] = []
+        self.modified_lines = modified_lines
 
     def visit_ClassDef(self, node: ast.ClassDef):
         self._class_stack.append(node)
@@ -144,6 +145,12 @@ class PythonStubVisitor(ast.NodeVisitor):
                     stub_type = "return True"
 
         if is_stub:
+            node_start = getattr(node, "lineno", 1)
+            node_end = getattr(node, "end_lineno", node_start)
+            if self.modified_lines is not None:
+                node_lines = set(range(node_start, node_end + 1))
+                if not (node_lines & self.modified_lines):
+                    return
             self.violations.append(
                 f"Function '{node.name}' in {self.filename} is an empty stub ({stub_type}). Write actual working implementation before completing."
             )
@@ -170,7 +177,7 @@ def check_ast_stubs(filepath: str, modified_lines: Optional[Set[int]] = None) ->
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
             tree = ast.parse(content, filename=filepath)
-            visitor = PythonStubVisitor(filepath)
+            visitor = PythonStubVisitor(filepath, modified_lines=modified_lines)
             visitor.visit(tree)
             return visitor.violations
         except SyntaxError as se:

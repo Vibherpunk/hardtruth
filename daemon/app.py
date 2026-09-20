@@ -174,6 +174,10 @@ class GetPremiseResponse(BaseModel):
     modified_files: List[str]
     modified_file_paths: Optional[List[str]] = []
     verification_commands_executed: int
+    test_commands_executed: Optional[int] = 0
+    last_source_mod_step: Optional[int] = -1
+    last_test_step: Optional[int] = -1
+    created_at: Optional[float] = 0.0
     unresolved_failures: List[UnresolvedFailureItem]
     records_count: int
     error: Optional[str] = None

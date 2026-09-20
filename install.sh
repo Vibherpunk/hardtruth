@@ -47,7 +47,7 @@ if [ -d "$HOME/.gemini" ]; then
           {
             "type": "command",
             "command": "python3 ~/.gemini/config/hardtruth_hook.py post_tool",
-            "timeout": 5
+            "timeout": 20
           }
         ]
       }
@@ -56,7 +56,7 @@ if [ -d "$HOME/.gemini" ]; then
       {
         "type": "command",
         "command": "python3 ~/.gemini/config/hardtruth_hook.py stop",
-        "timeout": 10
+        "timeout": 90
       }
     ]
   }
@@ -69,23 +69,37 @@ fi
 cat > "$GLOBAL_HOOKS_DIR/pre-commit" << 'EOF'
 #!/bin/bash
 # HardTruth Global Pre-Commit Gate
+
+# If a previous hooks path was configured, chain and execute its pre-commit hook first
+PREV_HOOKS_FILE="$HOME/.hardtruth/previous_hooksPath"
+if [ -f "$PREV_HOOKS_FILE" ]; then
+    PREV_DIR="$(cat "$PREV_HOOKS_FILE" | tr -d '\r\n')"
+    if [ -n "$PREV_DIR" ] && [ -x "$PREV_DIR/pre-commit" ]; then
+        "$PREV_DIR/pre-commit" "$@"
+        PREV_EC=$?
+        if [ $PREV_EC -ne 0 ]; then
+            exit $PREV_EC
+        fi
+    fi
+fi
+
 python3 -c "
 import sys, os
 sys.path.insert(0, os.path.expanduser('~/.hardtruth/lib'))
 from hardtruth.ast_checker import check_ast_stubs
-import subprocess
-try:
-    files = subprocess.check_output(['git', 'diff', '--cached', '--name-only'], text=True).splitlines()
-except Exception:
-    sys.exit(0)
-stubs = []
-for f in files:
-    if f.endswith('.py') and os.path.exists(f):
-        stubs.extend(check_ast_stubs(f))
-if stubs:
-    print('🚨 HardTruth rejected commit: Unimplemented dummy stub detected: ' + stubs[0], file=sys.stderr)
+
+modified = sys.argv[1:]
+violations = []
+for f in modified:
+    if os.path.isfile(f):
+        violations.extend(check_ast_stubs(f))
+
+if violations:
+    print('🚨 HARDTRUTH COMMIT GATE REJECTED: Code contains stubs.')
+    for v in violations:
+        print(f'   - {v}')
     sys.exit(1)
-"
+" "$@"
 EOF
 chmod +x "$GLOBAL_HOOKS_DIR/pre-commit"
 echo "✓ Pre-commit hook written to $GLOBAL_HOOKS_DIR/pre-commit"
@@ -98,9 +112,11 @@ for arg in "$@"; do
     fi
 done
 
-# If not passed via flag and running interactively, prompt user
+# If not passed via flag and running interactively, prompt user with clear warning
 if [ "$INSTALL_GLOBAL_HOOK" = false ] && [ -t 0 ]; then
     echo ""
+    echo "⚠️  WARNING: Setting core.hooksPath overrides git hooks for EVERY repository on this machine."
+    echo "   (HardTruth chains previously configured global hooks, but per-repo .git/hooks may be superseded)."
     read -p "Install machine-wide git hook via 'git config --global core.hooksPath'? [y/N]: " choice
     if [[ "$choice" =~ ^[Yy]$ ]]; then
         INSTALL_GLOBAL_HOOK=true

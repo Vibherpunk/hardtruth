@@ -47,6 +47,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         os.makedirs(self.halt_dir, mode=0o700, exist_ok=True)
         os.environ["HARDTRUTH_LEDGER_PATH"] = self.ledger_file
         os.environ["HARDTRUTH_HALT_DIR"] = self.halt_dir
+        os.environ["HARDTRUTH_SKIP_TIER2"] = "1"
         # Round 8 (#6): run hook subprocesses token-less so test suites never write
         # records into the physical daemon ledger (daemon rejects with 401; the hook
         # degrades gracefully to its local temp ledger). test_17/test_18 explicitly
@@ -55,6 +56,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         self.conv_id = f"test-conv-{uuid.uuid4().hex}"
 
     def tearDown(self):
+        os.environ.pop("HARDTRUTH_SKIP_TIER2", None)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def run_hook(self, mode: str, payload: dict, env_override: dict = None) -> dict:
