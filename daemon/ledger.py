@@ -17,6 +17,56 @@ from typing import Dict, List, Optional, Tuple, Any
 DEFAULT_LEDGER_PATH = os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl")
 DEFAULT_KEY_PATH = os.path.expanduser("~/.hardtruth/daemon_hmac.key")
 
+# ---------------------------------------------------------------------------
+# Round 7 Finding A: unauthenticated daemon writes allowed any local process to
+# forge ledger records (fake tool="run_command" / exit 0) and resolve genuine
+# failures in the premise the hook's gate consults. All state-changing API
+# endpoints now require a shared bearer token. The token is distributed out of
+# band: HARDTRUTH_API_TOKEN env (hook + daemon) or the shared key file
+# ~/.hardtruth/daemon_api.key (auto-generated if missing).
+# ---------------------------------------------------------------------------
+DEFAULT_API_KEY_PATH = os.path.expanduser("~/.hardtruth/daemon_api.key")
+
+
+def get_daemon_api_token() -> str:
+    """Returns the daemon API write token: HARDTRUTH_API_TOKEN env, else key file."""
+    env_tok = os.environ.get("HARDTRUTH_API_TOKEN", "").strip()
+    if env_tok:
+        return env_tok
+    path = os.environ.get("HARDTRUTH_API_KEY", DEFAULT_API_KEY_PATH)
+    key_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(key_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(key_dir, 0o700)
+    except Exception:
+        pass
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                tok = f.read().strip()
+                if len(tok) >= 32:
+                    return tok
+        except Exception:
+            pass
+    tok = secrets.token_hex(32)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o400)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(tok)
+    try:
+        os.chmod(path, 0o400)
+    except Exception:
+        pass
+    return tok
+
+
+def validate_api_token(token: Optional[str]) -> bool:
+    """Constant-time comparison against the daemon API write token."""
+    if not token:
+        return False
+    expected = get_daemon_api_token()
+    return hmac.compare_digest(str(token), expected)
+
 # Matches verification commands even with leading env vars like CI=1 or PYTHONPATH=.
 VERIFICATION_CMD_PATTERN = re.compile(
     r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\w+)?|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint)\b",

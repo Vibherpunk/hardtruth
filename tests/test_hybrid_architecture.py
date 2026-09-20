@@ -23,7 +23,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from daemon.ledger import DaemonLedger, can_suite_resolve_failure, is_tainted_shell_command
-from daemon.tier2_runner import detect_test_runner, run_independent_verification
+from daemon.tier2_runner import detect_test_runner, resolve_workspace_path, run_independent_verification
 
 
 class TestHybridArchitecture(unittest.TestCase):
@@ -577,6 +577,49 @@ class TestHybridArchitecture(unittest.TestCase):
         self.assertTrue(can_suite_resolve_failure("pytest -v", "pytest tests/test_billing.py"))
         self.assertTrue(can_suite_resolve_failure("pytest -x", "pytest"))
         self.assertTrue(can_suite_resolve_failure("pytest --exitfirst", "pytest tests/test_foo.py::test_bar"))
+
+
+class TestRound7Fixes(unittest.TestCase):
+    """Round 7: workspace path resolution and fail-closed status for daemon-invisible paths."""
+
+    def setUp(self):
+        self._old_map = os.environ.get("HARDTRUTH_WORKSPACE_MAP")
+
+    def tearDown(self):
+        if self._old_map is None:
+            os.environ.pop("HARDTRUTH_WORKSPACE_MAP", None)
+        else:
+            os.environ["HARDTRUTH_WORKSPACE_MAP"] = self._old_map
+
+    def test_resolve_workspace_path_identity_when_unset(self):
+        os.environ.pop("HARDTRUTH_WORKSPACE_MAP", None)
+        self.assertEqual(
+            resolve_workspace_path("/Users/ai/dev/hardtruth-fix"),
+            "/Users/ai/dev/hardtruth-fix"
+        )
+
+    def test_resolve_workspace_path_maps_host_prefix(self):
+        os.environ["HARDTRUTH_WORKSPACE_MAP"] = json.dumps({"/Users/ai/dev": "/workspaces/dev"})
+        self.assertEqual(
+            resolve_workspace_path("/Users/ai/dev/hardtruth-fix/tests"),
+            "/workspaces/dev/hardtruth-fix/tests"
+        )
+
+    def test_resolve_workspace_path_longest_prefix_wins(self):
+        os.environ["HARDTRUTH_WORKSPACE_MAP"] = json.dumps({
+            "/Users/ai/dev": "/workspaces/dev",
+            "/Users/ai/dev/hardtruth-fix": "/workspaces/hardtruth-fix"
+        })
+        self.assertEqual(
+            resolve_workspace_path("/Users/ai/dev/hardtruth-fix"),
+            "/workspaces/hardtruth-fix"
+        )
+
+    def test_unverified_no_workspace_status(self):
+        """Finding B: a workspace invisible to the daemon fails closed, never passes."""
+        res = run_independent_verification("/nonexistent/definitely/missing/path")
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "unverified_no_workspace")
 
 
 if __name__ == "__main__":

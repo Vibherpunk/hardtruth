@@ -19,7 +19,7 @@ import psutil
 import threading
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,12 +27,12 @@ if _CURRENT_DIR not in sys.path:
     sys.path.insert(0, _CURRENT_DIR)
 
 try:
-    from ledger import DaemonLedger
+    from ledger import DaemonLedger, validate_api_token
 except ImportError:
     try:
-        from daemon.ledger import DaemonLedger
+        from daemon.ledger import DaemonLedger, validate_api_token
     except ImportError:
-        from hardtruth.ledger import DaemonLedger
+        from hardtruth.ledger import DaemonLedger, validate_api_token
 
 try:
     from tier2_runner import run_independent_verification
@@ -69,6 +69,25 @@ async def limit_payload_size(request: Request, call_next):
 # ---------------------------------------------------------------------------
 
 _ledger = DaemonLedger()
+
+
+# ---------------------------------------------------------------------------
+# API Write Authentication (Round 7 Finding A)
+# ---------------------------------------------------------------------------
+def require_daemon_auth(authorization: Optional[str] = Header(None)):
+    """
+    Requires the shared HardTruth API token on all state-changing endpoints.
+    Prevents any local process from forging ledger/baseline records or from
+    triggering external execution / NLI inference (Round 7 Finding A).
+    """
+    token = None
+    if authorization:
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+        else:
+            token = authorization.strip()
+    if not validate_api_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid HardTruth API token")
 
 # ---------------------------------------------------------------------------
 # Model Engine (DeBERTa-v3 NLI Direct Token Pair Evaluation)
@@ -192,7 +211,7 @@ def health_check():
         "docs_url": "http://127.0.0.1:8000/docs"
     }
 
-@app.post("/v1/ledger/record")
+@app.post("/v1/ledger/record", dependencies=[Depends(require_daemon_auth)])
 def record_ledger_entry(req: RecordLedgerRequest):
     """
     Appends an execution event to the HMAC-SHA256 hash-chained ledger.
@@ -222,7 +241,7 @@ def get_ledger_premise(conversationId: str = Query(..., description="Conversatio
         return JSONResponse(status_code=400, content=premise_data)
     return premise_data
 
-@app.post("/v1/session/baseline")
+@app.post("/v1/session/baseline", dependencies=[Depends(require_daemon_auth)])
 def set_session_baseline(req: SessionBaselineRequest):
     """
     Registers the session baseline commit SHA for (conversationId, workspace_path).
@@ -247,7 +266,7 @@ def get_session_baseline(
     baseline = _ledger.get_session_baseline(conversationId, workspace_path)
     return {"baseline_sha": baseline}
 
-@app.post("/v1/verify/handoff", response_model=HandoffVerifyResponse)
+@app.post("/v1/verify/handoff", response_model=HandoffVerifyResponse, dependencies=[Depends(require_daemon_auth)])
 def verify_handoff(req: HandoffVerifyRequest):
     """
     Tier 2 External Deterministic Verification Gate.
@@ -263,7 +282,7 @@ def verify_handoff(req: HandoffVerifyRequest):
         return JSONResponse(status_code=406, content=result)
     return result
 
-@app.post("/v1/verify-claim", response_model=VerifyClaimResponse)
+@app.post("/v1/verify-claim", response_model=VerifyClaimResponse, dependencies=[Depends(require_daemon_auth)])
 def verify_claim(req: VerifyClaimRequest):
     """
     Evaluates premise vs hypothesis using DeBERTa-v3 cross-encoder directly.

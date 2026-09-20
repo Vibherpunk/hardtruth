@@ -68,6 +68,22 @@ except ImportError:
 CONTRADICTION_THRESHOLD = 0.70
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
 
+
+def get_api_token() -> Optional[str]:
+    """Returns the shared HardTruth API token: HARDTRUTH_API_TOKEN env, then key file."""
+    tok = os.environ.get("HARDTRUTH_API_TOKEN", "").strip()
+    if tok:
+        return tok
+    key_file = os.environ.get("HARDTRUTH_API_KEY", os.path.expanduser("~/.hardtruth/daemon_api.key"))
+    try:
+        with open(key_file, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+            if len(tok) >= 32:
+                return tok
+    except Exception:
+        pass
+    return None
+
 def get_ledger_file() -> str:
     return os.environ.get(
         "HARDTRUTH_LEDGER_PATH",
@@ -102,14 +118,22 @@ def get_halt_counter_file(conv_id: str) -> str:
 def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0) -> Optional[dict]:
     url = f"{SYSTEM_ONE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    tok = get_api_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"}
+        headers=headers
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (401) — HARDTRUTH_API_TOKEN mismatch between hook and daemon.\n")
+        return None
     except Exception:
         return None
 
@@ -707,7 +731,11 @@ def handle_stop(payload: dict) -> dict:
     if not premise_data:
         try:
             url = f"{SYSTEM_ONE_URL.rstrip('/')}/v1/ledger/premise?conversationId={urllib.parse.quote(conv_id)}"
-            req = urllib.request.Request(url, headers={"User-Agent": "HardTruth-Hook"})
+            premise_headers = {"User-Agent": "HardTruth-Hook"}
+            premise_tok = get_api_token()
+            if premise_tok:
+                premise_headers["Authorization"] = f"Bearer {premise_tok}"
+            req = urllib.request.Request(url, headers=premise_headers)
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 premise_data = json.loads(resp.read().decode("utf-8"))
         except Exception:

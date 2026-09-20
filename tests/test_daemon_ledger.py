@@ -20,7 +20,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from daemon.ledger import DaemonLedger, is_verification_command, is_exploratory_command, classify_file
+from daemon.ledger import DaemonLedger, is_verification_command, is_exploratory_command, classify_file, get_daemon_api_token, validate_api_token
 
 
 class TestDaemonLedger(unittest.TestCase):
@@ -147,6 +147,26 @@ class TestDaemonLedger(unittest.TestCase):
         # Must not say "exit 0"
         self.assertNotIn("exit 0", premise["premise"])
         self.assertIn("uncorroborated by transcript", premise["premise"])
+
+
+class TestRound7ApiToken(unittest.TestCase):
+    """Round 7 Finding A: daemon API write-token validation (constant-time)."""
+
+    def test_validate_api_token_env(self):
+        os.environ["HARDTRUTH_API_TOKEN"] = "test-token-0123456789abcdef"
+        try:
+            self.assertTrue(validate_api_token("test-token-0123456789abcdef"))
+            self.assertFalse(validate_api_token("forged-token"))
+            self.assertFalse(validate_api_token(""))
+            self.assertFalse(validate_api_token(None))
+        finally:
+            os.environ.pop("HARDTRUTH_API_TOKEN", None)
+
+    def test_get_daemon_api_token_min_length(self):
+        os.environ.pop("HARDTRUTH_API_TOKEN", None)
+        tok = get_daemon_api_token()
+        self.assertGreaterEqual(len(tok), 32)
+        self.assertTrue(validate_api_token(tok))
 
 
 if __name__ == "__main__":

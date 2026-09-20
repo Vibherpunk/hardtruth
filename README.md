@@ -177,6 +177,28 @@ Or with Docker Compose:
 docker compose -f docker/docker-compose.yml up --build -d
 ```
 
+#### Daemon API Authentication (Round 7)
+All state-changing daemon endpoints (`/v1/ledger/record`, `/v1/session/baseline`,
+`/v1/verify/handoff`, `/v1/verify-claim`) require a shared API token:
+
+1. Generate one: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+2. Set `HARDTRUTH_API_TOKEN` for both hook and daemon, **or** write the value to
+   `~/.hardtruth/daemon_api.key` (mode 0400, read by both; auto-generated if missing).
+
+Requests without a valid token are rejected with `401`. This closes the Round 7
+Finding A vector where any local process could forge `run_command`/exit-0 ledger
+records and clear genuine failures from the gate's premise.
+
+#### Tier 2 Workspace Visibility (Round 7)
+The daemon must be able to see agent workspaces to run Tier 2 verification:
+
+- **Daemon on host:** no extra configuration.
+- **Daemon in a container:** mount each workspace into the daemon container and set
+  `HARDTRUTH_WORKSPACE_MAP` as a JSON object mapping host prefixes to container
+  prefixes (e.g. `{"\/Users\/ai\/dev":"\/workspaces\/dev"}`), or mount at the same
+  absolute path. If a workspace is not visible, Tier 2 fails closed with
+  `status: "unverified_no_workspace"` instead of a silent pass.
+
 ### 3. Run Test Suite
 ```bash
 pytest tests/

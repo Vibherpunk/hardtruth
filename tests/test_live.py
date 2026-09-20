@@ -443,5 +443,74 @@ class TestSystemOneSentinel(unittest.TestCase):
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("HARDTRUTH DAEMON UNREACHABLE", res.get("reason", ""))
 
+    def test_17_ledger_record_requires_api_token(self):
+        """Round 7 Finding A: forged ledger writes without the shared token are rejected (401)."""
+        import urllib.request, urllib.error
+        from client.hardtruth_hook import get_api_token
+        daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+        if os.environ.get("CI") == "true":
+            self.skipTest("Tier 2 in-container run: live daemon tests skipped")
+        try:
+            urllib.request.urlopen(daemon_base + "/health", timeout=2)
+        except Exception:
+            self.skipTest("daemon not reachable")
+        payload = json.dumps({
+            "conversationId": f"auth-test-{uuid.uuid4().hex}",
+            "stepIdx": 0,
+            "tool": "run_command",
+            "target": "pytest forged",
+            "observed_exit_code": 0
+        }).encode()
+        # No token -> 401
+        req = urllib.request.Request(
+            daemon_base + "/v1/ledger/record", data=payload,
+            headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=3)
+        self.assertEqual(ctx.exception.code, 401, "forged record without token must be rejected")
+        # Wrong token -> 401
+        req_bad = urllib.request.Request(
+            daemon_base + "/v1/ledger/record", data=payload,
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + "x" * 64})
+        with self.assertRaises(urllib.error.HTTPError) as ctx2:
+            urllib.request.urlopen(req_bad, timeout=3)
+        self.assertEqual(ctx2.exception.code, 401, "record with wrong token must be rejected")
+        # Valid token -> recorded
+        tok = get_api_token()
+        if not tok:
+            self.skipTest("no HARDTRUTH_API_TOKEN configured")
+        req_ok = urllib.request.Request(
+            daemon_base + "/v1/ledger/record", data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req_ok, timeout=3) as resp:
+            body = json.loads(resp.read().decode())
+        self.assertEqual(body.get("status"), "recorded")
+
+    def test_18_tier2_handoff_daemon_visible_workspace(self):
+        """Round 7 Finding B: /v1/verify/handoff succeeds when the workspace is daemon-visible."""
+        import urllib.request, urllib.error
+        from client.hardtruth_hook import get_api_token
+        daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+        if os.environ.get("CI") == "true":
+            self.skipTest("Tier 2 in-container run: live daemon tests skipped")
+        try:
+            urllib.request.urlopen(daemon_base + "/health", timeout=2)
+        except Exception:
+            self.skipTest("daemon not reachable")
+        tok = get_api_token()
+        if not tok:
+            self.skipTest("no HARDTRUTH_API_TOKEN configured")
+        payload = json.dumps({
+            "workspace_path": REPO_ROOT,
+            "conversationId": f"tier2-live-{uuid.uuid4().hex}",
+            "timeout_sec": 90
+        }).encode()
+        req = urllib.request.Request(
+            daemon_base + "/v1/verify/handoff", data=payload,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req, timeout=130) as resp:
+            body = json.loads(resp.read().decode())
+        self.assertTrue(body.get("success"), f"Tier 2 handoff failed: {body.get('output','')[:300]}")
+
 if __name__ == "__main__":
     unittest.main()

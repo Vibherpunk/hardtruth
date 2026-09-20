@@ -183,6 +183,36 @@ def detect_test_runner(workspace_path: str, tampered_manifests: Optional[List[st
     return None
 
 
+def resolve_workspace_path(workspace_path: Optional[str]) -> Optional[str]:
+    """
+    Maps a host workspace path to the path visible inside a containerized daemon.
+    Uses HARDTRUTH_WORKSPACE_MAP env: a JSON object of {host_prefix: container_prefix}.
+    Longest host-prefix match wins. Identity when unset or unmapped.
+    """
+    if not workspace_path:
+        return workspace_path
+    raw = os.environ.get("HARDTRUTH_WORKSPACE_MAP", "").strip()
+    if not raw:
+        return workspace_path
+    try:
+        mapping = json.loads(raw)
+    except Exception:
+        return workspace_path
+    norm = os.path.abspath(workspace_path)
+    best = None
+    best_len = -1
+    for host_prefix, container_prefix in mapping.items():
+        hp = os.path.abspath(str(host_prefix))
+        if norm == hp or norm.startswith(hp.rstrip(os.sep) + os.sep):
+            if len(hp) > best_len:
+                best = (hp, str(container_prefix).rstrip(os.sep))
+                best_len = len(hp)
+    if best is None:
+        return workspace_path
+    hp, cp = best
+    return cp + norm[len(hp):]
+
+
 def run_container_verification(
     workspace_path: str,
     test_cmd: str,
@@ -276,13 +306,17 @@ def run_independent_verification(
     Prioritizes ephemeral read-only Docker container isolation,
     falling back to clean subprocess sandbox if Docker is unavailable.
     """
+    orig_path = workspace_path
+    workspace_path = resolve_workspace_path(workspace_path)
     if not workspace_path or not os.path.exists(workspace_path):
         return {
-            "status": "error",
+            "status": "unverified_no_workspace",
             "success": False,
-            "exit_code": -1,
+            "exit_code": 1,
             "runner": None,
-            "output": f"Workspace path does not exist: {workspace_path}"
+            "output": (f"🚨 TIER 2 HARD GATE FAILED: Workspace path is not visible to the daemon: "
+                       f"{orig_path or workspace_path}. For a containerized daemon, mount the workspace "
+                       f"and/or configure HARDTRUTH_WORKSPACE_MAP={{'host_prefix':'container_prefix'}}.")
         }
 
     is_tampered, tampered_files = check_manifest_tampering(workspace_path, conv_id=conv_id)
@@ -360,9 +394,13 @@ def run_independent_verification(
     clean_env["PYTHONUNBUFFERED"] = "1"
     clean_env["CI"] = "true"
 
+    actual_cmd = canonical_runner
+    if actual_cmd.startswith("pytest") and "-o cache_dir" not in actual_cmd:
+        actual_cmd = f"{actual_cmd} -o cache_dir=/tmp/.pytest_cache -p no:cacheprovider"
+
     try:
         proc = subprocess.run(
-            canonical_runner,
+            actual_cmd,
             cwd=workspace_path,
             shell=True,
             stdout=subprocess.PIPE,
