@@ -34,14 +34,16 @@ from daemon.ledger import DaemonLedger  # noqa: E402
 
 DEFAULT_PREFIXES = [
     "test-conv-", "test-hybrid-", "test-gate-", "test-conv", "test_conv_http",
-    "test-bypass-", "test-debug-",
+    "test-bypass-", "test-debug-", "debug-test",
     "auth-test-", "tier2-live-", "premise-auth-", "baseline-auth-",
     "breaker-", "bypass-", "chat-conv-", "commit-run-", "dead-daemon-",
     "doc-", "fail-conv-", "fake-pass-", "grep-", "informal-", "inline-conv-",
     "multi-fail-", "npm-res-", "poison-commit-", "prompt-conv-", "rule1-",
     "slide-", "spoof-", "spoof-multiline-", "stub-conv-", "success-conv-",
     "survive-", "taint-", "evade-backtick-", "evade-quote-",
+    "http-sess-", "spotcheck-", "forge-test-", "fix-verify-",
 ]
+
 
 
 def main() -> int:
