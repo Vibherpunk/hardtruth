@@ -339,13 +339,29 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
         for p in ws_paths:
             if p and os.path.isdir(p):
                 return os.path.abspath(p)
-    for k in ["cwd", "workspace", "projectDir", "root"]:
+    for k in ["cwd", "workspace", "workspace_dir", "workspaceDir", "projectDir", "project_dir", "root"]:
         v = payload.get(k)
         if v and os.path.isdir(v):
             return os.path.abspath(v)
     return None
 
 
+
+
+def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
+    if not sha or not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+        return False
+    try:
+        chk = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{sha}^{{commit}}"],
+            cwd=workspace_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.0
+        )
+        return chk.returncode == 0
+    except Exception:
+        return False
 
 
 def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
@@ -361,11 +377,11 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
         return None
 
     safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    ws_norm = os.path.abspath(workspace_dir)
     conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
     halt_dir = get_halt_counter_dir()
     os.makedirs(halt_dir, mode=0o700, exist_ok=True)
     baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
-    ws_norm = os.path.abspath(workspace_dir)
 
     # 1. Ask isolated daemon (primary source of truth, container-isolated from agent)
     try:
@@ -376,21 +392,23 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
         )
         if resp and resp.get("baseline_sha"):
             daemon_sha = resp.get("baseline_sha")
-            try:
-                data = {}
-                if os.path.exists(baseline_file):
-                    try:
-                        with open(baseline_file, "r") as f:
-                            data = json.load(f)
-                    except Exception:
-                        pass
-                data["baseline_sha"] = daemon_sha
-                data.setdefault("created_at", time.time())
-                with open(baseline_file, "w") as f:
-                    json.dump(data, f)
-            except Exception:
-                pass
-            return daemon_sha
+            if is_valid_commit(daemon_sha, workspace_dir):
+                try:
+                    data = {}
+                    if os.path.exists(baseline_file):
+                        try:
+                            with open(baseline_file, "r") as f:
+                                data = json.load(f)
+                        except Exception:
+                            pass
+                    data["baseline_sha"] = daemon_sha
+                    data["workspace_path"] = ws_norm
+                    data.setdefault("created_at", time.time())
+                    with open(baseline_file, "w") as f:
+                        json.dump(data, f)
+                except Exception:
+                    pass
+                return daemon_sha
     except Exception:
         pass
 
@@ -406,13 +424,14 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
         )
         if ref_proc.returncode == 0 and ref_proc.stdout.strip():
             ref_sha = ref_proc.stdout.strip()
-            # Register with daemon if online
-            call_system_one("v1/session/baseline", {
-                "conversationId": conv_id,
-                "workspace_path": ws_norm,
-                "commit_sha": ref_sha
-            }, timeout=1.0)
-            return ref_sha
+            if is_valid_commit(ref_sha, workspace_dir):
+                # Register with daemon if online
+                call_system_one("v1/session/baseline", {
+                    "conversationId": conv_id,
+                    "workspace_path": ws_norm,
+                    "commit_sha": ref_sha
+                }, timeout=1.0)
+                return ref_sha
     except Exception:
         pass
 
@@ -422,7 +441,7 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
             with open(baseline_file, "r") as f:
                 data = json.load(f)
                 cached_sha = data.get("baseline_sha")
-                if cached_sha:
+                if cached_sha and is_valid_commit(cached_sha, workspace_dir):
                     call_system_one("v1/session/baseline", {
                         "conversationId": conv_id,
                         "workspace_path": ws_norm,
@@ -810,8 +829,15 @@ def handle_post_tool_use(payload: dict) -> dict:
     stdout_tail = None
     diff_stat = None
     harness_status = None
-    tool_cwd = tool_args.get("Cwd") or os.getcwd()
-    if tool_cwd and conv_id != "unknown":
+    tool_cwd = (
+        tool_args.get("Cwd")
+        or payload.get("workspace_dir")
+        or payload.get("workspace")
+        or payload.get("cwd")
+        or get_workspace_dir(payload)
+        or os.getcwd()
+    )
+    if tool_cwd and conv_id != "unknown" and os.path.isdir(tool_cwd):
         get_or_set_session_baseline(tool_cwd, conv_id)
 
     if tool_name == "run_command":
@@ -1104,6 +1130,15 @@ def handle_stop(payload: dict) -> dict:
     modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
     if git_paths:
         modified_paths = list(set(modified_paths) | set(git_paths))
+        all_mod_names = sorted(list(set(os.path.basename(p) for p in modified_paths)))
+        if all_mod_names:
+            if "MODIFIED FILES: No files were modified." in premise_str:
+                premise_str = premise_str.replace(
+                    "MODIFIED FILES: No files were modified.",
+                    f"MODIFIED FILES: {', '.join(all_mod_names)}."
+                )
+            elif "MODIFIED FILES:" not in premise_str:
+                premise_str += f" MODIFIED FILES: {', '.join(all_mod_names)}."
 
     # Evasion E4 Check: Git History Lineage (merge-base ancestor check)
     if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
