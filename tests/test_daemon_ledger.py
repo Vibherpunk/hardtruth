@@ -169,5 +169,49 @@ class TestRound7ApiToken(unittest.TestCase):
         self.assertTrue(validate_api_token(tok))
 
 
+class TestRound8PurgeRecords(unittest.TestCase):
+    """Round 8 (#6): test-artifact purge rebuilds the ledger chain (chain stays valid)."""
+
+    def test_purge_records_excludes_prefixes_and_keeps_chain_valid(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger_path = os.path.join(td, "ledger.jsonl")
+            key_path = os.path.join(td, "key")
+            ledger = DaemonLedger(ledger_path=ledger_path, key_path=key_path)
+            ledger.record_entry(conversation_id="test-conv-abc", step_idx=0, tool="run_command", target="pytest", observed_exit_code=0)
+            ledger.record_entry(conversation_id="auth-test-xyz", step_idx=0, tool="run_command", target="pytest", observed_exit_code=0)
+            ledger.record_entry(conversation_id="real-conv-1", step_idx=0, tool="run_command", target="pytest", observed_exit_code=0)
+            ledger.set_session_baseline("test-conv-abc", os.path.abspath("."), "sha123")
+
+            res = ledger.purge_records(["test-conv-", "auth-test-", "tier2-live-"])
+            self.assertEqual(res["purged"], 3, "two records + one baseline for test-conv-abc")
+            self.assertEqual(res["kept"], 1)
+            valid, count, msg = ledger.verify_chain()
+            self.assertTrue(valid, msg)
+            self.assertEqual(count, 1)
+            premise = ledger.get_premise("real-conv-1")
+            self.assertGreaterEqual(premise.get("verification_commands_executed", 0), 1)
+
+    def test_purge_noop_when_no_match(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger = DaemonLedger(ledger_path=os.path.join(td, "l.jsonl"), key_path=os.path.join(td, "k"))
+            ledger.record_entry(conversation_id="real-conv-1", step_idx=0, tool="run_command", target="pytest", observed_exit_code=0)
+            res = ledger.purge_records(["test-conv-"])
+            self.assertEqual(res["purged"], 0)
+            self.assertEqual(res["kept"], 1)
+
+    def test_purge_refuses_tampered_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            ledger_path = os.path.join(td, "l.jsonl")
+            ledger = DaemonLedger(ledger_path=ledger_path, key_path=os.path.join(td, "k"))
+            ledger.record_entry(conversation_id="test-conv-abc", step_idx=0, tool="run_command", target="pytest", observed_exit_code=0)
+            # Tamper: change the entry's stepIdx so the canonical hash no longer matches.
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                content = f.read().replace('"stepIdx": 0', '"stepIdx": 99', 1)
+            with open(ledger_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            with self.assertRaises(ValueError):
+                ledger.purge_records(["test-conv-"])
+
+
 if __name__ == "__main__":
     unittest.main()

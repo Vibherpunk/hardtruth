@@ -18,6 +18,10 @@ Tests:
 14. Secure Counter Directory & Path Traversal Prevention
 15. Circuit Breaker Visible Warning on 4th Attempt
 16. Daemon Unreachable Fail-Closed Behavior
+17. Ledger Writes Require API Token (Round 7 Finding A)
+18. Tier 2 Handoff Daemon-Visible Workspace (Round 7 Finding B)
+19. Ledger Premise Reads Require API Token (Round 8)
+20. Session Baseline Reads Require API Token (Round 8)
 """
 
 import os
@@ -43,6 +47,11 @@ class TestSystemOneSentinel(unittest.TestCase):
         os.makedirs(self.halt_dir, mode=0o700, exist_ok=True)
         os.environ["HARDTRUTH_LEDGER_PATH"] = self.ledger_file
         os.environ["HARDTRUTH_HALT_DIR"] = self.halt_dir
+        # Round 8 (#6): run hook subprocesses token-less so test suites never write
+        # records into the physical daemon ledger (daemon rejects with 401; the hook
+        # degrades gracefully to its local temp ledger). test_17/test_18 explicitly
+        # restore the real token to exercise the live authenticated HTTP path.
+        os.environ["HARDTRUTH_API_KEY"] = os.path.join(self.test_dir, "no-such-key")
         self.conv_id = f"test-conv-{uuid.uuid4().hex}"
 
     def tearDown(self):
@@ -454,6 +463,7 @@ class TestSystemOneSentinel(unittest.TestCase):
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
         except Exception:
             self.skipTest("daemon not reachable")
+        os.environ.pop("HARDTRUTH_API_KEY", None)  # Round 8 (#6): restore real token source for this live test
         payload = json.dumps({
             "conversationId": f"auth-test-{uuid.uuid4().hex}",
             "stepIdx": 0,
@@ -497,6 +507,7 @@ class TestSystemOneSentinel(unittest.TestCase):
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
         except Exception:
             self.skipTest("daemon not reachable")
+        os.environ.pop("HARDTRUTH_API_KEY", None)  # Round 8 (#6): restore real token source for this live test
         tok = get_api_token()
         if not tok:
             self.skipTest("no HARDTRUTH_API_TOKEN configured")
@@ -511,6 +522,66 @@ class TestSystemOneSentinel(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=130) as resp:
             body = json.loads(resp.read().decode())
         self.assertTrue(body.get("success"), f"Tier 2 handoff failed: {body.get('output','')[:300]}")
+
+    def test_19_ledger_premise_requires_api_token(self):
+        """Round 8 (#3): premise reads without the shared token are rejected (401)."""
+        import urllib.request, urllib.error, urllib.parse
+        from client.hardtruth_hook import get_api_token
+        daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+        if os.environ.get("CI") == "true":
+            self.skipTest("Tier 2 in-container run: live daemon tests skipped")
+        try:
+            urllib.request.urlopen(daemon_base + "/health", timeout=2)
+        except Exception:
+            self.skipTest("daemon not reachable")
+        os.environ.pop("HARDTRUTH_API_KEY", None)  # Round 8 (#6): restore real token source for this live test
+        conv = f"premise-auth-{uuid.uuid4().hex}"
+        url = daemon_base + "/v1/ledger/premise?conversationId=" + urllib.parse.quote(conv)
+        # No token -> 401
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(url, timeout=3)
+        self.assertEqual(ctx.exception.code, 401, "premise read without token must be rejected")
+        # Valid token -> 200
+        tok = get_api_token()
+        if not tok:
+            self.skipTest("no HARDTRUTH_API_TOKEN configured")
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode())
+        self.assertEqual(resp.status, 200)
+        self.assertIn("unresolved_failures", body)
+
+    def test_20_session_baseline_get_requires_api_token(self):
+        """Round 8 (#3): baseline reads without the shared token are rejected (401)."""
+        import urllib.request, urllib.error, urllib.parse
+        from client.hardtruth_hook import get_api_token
+        daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+        if os.environ.get("CI") == "true":
+            self.skipTest("Tier 2 in-container run: live daemon tests skipped")
+        try:
+            urllib.request.urlopen(daemon_base + "/health", timeout=2)
+        except Exception:
+            self.skipTest("daemon not reachable")
+        os.environ.pop("HARDTRUTH_API_KEY", None)  # Round 8 (#6): restore real token source for this live test
+        tok = get_api_token()
+        if not tok:
+            self.skipTest("no HARDTRUTH_API_TOKEN configured")
+        conv = f"baseline-auth-{uuid.uuid4().hex}"
+        url = (
+            daemon_base + "/v1/session/baseline"
+            "?conversationId=" + urllib.parse.quote(conv)
+            + "&workspace_path=" + urllib.parse.quote(REPO_ROOT)
+        )
+        # No token -> 401
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(url, timeout=3)
+        self.assertEqual(ctx.exception.code, 401, "baseline read without token must be rejected")
+        # Valid token -> 200
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body = json.loads(resp.read().decode())
+        self.assertEqual(resp.status, 200)
+        self.assertIn("baseline_sha", body)
 
 if __name__ == "__main__":
     unittest.main()

@@ -199,11 +199,44 @@ The daemon must be able to see agent workspaces to run Tier 2 verification:
   absolute path. If a workspace is not visible, Tier 2 fails closed with
   `status: "unverified_no_workspace"` instead of a silent pass.
 
+#### Read-Endpoint Authentication (Round 8)
+`GET /v1/ledger/premise` and `GET /v1/session/baseline` now also require the same
+shared token as the write endpoints. `/health` stays open for liveness checks.
+The hook already sends the token on premise/baseline reads; a token-less hook
+degrades gracefully to its local ledger.
+
+#### NLI Cold-Start Preload (Round 8)
+The Docker image preloads `cross-encoder/nli-deberta-v3-small` at build time and
+the daemon warms the model in a background thread at startup, so the first
+`/v1/verify-claim` in a fresh container is fast and `/health` reports
+`nli_loaded: true` shortly after boot. Trade-off: image size grows by roughly the
+model size (~500MB).
+
+#### Test Ledger Isolation & Purge (Round 8)
+Test runs no longer pollute the physical ledger:
+
+- `tests/test_live.py` runs hook subprocesses **token-less**, so their record and
+  baseline writes are rejected by the daemon (401) and stay in the test-local temp
+  ledger. Only the explicit live-auth tests (`test_17`-`test_20`) talk to a real
+  daemon with the real token.
+- For cleaning up artifacts from past or manual live runs, an ops-only CLI exists
+  (same-user filesystem access; deliberately **not** an HTTP endpoint so a remote
+  token holder cannot erase ledger evidence). Stop the daemon, then:
+  ```bash
+  HARDTRUTH_DAEMON_LEDGER=~/.hardtruth/daemon_ledger.jsonl \
+  HARDTRUTH_DAEMON_KEY=~/.hardtruth/daemon_hmac.key \
+  python3 scripts/purge_test_records.py
+  ```
+  The HMAC chain is rebuilt and re-verified over the kept records; a tampered
+  ledger is refused.
+
 ### 3. Run Test Suite
 ```bash
 pytest tests/
 ```
-All 29 tests pass cleanly across daemon ledger integrity, inverted gate rules, and live hook execution.
+All tests pass cleanly across daemon ledger integrity, inverted gate rules, live hook execution,
+and live daemon auth (Round 7/8). Tests that need a live daemon (`test_10`, `test_17`-`test_20`)
+self-skip under `CI=true` or when the daemon is unreachable.
 
 ---
 

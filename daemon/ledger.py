@@ -510,6 +510,102 @@ class DaemonLedger:
 
         return True, expected_index, "VALID"
 
+    def count_records_by_prefix(self, prefixes) -> dict:
+        """Round 8 (#6): counts records whose conversationId starts with any prefix.
+        Dry-run support for the purge ops tool; read-only, no chain rebuild."""
+        prefixes = tuple(str(p) for p in (prefixes or []) if str(p))
+        purged = 0
+        involved = set()
+        total = 0
+        if os.path.exists(self.ledger_path):
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if not line_s:
+                        continue
+                    try:
+                        record = json.loads(line_s)
+                    except Exception:
+                        continue
+                    total += 1
+                    entry = record.get("entry") or record
+                    conv = entry.get("conversationId", "")
+                    if prefixes and any(str(conv).startswith(p) for p in prefixes):
+                        purged += 1
+                        involved.add(str(conv))
+        return {"purged": purged, "conv_ids": len(involved), "total": total}
+
+    def purge_records(self, prefixes) -> dict:
+        """
+        Round 8 (#6): ops tooling — rebuilds this ledger excluding every record whose
+        conversationId starts with one of `prefixes` (used to clear test artifacts such
+        as test-conv-*, auth-test-*, tier2-live-*). The HMAC chain is recomputed over the
+        kept records, so chain validity is preserved. The daemon must NOT be running while
+        this is invoked (same-user filesystem/ops access only; deliberately NOT an HTTP
+        endpoint, so a remote token holder cannot erase ledger evidence).
+        """
+        prefixes = tuple(str(p) for p in (prefixes or []) if str(p))
+        if not prefixes or not os.path.exists(self.ledger_path):
+            return {"status": "noop", "purged": 0, "kept": 0}
+
+        valid, total, msg = self.verify_chain()
+        if not valid:
+            raise ValueError(f"Refusing to purge a tampered ledger: {msg}")
+
+        kept_rows = []
+        purged = 0
+        involved = set()
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                try:
+                    record = json.loads(line_s)
+                except Exception:
+                    continue
+                entry = record.get("entry") or record
+                conv = entry.get("conversationId", "")
+                if any(str(conv).startswith(p) for p in prefixes):
+                    purged += 1
+                    involved.add(str(conv))
+                else:
+                    kept_rows.append(record)
+
+        if purged == 0:
+            return {"status": "ok", "purged": 0, "kept": len(kept_rows)}
+
+        # Rebuild into a temp file, verify the rebuilt chain, then atomically replace.
+        tmp_path = f"{self.ledger_path}.purge-tmp"
+        prev_hash = "0" * 64
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for idx, record in enumerate(kept_rows):
+                entry = record["entry"]
+                canonical_entry = json.dumps(entry, sort_keys=True, separators=(",", ":"))
+                record["index"] = idx
+                record["prev_hash"] = prev_hash
+                record["hash"] = self._compute_hash(idx, prev_hash, canonical_entry)
+                f.write(json.dumps(record) + "\n")
+                prev_hash = record["hash"]
+        try:
+            os.chmod(tmp_path, 0o600)
+        except Exception:
+            pass
+
+        # Verify the rebuilt chain before swapping it in.
+        check = DaemonLedger(ledger_path=tmp_path, key_path=self.key_path)
+        rebuilt_valid, rebuilt_count, rebuilt_msg = check.verify_chain()
+        if not rebuilt_valid:
+            raise ValueError(f"Purge rebuild failed chain verification: {rebuilt_msg}")
+        os.replace(tmp_path, self.ledger_path)
+
+        # Drop in-memory baselines that belong to purged test conversations.
+        for (conv, _ws), _sha in list(self._session_baselines.items()):
+            if any(str(conv).startswith(p) for p in prefixes):
+                self._session_baselines.pop((conv, _ws), None)
+
+        return {"status": "ok", "purged": purged, "kept": len(kept_rows)}
+
     def get_premise(self, conversation_id: str) -> dict:
         """
         Reads ledger records for conversation_id after validating chain integrity.

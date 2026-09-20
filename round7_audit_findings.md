@@ -194,3 +194,46 @@ Daemon health: `chain_valid: True`, `records: 1136`, `nli_loaded: True`,
 `tier2_hard_gate: enabled`. Container daemon files md5-identical to HEAD.
 Note: the in-container Tier 2 suite records its hook events into the physical
 ledger under `test-conv-*` conversation IDs (append-only, isolated, chain intact).
+---
+
+## Round 8 — Residual hardening (low-risk batch) — RESOLVED
+
+Follow-up to the final question ("does it still have vulnerabilities?"). Items 3, 5,
+6 from the residual list are now fixed; item 2 (per-record session authenticity) and
+item 4 (CI live-daemon matrix job) remain open by design/choice.
+
+### #3 GET endpoints now require the API token
+`GET /v1/ledger/premise` and `GET /v1/session/baseline` are protected by the same
+`require_daemon_auth` dependency as the write endpoints (`/health` stays open).
+Verified live: 401 without token, 200 with token (premise + baseline).
+
+### #5 NLI cold start eliminated
+Dockerfile preloads `cross-encoder/nli-deberta-v3-small` at build time
+(553MB layer cache) and the daemon warms the model in a background thread at
+startup. First `/v1/verify-claim` on a fresh container: **159ms** (was ~8.3s
+download+load on first call).
+
+### #6 Test runs no longer pollute the physical ledger
+Root cause: hook subprocess *and* in-process calls (`handle_post_tool_use`,
+`get_or_set_session_baseline`) dual-write to the daemon ledger over HTTP whenever
+the daemon is reachable and a token is readable. Fix: all three hook-driving test
+suites (`test_live.py`, `test_hybrid_architecture.py`, `test_inverted_gate.py`)
+now run token-less (`HARDTRUTH_API_KEY` → nonexistent path in the test env), so
+the daemon rejects test writes (401) and hooks degrade to their local temp
+ledgers. Live-auth tests (`test_17`-`test_20`) restore the real token.
+Verified: full suite run adds exactly **+1** record (test_17's intentional live
+record), down from +36.
+Ops cleanup tooling for pre-existing artifacts:
+`scripts/purge_test_records.py` (dry-run + real purge; rebuilds and re-verifies
+the HMAC chain over kept records; refuses tampered ledgers; CLI-only so a remote
+token holder cannot erase ledger evidence). Demo on a ledger copy: 1182 purged,
+chain valid, documented probe namespaces (spotcheck/forge-test/fix-verify)
+preserved by default.
+
+### Suite status
+`pytest tests/` → **68 passed, 0 skipped** (63 + test_19/20 live GET-auth +
+3 purge unit tests). Daemon healthy, `chain_valid: True`, `nli_loaded: True`,
+`tier2_hard_gate: enabled`; container daemon files md5-identical to source.
+Health note: the pre-existing record count in this dev ledger is ~99% synthetic
+(test runs + round-7 probes + verification runs); the purge tooling can clean it
+(offline) when desired.

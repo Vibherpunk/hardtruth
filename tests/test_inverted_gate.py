@@ -33,11 +33,18 @@ class TestInvertedGate(unittest.TestCase):
         self.halt_dir = os.path.join(self.test_dir, "halts")
         os.makedirs(self.halt_dir, mode=0o700, exist_ok=True)
         self.conv_id = f"test-gate-{uuid.uuid4().hex}"
+        # Round 8 (#6): token-less isolation in the process env (hook helpers may run
+        # in-process) so no test run writes into the physical daemon ledger.
+        os.environ["HARDTRUTH_API_KEY"] = os.path.join(self.test_dir, "no-such-key")
         self.env = {
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
-            "SYSTEM_ONE_URL": "http://127.0.0.1:8000"
+            "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
+            # Round 8 (#6): run hook subprocesses token-less so test suites never
+            # write records into the physical daemon ledger (daemon rejects with 401;
+            # the hook degrades gracefully to its local temp ledger).
+            "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key")
         }
 
     def tearDown(self):

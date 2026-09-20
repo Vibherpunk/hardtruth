@@ -36,12 +36,20 @@ class TestHybridArchitecture(unittest.TestCase):
         self.conv_id = f"test-hybrid-{uuid.uuid4().hex}"
         self.old_halt_dir = os.environ.get("HARDTRUTH_HALT_DIR")
         os.environ["HARDTRUTH_HALT_DIR"] = self.halt_dir
+        # Round 8 (#6): token-less isolation in the process env too (some hook helpers
+        # run in-process here, e.g. get_or_set_session_baseline) so no test run writes
+        # into the physical daemon ledger.
+        os.environ["HARDTRUTH_API_KEY"] = os.path.join(self.test_dir, "no-such-key")
         self.env = {
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
             "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
-            "HARDTRUTH_SKIP_TIER2": "1"  # Skipped unless specifically tested
+            "HARDTRUTH_SKIP_TIER2": "1",  # Skipped unless specifically tested
+            # Round 8 (#6): run hook subprocesses token-less so test suites never write
+            # records into the physical daemon ledger (daemon rejects with 401; hook
+            # degrades gracefully to its local temp ledger).
+            "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key")
         }
 
     def tearDown(self):

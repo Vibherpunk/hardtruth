@@ -112,6 +112,19 @@ def get_nli_direct():
                 _nli_direct_model.eval()
     return _nli_direct_tok, _nli_direct_model
 
+
+def _warmup_nli_in_background():
+    """Round 8 (#5): eager-load the NLI model at startup (weights are baked into the
+    image by the Dockerfile preload step), so /health reports nli_loaded quickly and
+    the first /v1/verify-claim doesn't pay a cold-start download/load penalty."""
+    try:
+        get_nli_direct()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup_nli_in_background, daemon=True, name="nli-warmup").start()
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -231,7 +244,7 @@ def record_ledger_entry(req: RecordLedgerRequest):
     )
     return res
 
-@app.get("/v1/ledger/premise")
+@app.get("/v1/ledger/premise", dependencies=[Depends(require_daemon_auth)])
 def get_ledger_premise(conversationId: str = Query(..., description="Conversation ID to query")):
     """
     Validates HMAC hash-chain integrity, extracts execution evidence, and compiles failure-biased premise.
@@ -255,7 +268,7 @@ def set_session_baseline(req: SessionBaselineRequest):
         return {"baseline_sha": saved, "status": "created"}
     return {"baseline_sha": None, "status": "not_found"}
 
-@app.get("/v1/session/baseline")
+@app.get("/v1/session/baseline", dependencies=[Depends(require_daemon_auth)])
 def get_session_baseline(
     conversationId: str = Query(..., description="Conversation ID"),
     workspace_path: str = Query(..., description="Workspace path")
