@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Kept as its own layer so rebuilds cache it.
 RUN python3 -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; AutoTokenizer.from_pretrained('cross-encoder/nli-deberta-v3-small'); AutoModelForSequenceClassification.from_pretrained('cross-encoder/nli-deberta-v3-small')"
 # Tier 2 needs pytest in-image to run canonical suites in the subprocess sandbox
-RUN pip install --no-cache-dir pytest
+RUN pip install --no-cache-dir pytest httpx
 
 COPY daemon/ /app/
 

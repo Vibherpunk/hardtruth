@@ -280,6 +280,31 @@ class DaemonLedger:
         self.key_path = key_path or os.environ.get("HARDTRUTH_DAEMON_KEY", DEFAULT_KEY_PATH)
         self._key = self._load_or_create_key()
         self._session_baselines: Dict[Tuple[str, str], str] = {}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._step_counters: Dict[str, int] = {}
+
+    def start_session(self, conversation_id: str, workspace_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
+        """
+        Open Item #2: Registers an active session with an ephemeral 256-bit secret.
+        Returns (status, session_secret).
+        If new: returns ("created", secret).
+        If already active: returns ("already_active", None) to prevent secret leakage.
+        """
+        conv_str = str(conversation_id)
+        if conv_str in self._sessions:
+            return "already_active", None
+
+        secret = secrets.token_hex(32)
+        self._sessions[conv_str] = {
+            "secret": secret,
+            "last_step_idx": -1,
+            "workspace_path": workspace_path,
+            "created_at": time.time()
+        }
+        return "created", secret
+
+    def get_session(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        return self._sessions.get(str(conversation_id))
 
     def _load_or_create_key(self) -> bytes:
         key_dir = os.path.dirname(os.path.abspath(self.key_path))
@@ -365,6 +390,19 @@ class DaemonLedger:
             is_tainted = True
             error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
             harness_status = "tainted_shell_operator"
+
+        # Open Item #2: Monotonic Step Index Enforcement
+        conv_str = str(conversation_id)
+        if hasattr(self, "_sessions") and conv_str in self._sessions:
+            last_step = self._sessions[conv_str].get("last_step_idx", -1)
+            if step_idx < last_step:
+                raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+            self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
+        elif hasattr(self, "_step_counters"):
+            last_step = self._step_counters.get(conv_str, -1)
+            if step_idx < last_step:
+                raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+            self._step_counters[conv_str] = max(last_step, step_idx)
 
         entry_data = {
             "conversationId": conversation_id,

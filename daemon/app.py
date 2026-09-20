@@ -15,8 +15,12 @@ from __future__ import annotations
 import os
 import sys
 import time
-import psutil
+import hmac
 import threading
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -176,6 +180,15 @@ class GetPremiseResponse(BaseModel):
     broken_at_index: Optional[int] = None
     detail: Optional[str] = None
 
+class SessionStartRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    workspace_path: Optional[str] = Field(None, max_length=1024)
+
+class SessionStartResponse(BaseModel):
+    conversationId: str
+    session_secret: Optional[str] = None
+    status: str
+
 class SessionBaselineRequest(BaseModel):
     conversationId: str = Field(..., max_length=128)
     workspace_path: str = Field(..., max_length=1024)
@@ -201,8 +214,13 @@ class HandoffVerifyResponse(BaseModel):
 @app.get("/health")
 @app.get("/v1/health")
 def health_check():
-    process = psutil.Process(os.getpid())
-    rss_mb = process.memory_info().rss / (1024 * 1024)
+    rss_mb = 0.0
+    if psutil:
+        try:
+            process = psutil.Process(os.getpid())
+            rss_mb = process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
     valid_chain, records_count, chain_msg = _ledger.verify_chain()
     return {
         "status": "healthy",
@@ -224,31 +242,71 @@ def health_check():
         "docs_url": "http://127.0.0.1:8000/docs"
     }
 
+@app.post("/v1/session/start", response_model=SessionStartResponse, dependencies=[Depends(require_daemon_auth)])
+def session_start(req: SessionStartRequest):
+    """
+    Open Item #2: Register session and mint ephemeral 256-bit session secret.
+    Returns session_secret ONLY on creation. Subsequent calls return status: already_active
+    without secret to prevent credential leakage.
+    """
+    status, secret = _ledger.start_session(req.conversationId, req.workspace_path)
+    return SessionStartResponse(
+        conversationId=req.conversationId,
+        session_secret=secret,
+        status=status
+    )
+
 @app.post("/v1/ledger/record", dependencies=[Depends(require_daemon_auth)])
-def record_ledger_entry(req: RecordLedgerRequest):
+def record_ledger_entry(
+    req: RecordLedgerRequest,
+    x_session_secret: Optional[str] = Header(None, alias="X-Session-Secret")
+):
     """
     Appends an execution event to the HMAC-SHA256 hash-chained ledger.
+    Validates X-Session-Secret if session is registered.
+    Enforces monotonic step sequencing.
     """
-    res = _ledger.record_entry(
-        conversation_id=req.conversationId,
-        step_idx=req.stepIdx,
-        tool=req.tool,
-        target=req.target,
-        observed_exit_code=req.observed_exit_code,
-        harness_status=req.harness_status,
-        error=req.error,
-        stdout_tail=req.stdout_tail,
-        diff_stat=req.diff_stat,
-        timestamp=req.timestamp,
-        cwd=req.cwd
-    )
-    return res
+    session = _ledger.get_session(req.conversationId)
+    if session:
+        if not x_session_secret:
+            raise HTTPException(status_code=403, detail="Forbidden: missing X-Session-Secret for active session")
+        if not hmac.compare_digest(str(x_session_secret), session["secret"]):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid X-Session-Secret")
+
+    try:
+        res = _ledger.record_entry(
+            conversation_id=req.conversationId,
+            step_idx=req.stepIdx,
+            tool=req.tool,
+            target=req.target,
+            observed_exit_code=req.observed_exit_code,
+            harness_status=req.harness_status,
+            error=req.error,
+            stdout_tail=req.stdout_tail,
+            diff_stat=req.diff_stat,
+            timestamp=req.timestamp,
+            cwd=req.cwd
+        )
+        return res
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 @app.get("/v1/ledger/premise", dependencies=[Depends(require_daemon_auth)])
-def get_ledger_premise(conversationId: str = Query(..., description="Conversation ID to query")):
+def get_ledger_premise(
+    conversationId: str = Query(..., description="Conversation ID to query"),
+    x_session_secret: Optional[str] = Header(None, alias="X-Session-Secret")
+):
     """
     Validates HMAC hash-chain integrity, extracts execution evidence, and compiles failure-biased premise.
+    Validates X-Session-Secret if session is registered.
     """
+    session = _ledger.get_session(conversationId)
+    if session:
+        if not x_session_secret:
+            raise HTTPException(status_code=403, detail="Forbidden: missing X-Session-Secret for active session")
+        if not hmac.compare_digest(str(x_session_secret), session["secret"]):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid X-Session-Secret")
+
     premise_data = _ledger.get_premise(conversationId)
     if premise_data.get("tampered"):
         return JSONResponse(status_code=400, content=premise_data)

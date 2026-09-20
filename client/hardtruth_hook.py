@@ -115,13 +115,76 @@ def get_halt_counter_file(conv_id: str) -> str:
     return os.path.join(halt_dir, f"halt_{safe_slug}_{conv_hash}.json")
 
 
-def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0) -> Optional[dict]:
+_SESSION_SECRETS: Dict[str, str] = {}
+
+
+def get_session_secret_file(conv_id: str) -> str:
+    """Returns secure slugified and hashed session secret path inside mode 0o700 dir."""
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(halt_dir, 0o700)
+    except Exception:
+        pass
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(halt_dir, f"session_{safe_slug}_{conv_hash}.key")
+
+
+def get_or_create_session_secret(conv_id: str, workspace_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Open Item #2: Retrieves or requests an ephemeral session secret from the daemon.
+    Caches secret in process memory and mode 0400 file in halt_dir.
+    """
+    if not conv_id or conv_id == "unknown":
+        return None
+    if conv_id in _SESSION_SECRETS:
+        return _SESSION_SECRETS[conv_id]
+
+    key_path = get_session_secret_file(conv_id)
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                sec = f.read().strip()
+                if len(sec) >= 32:
+                    _SESSION_SECRETS[conv_id] = sec
+                    return sec
+        except Exception:
+            pass
+
+    # Mint session secret on daemon
+    resp = call_system_one("v1/session/start", {
+        "conversationId": conv_id,
+        "workspace_path": workspace_dir or os.getcwd()
+    }, timeout=2.0)
+    if resp and resp.get("session_secret"):
+        sec = resp.get("session_secret")
+        _SESSION_SECRETS[conv_id] = sec
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(key_path, flags, 0o400)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(sec)
+            try:
+                os.chmod(key_path, 0o400)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return sec
+
+    return None
+
+
+def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0, session_secret: Optional[str] = None) -> Optional[dict]:
     url = f"{SYSTEM_ONE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     tok = get_api_token()
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
+    if session_secret:
+        headers["X-Session-Secret"] = session_secret
     req = urllib.request.Request(
         url,
         data=data,
@@ -133,6 +196,10 @@ def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0) -> Optio
     except urllib.error.HTTPError as e:
         if e.code == 401:
             sys.stderr.write("⚠️ HardTruth: daemon rejected request (401) — HARDTRUTH_API_TOKEN mismatch between hook and daemon.\n")
+        elif e.code == 403:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (403) — X-Session-Secret mismatch or unauthorized session.\n")
+        elif e.code == 409:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (409) — Conflict / out-of-order step.\n")
         return None
     except Exception:
         return None
@@ -610,7 +677,8 @@ def handle_post_tool_use(payload: dict) -> dict:
         "cwd": tool_cwd
     }
 
-    call_system_one("v1/ledger/record", record_payload, timeout=2.0)
+    session_secret = get_or_create_session_secret(conv_id, tool_cwd)
+    call_system_one("v1/ledger/record", record_payload, timeout=2.0, session_secret=session_secret)
 
     local_ledger = get_local_ledger()
     if local_ledger:
@@ -721,6 +789,7 @@ def handle_stop(payload: dict) -> dict:
 
     # Fetch Ledger Premise
     premise_data = None
+    session_secret = get_or_create_session_secret(conv_id, workspace_dir)
     local_ledger = get_local_ledger()
     if os.environ.get("HARDTRUTH_LEDGER_PATH") and local_ledger:
         try:
@@ -735,6 +804,8 @@ def handle_stop(payload: dict) -> dict:
             premise_tok = get_api_token()
             if premise_tok:
                 premise_headers["Authorization"] = f"Bearer {premise_tok}"
+            if session_secret:
+                premise_headers["X-Session-Secret"] = session_secret
             req = urllib.request.Request(url, headers=premise_headers)
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 premise_data = json.loads(resp.read().decode("utf-8"))
@@ -910,10 +981,17 @@ def handle_stop(payload: dict) -> dict:
                 "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
             }
 
-    # All tiers passed: reset counter file
+    # All tiers passed: reset counter file and session key
     if os.path.exists(counter_file):
         try:
             os.remove(counter_file)
+        except Exception:
+            pass
+
+    sec_file = get_session_secret_file(conv_id)
+    if os.path.exists(sec_file):
+        try:
+            os.remove(sec_file)
         except Exception:
             pass
 

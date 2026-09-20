@@ -630,5 +630,180 @@ class TestRound7Fixes(unittest.TestCase):
         self.assertEqual(res["status"], "unverified_no_workspace")
 
 
+class TestRound9SessionAuthenticity(unittest.TestCase):
+    """Open Item #2: Per-record session authenticity & monotonic step sequencing."""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="hardtruth-session-test-")
+        self.ledger_path = os.path.join(self.test_dir, "daemon_ledger.jsonl")
+        self.key_path = os.path.join(self.test_dir, "daemon_hmac.key")
+        self.ledger = DaemonLedger(ledger_path=self.ledger_path, key_path=self.key_path)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_session_start_mints_secret_once(self):
+        """POST /v1/session/start generates 256-bit secret on creation."""
+        status, secret = self.ledger.start_session("conv-sess-1", "/tmp")
+        self.assertEqual(status, "created")
+        self.assertIsNotNone(secret)
+        self.assertGreaterEqual(len(secret), 32)
+        sess = self.ledger.get_session("conv-sess-1")
+        self.assertIsNotNone(sess)
+        self.assertEqual(sess["secret"], secret)
+
+    def test_session_start_idempotent_omits_secret(self):
+        """Subsequent start_session calls return already_active without leaking secret."""
+        status1, secret1 = self.ledger.start_session("conv-sess-2", "/tmp")
+        self.assertEqual(status1, "created")
+        status2, secret2 = self.ledger.start_session("conv-sess-2", "/tmp")
+        self.assertEqual(status2, "already_active")
+        self.assertIsNone(secret2, "Secret must NEVER be returned on subsequent start calls")
+
+    def test_step_monotonicity_rejects_backdating(self):
+        """Step index cannot decrease within the same session (defeats backdating)."""
+        self.ledger.start_session("conv-sess-3", "/tmp")
+        # Step 5 succeeds
+        rec1 = self.ledger.record_entry("conv-sess-3", 5, "run_command", "pytest tests/")
+        self.assertEqual(rec1["status"], "recorded")
+
+        # Step 3 (backdating) MUST raise ValueError
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.record_entry("conv-sess-3", 3, "run_command", "pytest tests/test_forged.py")
+        self.assertIn("Out-of-order step execution", str(ctx.exception))
+
+        # Same step 5 (e.g. parallel tool call in same step) is permitted
+        rec2 = self.ledger.record_entry("conv-sess-3", 5, "view_file", "foo.py")
+        self.assertEqual(rec2["status"], "recorded")
+
+        # Step 6 (forward) succeeds
+        rec3 = self.ledger.record_entry("conv-sess-3", 6, "run_command", "pytest tests/")
+        self.assertEqual(rec3["status"], "recorded")
+
+    def test_http_session_start_and_secret_enforcement(self):
+        """HTTP endpoints enforce session registration, secret validation, and 403 on tampering."""
+        from daemon.app import app, session_start, record_ledger_entry, get_ledger_premise, SessionStartRequest, RecordLedgerRequest
+        from daemon.ledger import get_daemon_api_token
+        from fastapi import HTTPException
+        api_tok = get_daemon_api_token()
+        conv = f"http-sess-{uuid.uuid4().hex}"
+
+        try:
+            from fastapi.testclient import TestClient
+            client = TestClient(app)
+        except (ImportError, RuntimeError):
+            client = None
+
+        if client is not None:
+            auth_hdr = {"Authorization": f"Bearer {api_tok}"}
+
+            # 1. Unauthenticated /v1/session/start -> 401
+            r_unauth = client.post("/v1/session/start", json={"conversationId": conv, "workspace_path": "/tmp"})
+            self.assertEqual(r_unauth.status_code, 401)
+
+            # 2. Authenticated /v1/session/start -> 200, status: created, secret returned
+            r_start = client.post("/v1/session/start", json={"conversationId": conv, "workspace_path": "/tmp"}, headers=auth_hdr)
+            self.assertEqual(r_start.status_code, 200)
+            body = r_start.json()
+            self.assertEqual(body["status"], "created")
+            session_secret = body["session_secret"]
+            self.assertIsNotNone(session_secret)
+
+            # 3. Repeat start -> already_active, secret is None
+            r_repeat = client.post("/v1/session/start", json={"conversationId": conv, "workspace_path": "/tmp"}, headers=auth_hdr)
+            self.assertEqual(r_repeat.status_code, 200)
+            self.assertEqual(r_repeat.json()["status"], "already_active")
+            self.assertIsNone(r_repeat.json()["session_secret"])
+
+            # 4. Record without X-Session-Secret -> 403
+            payload = {
+                "conversationId": conv,
+                "stepIdx": 1,
+                "tool": "run_command",
+                "target": "pytest",
+                "observed_exit_code": 0
+            }
+            r_no_sec = client.post("/v1/ledger/record", json=payload, headers=auth_hdr)
+            self.assertEqual(r_no_sec.status_code, 403)
+
+            # 5. Record with wrong X-Session-Secret -> 403
+            bad_hdr = dict(auth_hdr, **{"X-Session-Secret": "0" * 64})
+            r_bad_sec = client.post("/v1/ledger/record", json=payload, headers=bad_hdr)
+            self.assertEqual(r_bad_sec.status_code, 403)
+
+            # 6. Record with valid X-Session-Secret -> 200 recorded
+            ok_hdr = dict(auth_hdr, **{"X-Session-Secret": session_secret})
+            r_ok = client.post("/v1/ledger/record", json=payload, headers=ok_hdr)
+            self.assertEqual(r_ok.status_code, 200)
+            self.assertEqual(r_ok.json()["status"], "recorded")
+
+            # 7. Premise read without X-Session-Secret -> 403
+            r_prem_no = client.get(f"/v1/ledger/premise?conversationId={conv}", headers=auth_hdr)
+            self.assertEqual(r_prem_no.status_code, 403)
+
+            # 8. Premise read with valid X-Session-Secret -> 200
+            r_prem_ok = client.get(f"/v1/ledger/premise?conversationId={conv}", headers=ok_hdr)
+            self.assertEqual(r_prem_ok.status_code, 200)
+
+            # 9. Decreasing step index via HTTP -> 409 Conflict
+            backdate_payload = {
+                "conversationId": conv,
+                "stepIdx": 0,
+                "tool": "run_command",
+                "target": "pytest backdated",
+                "observed_exit_code": 0
+            }
+            r_backdate = client.post("/v1/ledger/record", json=backdate_payload, headers=ok_hdr)
+            self.assertEqual(r_backdate.status_code, 409)
+        else:
+            # Direct handler invocations
+            req_start = SessionStartRequest(conversationId=conv, workspace_path="/tmp")
+            res_start = session_start(req_start)
+            self.assertEqual(res_start.status, "created")
+            session_secret = res_start.session_secret
+            self.assertIsNotNone(session_secret)
+
+            res_repeat = session_start(req_start)
+            self.assertEqual(res_repeat.status, "already_active")
+            self.assertIsNone(res_repeat.session_secret)
+
+            req_rec = RecordLedgerRequest(
+                conversationId=conv,
+                stepIdx=1,
+                tool="run_command",
+                target="pytest",
+                observed_exit_code=0
+            )
+            with self.assertRaises(HTTPException) as cm:
+                record_ledger_entry(req_rec, x_session_secret=None)
+            self.assertEqual(cm.exception.status_code, 403)
+
+            with self.assertRaises(HTTPException) as cm:
+                record_ledger_entry(req_rec, x_session_secret="0" * 64)
+            self.assertEqual(cm.exception.status_code, 403)
+
+            rec_ok = record_ledger_entry(req_rec, x_session_secret=session_secret)
+            self.assertEqual(rec_ok["status"], "recorded")
+
+            with self.assertRaises(HTTPException) as cm:
+                get_ledger_premise(conversationId=conv, x_session_secret=None)
+            self.assertEqual(cm.exception.status_code, 403)
+
+            prem_ok = get_ledger_premise(conversationId=conv, x_session_secret=session_secret)
+            self.assertIn("verification_commands_executed", prem_ok)
+
+            req_backdate = RecordLedgerRequest(
+                conversationId=conv,
+                stepIdx=0,
+                tool="run_command",
+                target="pytest backdated",
+                observed_exit_code=0
+            )
+            with self.assertRaises(HTTPException) as cm:
+                record_ledger_entry(req_backdate, x_session_secret=session_secret)
+            self.assertEqual(cm.exception.status_code, 409)
+
+
+
 if __name__ == "__main__":
     unittest.main()
