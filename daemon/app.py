@@ -105,6 +105,7 @@ class RecordLedgerRequest(BaseModel):
     stdout_tail: Optional[str] = None
     diff_stat: Optional[str] = None
     timestamp: Optional[float] = None
+    cwd: Optional[str] = None
 
 class UnresolvedFailureItem(BaseModel):
     command: str
@@ -112,6 +113,7 @@ class UnresolvedFailureItem(BaseModel):
     error: Optional[str] = None
     stdout_tail: Optional[str] = None
     stepIdx: Optional[int] = None
+    cwd: Optional[str] = None
 
 class GetPremiseResponse(BaseModel):
     tampered: bool
@@ -186,7 +188,8 @@ def record_ledger_entry(req: RecordLedgerRequest):
         error=req.error,
         stdout_tail=req.stdout_tail,
         diff_stat=req.diff_stat,
-        timestamp=req.timestamp
+        timestamp=req.timestamp,
+        cwd=req.cwd
     )
     return res
 

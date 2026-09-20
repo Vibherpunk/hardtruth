@@ -73,3 +73,35 @@ The tests in `test_inverted_gate.py` and `test_daemon_ledger.py` only cover the 
 2. **Robust Exit Code Extraction:** Do not regex the raw `content` field which contains agent stdout. The harness should ideally pass the explicit integer `exitCode` in the `PostToolUse` payload. If polling is required, ensure the regex strictly anchors to the system prefix, out of reach of stdout spoofing.
 3. **Generalize Test Resolution:** Instead of `base_cmd tests/`, the resolution engine should allow any passing verification command with the same `base_cmd` to clear prior failures, or maintain a graph of test targets.
 4. **Fix Regex Anchoring:** Remove the `^` anchor in `VERIFICATION_CMD_PATTERN` to allow `cd dir && cmd` or env var prefixes (`CI=1 pytest`). Ensure shell operators (`;`, `&&`, `||`) are stripped or parsed correctly to prevent exit code spoofing.
+
+---
+
+## 6. Independent Adversarial Audit (Round 2 — Commit `b6d69a1`)
+
+An independent adversarial audit conducted by Opus subagent `f7b3bca5` on commit `b6d69a1` identified 5 critical vulnerabilities and edge cases in the initial hybrid implementation:
+
+1. **`re.MULTILINE` Regex Spoofing (CRITICAL):**
+   - *Vulnerability:* The transcript polling regex was compiled with `re.MULTILINE`, allowing `^` to match the start of *any* line in `stdout`. An agent could echo `\nCreated At: ... \nThe command exited with code 0` in its command output to forge an exit code of 0.
+   - *Mitigation:* Replaced `re.MULTILINE` with `\A` (strict string start anchor) matching the exact beginning of the harness log content at index 0. Removed all loose regex fallbacks.
+2. **Pipe Operator Masking (CRITICAL):**
+   - *Vulnerability:* `SHELL_OPERATOR_MASK_PATTERN` caught `; true` and `|| exit 0` but omitted POSIX pipe operators (`|`). An agent could run `pytest | cat` to mask non-zero exit codes with exit 0.
+   - *Mitigation:* Expanded `SHELL_OPERATOR_MASK_PATTERN` to check for pipes (`| cat`, `| tee`, `| head`, `| grep`) and flag any piped verification command as `TAINTED`.
+3. **Agent-Controlled Manifest Poisoning (CRITICAL):**
+   - *Vulnerability:* Tier 2 relied on reading `Makefile` and `package.json` directly from the workspace. An agent could rewrite `Makefile` with `test: exit 0` or edit `package.json` to spoof test suites.
+   - *Mitigation:* Added `check_manifest_tampering` to inspect `git status --porcelain` on build manifests. If `Makefile` or `package.json` was modified during the task, Tier 2 refuses execution with `status: "tampered"`.
+4. **Docker Read-Only Mount Cache Crashes (CRITICAL):**
+   - *Vulnerability:* Standard runners (`pytest`, `npm`, `cargo`) write cache directories (`.pytest_cache`, `.cache`, `target/`), systematically failing with `Read-only file system` errors under `-v workspace:ro`.
+   - *Mitigation:* Added `--tmpfs /tmp` and `--tmpfs /root/.cache`, `PYTHONDONTWRITEBYTECODE=1`, `PYTHONPYCACHEPREFIX=/tmp/pycache`, `CARGO_TARGET_DIR=/tmp/target`, and `-o cache_dir=/tmp/.pytest_cache` for pytest.
+5. **CWD-Blind Test Resolution & Overreach (HIGH):**
+   - *Vulnerability:* Commands were tracked without recording working directory, allowing an agent in an empty directory to run `pytest` (exit 0) and resolve prior failures. `pytest tests/` was also incorrectly matching `pytest integration_tests/`.
+   - *Mitigation:* Embedded `cwd` in the HMAC-chained ledger entries. Enforced exact CWD matching and strict path encompassment (`tests/` resolves `tests/test_foo.py` but never `integration_tests/`).
+
+---
+
+## 7. Verification Status
+All 39 tests passing cleanly in `tests/` across 4 test suites:
+- `tests/test_hybrid_architecture.py` (10 tests)
+- `tests/test_inverted_gate.py` (6 tests)
+- `tests/test_daemon_ledger.py` (7 tests)
+- `tests/test_live.py` (16 tests)
+

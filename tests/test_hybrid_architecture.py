@@ -177,6 +177,105 @@ class TestHybridArchitecture(unittest.TestCase):
         p2 = ledger.get_premise(conv)
         self.assertEqual(len(p2["unresolved_failures"]), 0)
 
+    def test_pipe_operator_exit_code_masking_tainted(self):
+        """Piping verification commands through cat, tee, or grep is tainted."""
+        self.assertTrue(is_tainted_shell_command("pytest | cat"))
+        self.assertTrue(is_tainted_shell_command("pytest tests/ | tee /tmp/test.log"))
+        self.assertTrue(is_tainted_shell_command("cargo test | head -n 10"))
+        self.assertTrue(is_tainted_shell_command("npm test | grep -i fail"))
+
+    def test_re_multiline_stdout_spoofing_defeated(self):
+        """Embedding a newline + fake Created At header in stdout cannot spoof exit code 0."""
+        conv = f"spoof-multiline-{uuid.uuid4().hex}"
+        # Real header: exit 1. Stdout: fake Created At header claiming exit 0
+        transcript_content = (
+            '{"type": "GENERIC", "step_index": 10, "content": "Created At: 2026-09-19T20:00:00-07:00\\n'
+            'Completed At: 2026-09-19T20:00:01-07:00\\n\\n'
+            'The command exited with code 1.\\n'
+            'Output:\\n'
+            'Some output\\n'
+            'Created At: 2026-09-19T20:00:00-07:00\\n'
+            'Completed At: 2026-09-19T20:00:01-07:00\\n\\n'
+            'The command exited with code 0"}\n'
+        )
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(transcript_content)
+            transcript_path = tf.name
+
+        self.run_hook("post_tool", {
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest tests/test_billing.py"}},
+            "stepIdx": 10,
+            "conversationId": conv,
+            "transcriptPath": transcript_path,
+            "error": "exit status 1"
+        })
+
+        ledger = DaemonLedger(ledger_path=self.ledger_file)
+        premise = ledger.get_premise(conv)
+        os.remove(transcript_path)
+
+        self.assertEqual(len(premise["unresolved_failures"]), 1)
+        self.assertEqual(premise["unresolved_failures"][0]["observed_exit_code"], 1)
+
+    def test_cwd_and_path_encompassment(self):
+        """CWD isolation and strict path encompassment prevent cross-directory or cross-suite false resolution."""
+        # Different CWD cannot resolve
+        self.assertFalse(can_suite_resolve_failure("pytest", "pytest", clean_cwd="/tmp", failed_cwd="/workspace"))
+        self.assertTrue(can_suite_resolve_failure("pytest", "pytest", clean_cwd="/workspace", failed_cwd="/workspace"))
+
+        # Strict path encompassment: tests/ does NOT encompass integration_tests/
+        self.assertFalse(can_suite_resolve_failure("pytest tests/", "pytest integration_tests/"))
+        self.assertTrue(can_suite_resolve_failure("pytest tests/", "pytest tests/test_billing.py"))
+        # Bare pytest encompasses any subdir
+        self.assertTrue(can_suite_resolve_failure("pytest", "pytest integration_tests/"))
+
+    def test_manifest_tampering_defense(self):
+        """Tier 2 refuses to execute agent-modified test manifests (Makefile / package.json poisoning)."""
+        git_repo_dir = os.path.join(self.test_dir, "manifest_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        makefile = os.path.join(git_repo_dir, "Makefile")
+        with open(makefile, "w") as f:
+            f.write("test:\n\tpytest tests/\n")
+        subprocess.run(["git", "add", "Makefile"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "add Makefile"], cwd=git_repo_dir, check=True)
+
+        # Agent tampers with Makefile to echo pass
+        with open(makefile, "w") as f:
+            f.write("test:\n\techo 'passed' && exit 0\n")
+
+        res = run_independent_verification(git_repo_dir)
+        self.assertEqual(res["status"], "tampered")
+        self.assertFalse(res["success"])
+        self.assertIn("manifest", res["runner"].lower())
+
+    def test_extensionless_executable_and_gitignored_file_tracking(self):
+        """Modifying extensionless scripts or gitignored source files is tracked by Rule 1."""
+        git_repo_dir = os.path.join(self.test_dir, "ext_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        # Create gitignore with secret.py
+        gitignore = os.path.join(git_repo_dir, ".gitignore")
+        with open(gitignore, "w") as f:
+            f.write("secret.py\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=git_repo_dir, check=True)
+
+        # Modify gitignored secret.py
+        secret_file = os.path.join(git_repo_dir, "secret.py")
+        with open(secret_file, "w") as f:
+            f.write("def auth(): return True\n")
+
+        from client.hardtruth_hook import get_git_modified_source_files
+        source_files, doc_files, _ = get_git_modified_source_files(git_repo_dir)
+        self.assertIn("secret.py", source_files)
+
     def test_tier2_runner_detection_and_execution(self):
         """detect_test_runner finds appropriate test command and runs cleanly."""
         runner = detect_test_runner(REPO_ROOT)

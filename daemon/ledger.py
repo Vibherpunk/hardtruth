@@ -23,9 +23,9 @@ VERIFICATION_CMD_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Chained shell operators that mask exit codes
+# Chained shell operators that mask exit codes (; true, || exit 0, or pipes like | cat, | tee)
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
-    r"(?:;\s*(?:true|exit\s+0|echo)|\|\|\s*(?:true|exit\s+0|echo)|&&\s*true)",
+    r"(?:;\s*(?:true|exit\b|echo\b|:)|\|\|\s*(?:true|exit\b|echo\b|:)|&&\s*(?:true|exit\s+0|:)|\|(?!=)\s*[a-zA-Z0-9_.-]+)",
     re.IGNORECASE
 )
 
@@ -54,7 +54,7 @@ def is_verification_command(cmd: str) -> bool:
 
 
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects verification commands chained with masking operators like ; true or || exit 0."""
+    """Detects verification commands chained with masking operators like ; true, || exit 0, or | cat."""
     cmd_clean = (cmd or "").strip()
     if is_verification_command(cmd_clean):
         return bool(SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean))
@@ -66,7 +66,7 @@ def is_exploratory_command(cmd: str) -> bool:
     return bool(EXPLORATORY_CMD_PATTERN.search(cmd_clean))
 
 
-def classify_file(filepath: str) -> str:
+def classify_file(filepath: str, workspace_dir: Optional[str] = None) -> str:
     """Returns 'source', 'doc', or 'other'."""
     basename = os.path.basename(filepath or "")
     if basename in ["Makefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh"]:
@@ -78,27 +78,68 @@ def classify_file(filepath: str) -> str:
         return "source"
     elif ext in DOC_EXTENSIONS:
         return "doc"
+
+    # Sniff executable bits or shebang for extensionless scripts (e.g. bin/build)
+    full_path = filepath
+    if workspace_dir and not os.path.isabs(filepath):
+        full_path = os.path.join(workspace_dir, filepath)
+
+    if os.path.isfile(full_path):
+        try:
+            if os.access(full_path, os.X_OK):
+                return "source"
+            with open(full_path, "rb") as f:
+                header = f.read(256)
+                if header.startswith(b"#!"):
+                    return "source"
+        except Exception:
+            pass
+
     return "other"
 
 
-def can_suite_resolve_failure(clean_cmd: str, failed_cmd: str) -> bool:
+def can_suite_resolve_failure(
+    clean_cmd: str,
+    failed_cmd: str,
+    clean_cwd: Optional[str] = None,
+    failed_cwd: Optional[str] = None
+) -> bool:
     """
     Hierarchical resolution: checks if clean_cmd encompasses failed_cmd.
-    - pytest / pytest tests/ resolves any pytest failure
-    - npm test / npm run test resolves any npm run test:* failure
-    - cargo test resolves any cargo test --* failure
-    - go test ./... resolves any go test failure
+    Guarantees:
+    - Same working directory (CWD-aware)
+    - Strict path encompassment (tests/ does NOT resolve integration_tests/)
     """
     clean = clean_cmd.strip()
     failed = failed_cmd.strip()
+
+    # CWD check: different working directories cannot resolve each other
+    if clean_cwd and failed_cwd:
+        if os.path.abspath(clean_cwd) != os.path.abspath(failed_cwd):
+            return False
 
     if clean == failed:
         return True
 
     # 1. Python pytest hierarchy
-    is_clean_pytest_suite = bool(re.search(r"^pytest(?:\s+tests/?|\s+\.)?$", clean)) or clean == "python3 -m unittest"
-    if is_clean_pytest_suite and (failed.startswith("pytest") or "unittest" in failed):
-        return True
+    # Bare pytest or pytest . runs all tests in the workspace root
+    if clean in ["pytest", "pytest .", "python3 -m unittest", "python3 -m unittest discover"]:
+        if failed.startswith("pytest") or "unittest" in failed:
+            return True
+
+    # Check scoped pytest e.g. pytest tests/ vs pytest integration_tests/
+    m_clean = re.match(r"^pytest\s+([^\s\-]+)", clean)
+    m_failed = re.match(r"^pytest\s+([^\s\-]+)", failed)
+    if m_clean and m_failed:
+        clean_target = os.path.normpath(m_clean.group(1).rstrip("/"))
+        failed_target = os.path.normpath(m_failed.group(1).rstrip("/"))
+        # Clean target must be an ancestor directory or exact match of failed target
+        if failed_target == clean_target or failed_target.startswith(clean_target + os.sep):
+            return True
+        return False
+    elif m_clean and not m_failed:
+        # e.g. clean is 'pytest tests/' but failed was bare 'pytest'
+        return False
 
     # 2. Node npm test hierarchy
     is_clean_npm_suite = clean in ["npm test", "npm run test", "yarn test", "bun test"]
@@ -111,7 +152,7 @@ def can_suite_resolve_failure(clean_cmd: str, failed_cmd: str) -> bool:
         return True
 
     # 4. Go test hierarchy
-    is_clean_go_suite = clean in ["go test ./...", "go test .", "go test"]
+    is_clean_go_suite = clean in ["go test ./...", "go test ."]
     if is_clean_go_suite and failed.startswith("go test"):
         return True
 
@@ -185,7 +226,8 @@ class DaemonLedger:
         error: Optional[str] = None,
         stdout_tail: Optional[str] = None,
         diff_stat: Optional[str] = None,
-        timestamp: Optional[float] = None
+        timestamp: Optional[float] = None,
+        cwd: Optional[str] = None
     ) -> dict:
         """
         Appends an entry to the HMAC-SHA256 hash-chained daemon ledger.
@@ -223,7 +265,8 @@ class DaemonLedger:
             "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
             "diff_stat": diff_stat[:200] if diff_stat else None,
             "timestamp": timestamp or time.time(),
-            "tainted": is_tainted
+            "tainted": is_tainted,
+            "cwd": cwd
         }
 
         canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
@@ -242,7 +285,8 @@ class DaemonLedger:
             "tool": tool,
             "conversationId": conversation_id,
             "stepIdx": step_idx,
-            "error": error
+            "error": error,
+            "cwd": cwd
         }
 
         file_exists = os.path.exists(self.ledger_path)
@@ -355,24 +399,32 @@ class DaemonLedger:
                 all_commands.append(e)
                 is_verif = is_verification_command(target)
                 if is_verif:
-                    failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None)
+                    failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None) or (status == "unverified_timeout")
                     if failed:
                         unresolved_failures[target] = {
                             "command": target,
                             "observed_exit_code": exit_code,
-                            "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else None),
+                            "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else "UNVERIFIED_TIMEOUT" if status == "unverified_timeout" else None),
                             "stdout_tail": e.get("stdout_tail"),
-                            "stepIdx": e.get("stepIdx")
+                            "stepIdx": e.get("stepIdx"),
+                            "cwd": e.get("cwd")
                         }
                     else:
-                        verification_commands_count += 1
-                        # Hierarchical resolution across test suites
-                        resolved_keys = [
-                            k for k in list(unresolved_failures.keys())
-                            if can_suite_resolve_failure(target, k)
-                        ]
-                        for k in resolved_keys:
-                            unresolved_failures.pop(k, None)
+                        # Only confirmed success with exit_code == 0 or no_error can increment or resolve
+                        if status != "unverified_timeout" and (exit_code == 0 or status == "no_error"):
+                            verification_commands_count += 1
+                            # Hierarchical resolution across test suites with CWD isolation
+                            resolved_keys = [
+                                k for k in list(unresolved_failures.keys())
+                                if can_suite_resolve_failure(
+                                    clean_cmd=target,
+                                    failed_cmd=k,
+                                    clean_cwd=e.get("cwd"),
+                                    failed_cwd=unresolved_failures[k].get("cwd")
+                                )
+                            ]
+                            for k in resolved_keys:
+                                unresolved_failures.pop(k, None)
 
             elif tool in ["write_to_file", "replace_file_content"]:
                 ftype = classify_file(target)

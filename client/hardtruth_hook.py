@@ -122,10 +122,13 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
     return None
 
 
+IGNORED_BUILD_DIRS = {".git", ".pytest_cache", "__pycache__", "node_modules", "target", ".venv", "venv", ".tox", ".mypy_cache"}
+
+
 def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str], List[str]]:
     """
-    Universal File Tracking: Runs git status --porcelain in workspace.
-    Detects ANY working tree modification (M, A, ??, R) regardless of tool used (sed, echo, patch).
+    Universal File Tracking: Runs git status --porcelain --ignored=matching in workspace.
+    Detects ANY working tree modification (M, A, ??, R, !!) regardless of tool used (sed, echo, patch).
     Returns: (source_files, doc_files, full_file_paths)
     """
     source_files = set()
@@ -137,7 +140,7 @@ def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str
 
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--ignored=matching"],
             cwd=workspace_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -154,9 +157,14 @@ def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str
                 if " -> " in filepath_rel:
                     filepath_rel = filepath_rel.split(" -> ")[1].strip()
 
+                # Filter out internal cache/build directories
+                parts = set(os.path.normpath(filepath_rel).split(os.sep))
+                if parts & IGNORED_BUILD_DIRS:
+                    continue
+
                 full_path = os.path.join(workspace_dir, filepath_rel)
                 full_paths.append(full_path)
-                ftype = classify_file(filepath_rel)
+                ftype = classify_file(filepath_rel, workspace_dir=workspace_dir)
                 base = os.path.basename(filepath_rel)
                 if ftype == "source":
                     source_files.add(base)
@@ -168,18 +176,18 @@ def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str
     return source_files, doc_files, full_paths
 
 
-def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 300) -> Tuple[Optional[int], Optional[str]]:
-    """
+def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 300) -> Tuple[Optional[int], Optional[str], bool]:
+    r"""
     Polls transcript for up to max_wait_ms (50ms intervals) to extract observed exit code and stdout tail.
-    Anchored strictly to system-generated log header to eliminate stdout spoofing.
+    Anchored strictly to \A (beginning of whole string) without re.MULTILINE to eliminate stdout spoofing.
+    Returns (exit_code, stdout_tail, timed_out).
     """
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, None
+        return None, None, False
 
-    # Anchored regex matching system header strictly
+    # Anchored strictly to absolute start of string (\A) without MULTILINE
     system_header_regex = re.compile(
-        r"^Created At: [^\n]+\nCompleted At: [^\n]+\n\nThe command exited with code (\d+)",
-        re.MULTILINE
+        r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n\nThe command exited with code (\d+)"
     )
 
     end_time = time.time() + (max_wait_ms / 1000.0)
@@ -202,26 +210,20 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
                     if target_step_idx is not None and step.get("step_index") == target_step_idx:
                         content = step.get("content", "")
                         exit_m = system_header_regex.search(content)
-                        if not exit_m:
-                            # Fallback to secondary search only if Created At is verified
-                            if "Created At:" in content:
-                                exit_m = re.search(r"The command exited with code (\d+)", content)
                         exit_code = int(exit_m.group(1)) if exit_m else None
                         lines = content.splitlines()
                         tail = "\n".join(lines[-15:])[:1000] if lines else None
-                        return exit_code, tail
+                        return exit_code, tail, False
 
                 if matching_lines:
                     last_step = matching_lines[-1]
                     content = last_step.get("content", "")
                     exit_m = system_header_regex.search(content)
-                    if not exit_m and "Created At:" in content:
-                        exit_m = re.search(r"The command exited with code (\d+)", content)
                     if exit_m:
                         exit_code = int(exit_m.group(1))
                         lines = content.splitlines()
                         tail = "\n".join(lines[-15:])[:1000] if lines else None
-                        return exit_code, tail
+                        return exit_code, tail, False
 
         except Exception:
             pass
@@ -230,7 +232,7 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
             break
         time.sleep(0.05)
 
-    return None, None
+    return None, None, True
 
 
 def get_git_diff_stat(filepath: str) -> Optional[str]:
@@ -280,6 +282,7 @@ def handle_post_tool_use(payload: dict) -> dict:
     stdout_tail = None
     diff_stat = None
     harness_status = None
+    tool_cwd = tool_args.get("Cwd") or os.getcwd()
 
     if tool_name == "run_command":
         cmd_or_file = tool_args.get("CommandLine", "")
@@ -289,12 +292,15 @@ def handle_post_tool_use(payload: dict) -> dict:
             observed_exit_code = 1
             harness_status = "tainted_shell_operator"
             error_msg = f"TAINTED: Chained shell operators detected: {error_msg or ''}".strip()
-        else:
-            ec, tail = poll_transcript_for_step(transcript_path, step_idx)
+        elif transcript_path and os.path.exists(transcript_path):
+            ec, tail, timed_out = poll_transcript_for_step(transcript_path, step_idx)
             if ec is not None:
                 observed_exit_code = ec
                 stdout_tail = tail
                 harness_status = "no_error" if ec == 0 else f"exit_{ec}"
+            elif timed_out:
+                observed_exit_code = None
+                harness_status = "unverified_timeout"
             else:
                 if error_msg:
                     m = re.search(r"exit status (\d+)", str(error_msg))
@@ -305,7 +311,19 @@ def handle_post_tool_use(payload: dict) -> dict:
                         harness_status = "error"
                 else:
                     observed_exit_code = None
-                    harness_status = "no_error"
+                    harness_status = "unverified_timeout"
+        else:
+            # Fallback when transcript path not attached (e.g. test harnesses / unit tests)
+            if error_msg:
+                m = re.search(r"exit status (\d+)", str(error_msg))
+                if m:
+                    observed_exit_code = int(m.group(1))
+                    harness_status = f"exit_{observed_exit_code}"
+                else:
+                    harness_status = "error"
+            else:
+                observed_exit_code = 0
+                harness_status = "no_error"
 
     elif tool_name in ["write_to_file", "replace_file_content"]:
         cmd_or_file = tool_args.get("TargetFile", "")
@@ -325,7 +343,8 @@ def handle_post_tool_use(payload: dict) -> dict:
         "harness_status": harness_status,
         "error": str(error_msg) if error_msg else None,
         "stdout_tail": stdout_tail,
-        "diff_stat": diff_stat
+        "diff_stat": diff_stat,
+        "cwd": tool_cwd
     }
 
     call_system_one("v1/ledger/record", record_payload, timeout=2.0)
@@ -342,7 +361,8 @@ def handle_post_tool_use(payload: dict) -> dict:
                 harness_status=harness_status,
                 error=str(error_msg) if error_msg else None,
                 stdout_tail=stdout_tail,
-                diff_stat=diff_stat
+                diff_stat=diff_stat,
+                cwd=tool_cwd
             )
         except Exception:
             pass
