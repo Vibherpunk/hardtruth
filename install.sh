@@ -84,13 +84,18 @@ if [ -f "$PREV_HOOKS_FILE" ]; then
 fi
 
 python3 -c "
-import sys, os
+import sys, os, subprocess
 sys.path.insert(0, os.path.expanduser('~/.hardtruth/lib'))
 from hardtruth.ast_checker import check_ast_stubs
 
-modified = sys.argv[1:]
+try:
+    files = subprocess.check_output(
+        ['git', 'diff', '--cached', '--name-only', '--diff-filter=ACM'], text=True).splitlines()
+except Exception:
+    sys.exit(0)
+
 violations = []
-for f in modified:
+for f in files:
     if os.path.isfile(f):
         violations.extend(check_ast_stubs(f))
 
@@ -99,10 +104,35 @@ if violations:
     for v in violations:
         print(f'   - {v}')
     sys.exit(1)
-" "$@"
+"
 EOF
 chmod +x "$GLOBAL_HOOKS_DIR/pre-commit"
 echo "✓ Pre-commit hook written to $GLOBAL_HOOKS_DIR/pre-commit"
+
+# 3. Claude Code Configuration (if ~/.claude exists)
+if [ -d "$HOME/.claude" ]; then
+    echo "Configuring Claude Code global hooks..."
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    if [ ! -f "$CLAUDE_SETTINGS" ]; then
+        echo "{}" > "$CLAUDE_SETTINGS"
+    fi
+    # Safely merge or write HardTruth hooks for Claude Code
+    python3 -c "
+import json, os
+p = os.path.expanduser('~/.claude/settings.json')
+try:
+    with open(p, 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+hooks = data.setdefault('hooks', {})
+hooks['PostToolUse'] = [{'matcher': '*', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]
+hooks['Stop'] = [{'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]
+with open(p, 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    echo "✓ Claude Code configured with HardTruth hooks."
+fi
 
 # Parse CLI flags for opt-in global git hook installation
 INSTALL_GLOBAL_HOOK=false

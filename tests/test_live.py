@@ -82,7 +82,8 @@ class TestSystemOneSentinel(unittest.TestCase):
             },
             "stepIdx": 12,
             "conversationId": self.conv_id,
-            "error": None
+            "error": None,
+            "exitCode": 0
         }
         res = self.run_hook("post_tool", payload)
         self.assertEqual(res, {})
@@ -152,7 +153,8 @@ class TestSystemOneSentinel(unittest.TestCase):
             "toolCall": {"name": "run_command", "args": {"CommandLine": "python3 -m unittest test_daemon.py"}},
             "stepIdx": 8,
             "conversationId": conv,
-            "error": None
+            "error": None,
+            "exitCode": 0
         })
 
         with tempfile.NamedTemporaryFile("w", delete=False) as tf:

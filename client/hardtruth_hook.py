@@ -76,6 +76,48 @@ def _allow() -> dict:
         return {"action": "continue"}
     return {"decision": "allow"}
 
+_CC_TOOL_MAP = {
+    "Bash": "run_command", "bash": "run_command", "sh": "run_command",
+    "Write": "write_to_file", "write": "write_to_file",
+    "Edit": "replace_file_content", "edit": "replace_file_content",
+    "MultiEdit": "replace_file_content", "NotebookEdit": "replace_file_content",
+    "Read": "view_file", "read": "view_file"
+}
+
+def normalize_payload(p: dict) -> dict:
+    """Normalizes payloads across Antigravity, Claude Code, and Goose into standard HardTruth format."""
+    if not isinstance(p, dict):
+        return {}
+    if "toolCall" in p and "conversationId" in p:
+        return p
+    out = dict(p)
+    out["conversationId"] = p.get("session_id") or p.get("conversationId") or p.get("sessionId") or "unknown"
+    out["transcriptPath"] = p.get("transcript_path") or p.get("transcriptPath") or ""
+    out["stepIdx"] = int(p.get("stepIdx", p.get("step", p.get("step_index", 0))) or 0)
+
+    tn = p.get("tool_name") or p.get("tool") or (p.get("toolCall", {}).get("name") if isinstance(p.get("toolCall"), dict) else None)
+    ti = p.get("tool_input") or p.get("arguments") or (p.get("toolCall", {}).get("args") if isinstance(p.get("toolCall"), dict) else {})
+    if tn:
+        mapped_name = _CC_TOOL_MAP.get(tn, tn)
+        out["toolCall"] = {
+            "name": mapped_name,
+            "args": {
+                "CommandLine": ti.get("command") or ti.get("cmd") or ti.get("CommandLine", ""),
+                "TargetFile": ti.get("file_path") or ti.get("path") or ti.get("TargetFile", ""),
+                "AbsolutePath": ti.get("file_path") or ti.get("path") or ti.get("AbsolutePath", ""),
+                "Cwd": ti.get("cwd") or p.get("cwd", "")
+            }
+        }
+    tr = p.get("tool_response") or p.get("result") or p.get("output") or {}
+    if isinstance(tr, dict):
+        if tr.get("exitCode") is not None:
+            out["exitCode"] = tr["exitCode"]
+        elif tr.get("exit_code") is not None:
+            out["exitCode"] = tr["exit_code"]
+    elif p.get("exit_code") is not None and "exitCode" not in out:
+        out["exitCode"] = p["exit_code"]
+    return out
+
 CONTRADICTION_THRESHOLD = 0.70
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
 
@@ -100,7 +142,12 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
     if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
         return None
     rel_path = os.path.relpath(fpath, workspace_dir)
-    diff_args = ["git", "-c", "safe.directory=*", "diff", "-U0"]
+    ws_abs = os.path.abspath(workspace_dir)
+    diff_args = [
+        "git", "-c", f"safe.directory={ws_abs}",
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+        "diff", "-U0"
+    ]
     if baseline_sha:
         diff_args.append(baseline_sha)
     diff_args.extend(["--", rel_path])
@@ -624,7 +671,7 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
                         tail = "\n".join(lines[-15:])[:1000] if lines else None
                         return exit_code, tail, False
 
-                if matching_lines:
+                if target_step_idx is None and matching_lines:
                     last_step = matching_lines[-1]
                     content = last_step.get("content", "")
                     exit_m = system_header_regex.search(content)
@@ -678,6 +725,7 @@ def handle_post_tool_use(payload: dict) -> dict:
     Neutralizes shell operator bypasses (; true, || exit 0).
     Non-synthesis rule: NEVER synthesizes 'exit 0' out of thin air.
     """
+    payload = normalize_payload(payload)
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "unknown")
     tool_args = tool_call.get("args", {})
@@ -741,9 +789,6 @@ def handle_post_tool_use(payload: dict) -> dict:
             elif payload.get("exitCode") is not None:
                 observed_exit_code = int(payload["exitCode"])
                 harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
-            elif is_test_harness:
-                observed_exit_code = 0
-                harness_status = "no_error"
             else:
                 observed_exit_code = None
                 harness_status = "uncorroborated_execution"
@@ -799,16 +844,16 @@ def handle_post_tool_use(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 action_triggers = re.compile(
-    r"\b(i\s+(have\s+)?(ran|run|executed|tested|verified|fixed|modified|created)|"
-    r"ran\s+(unit\s+)?tests?|"
-    r"(all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|"
-    r"tests?\s+(have\s+)?passed|"
+    r"\b((?:i(?:'ve| have)?\s+)?(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built|refactored|completed|finished|wired up)|"
+    r"ran\s+(?:unit\s+)?tests?|"
+    r"(?:all|all \d+|\d+)?\s*(?:unit\s+)?tests?(?:\s+[\w/]+){0,3}\s+passed|"
+    r"tests?\s+(?:have\s+)?passed|"
     r"tests?\s+are\s+passing|"
     r"test\s+suite\s+passed|"
     r"tests?\s+succeeded|"
-    r"successfully\s+(verified|passed|tested)|"
+    r"successfully\s+(?:verified|passed|tested|built|implemented)|"
     r"all\s+checks?\s+passed|"
-    r"(feature|pipeline|integration)\s+is\s+(now\s+)?(wired|working|active)|"
+    r"(?:feature|pipeline|integration|logic)\s+is\s+(?:now\s+)?(?:wired|working|active|complete|finished)|"
     r"zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test)\b",
     re.IGNORECASE
 )
@@ -832,6 +877,7 @@ def handle_stop(payload: dict) -> dict:
     """
     Evaluates physical ledger state, agent claims, and executes Tier 2 Hard Gate.
     """
+    payload = normalize_payload(payload)
     conv_id = payload.get("conversationId", "default")
     transcript_path = payload.get("transcriptPath", "")
     workspace_dir = get_workspace_dir(payload)
@@ -852,7 +898,8 @@ def handle_stop(payload: dict) -> dict:
         if new_count >= 3:
             return _halt(
                 f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
-                "HardTruth never fails open. Manual verification or human escalation required.\n\n"
+                "HardTruth never fails open. Manual verification or human escalation required.\n"
+                f"Operator remediation instructions: Inspect and fix the underlying issue. To reset strike counter: rm {counter_file}\n\n"
                 f"Root Cause: {reason}"
             )
         return _halt(reason)
@@ -860,22 +907,28 @@ def handle_stop(payload: dict) -> dict:
     if _IMPORT_DEGRADED:
         return fail_halt(f"🚨 HARDTRUTH INTEGRITY ERROR: {_IMPORT_DEGRADED}. Install layout degraded, cannot verify truth safely. HardTruth fails closed.", remediable=False)
 
-    # Extract agent's final text from transcript (fail closed on unreadable transcript)
+    # Extract agent's final text from transcript (fail closed on unreadable or empty transcript)
     agent_text = ""
     if transcript_path:
         if not os.path.exists(transcript_path):
             return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript path does not exist on disk: {transcript_path}", remediable=False)
+        has_planner_response = False
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         d = json.loads(line)
-                        if d.get("type") == "PLANNER_RESPONSE" and d.get("content") and not d.get("tool_calls"):
-                            agent_text = d.get("content")
+                        if d.get("type") == "PLANNER_RESPONSE" and d.get("content"):
+                            has_planner_response = True
+                            if not d.get("tool_calls"):
+                                agent_text = d.get("content")
                     except Exception:
                         continue
         except Exception as e:
             return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript is unreadable: {e}", remediable=False)
+
+        if not has_planner_response:
+            return fail_halt("🚨 HARDTRUTH REJECTED: Attached transcript contains no valid agent responses. Emptying or stripping transcripts to bypass gates is forbidden.", remediable=False)
 
     # Fetch Ledger Premise
     premise_data = None
@@ -1019,30 +1072,39 @@ def handle_stop(payload: dict) -> dict:
     # Rule 5: Test-Surface Monotonicity (Assertion Weakening / Skipping Defense)
     # -----------------------------------------------------------------------
     test_weakening_violations = []
+    baseline_sha = None
+    if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+        baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
+
     for fpath in modified_paths:
         base_name = os.path.basename(fpath).lower()
         if ("test" in base_name or "spec" in base_name) and os.path.isfile(fpath):
             try:
                 with open(fpath, "r", encoding="utf-8", errors="ignore") as tf:
                     tcontent = tf.read()
-                if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", tcontent):
-                    test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}")
-                elif re.search(r"@pytest\.mark\.(?:skip|xfail)\b", tcontent):
-                    test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}")
-                elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", tcontent):
-                    test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}")
-                elif re.search(r"\bexpect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", tcontent, re.IGNORECASE):
-                    test_weakening_violations.append(f"Tautological assertion ('expect(true).toBe(true)') found in {base_name}")
-                elif re.search(r"\bassert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", tcontent, re.IGNORECASE):
-                    test_weakening_violations.append(f"Tautological assertion ('assert.equal(true, true)') found in {base_name}")
-                elif re.search(r"\bassert!\s*\(\s*true\s*\)", tcontent):
-                    test_weakening_violations.append(f"Tautological assertion ('assert!(true)') found in {base_name}")
-                elif re.search(r"\bt\.(?:Skip|SkipNow|Skipf)\s*\(", tcontent):
-                    test_weakening_violations.append(f"Test skipping call ('t.Skip()') found in {base_name}")
+
+                changed_lines = get_changed_lines(workspace_dir, fpath, baseline_sha)
+                lines = tcontent.splitlines()
+                for ln_idx, line_str in enumerate(lines, start=1):
+                    if changed_lines is not None and ln_idx not in changed_lines:
+                        continue
+                    if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", line_str):
+                        test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}:{ln_idx}")
+                    elif re.search(r"@pytest\.mark\.(?:skip|xfail)\b", line_str):
+                        test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", line_str):
+                        test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\bexpect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+                        test_weakening_violations.append(f"Tautological assertion ('expect(true).toBe(true)') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\bassert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+                        test_weakening_violations.append(f"Tautological assertion ('assert.equal(true, true)') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\bassert!\s*\(\s*true\s*\)", line_str):
+                        test_weakening_violations.append(f"Tautological assertion ('assert!(true)') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\bt\.(?:Skip|SkipNow|Skipf)\s*\(", line_str):
+                        test_weakening_violations.append(f"Test skipping call ('t.Skip()') found in {base_name}:{ln_idx}")
 
                 # Assertion count comparison against git baseline blob
                 if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
-                    baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
                     if baseline_sha:
                         rel_path = os.path.relpath(fpath, workspace_dir)
                         proc_base = subprocess.run(
@@ -1109,16 +1171,17 @@ def handle_stop(payload: dict) -> dict:
     # Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
     # -----------------------------------------------------------------------
     claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
+    clauses = re.split(r"(?<=[.!?])\s+|\n+|[,;]\s*(?:which|that|whereas|although|because|since)\b", agent_text, flags=re.IGNORECASE)
     for ref in claimed_file_refs:
         norm_ref = os.path.normpath(ref)
         if any(norm_ref.endswith(ext) for ext in SOURCE_CODE_EXTENSIONS):
             pattern = re.compile(
                 rf"\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^\n.!?]{{0,120}}?\b{re.escape(ref)}\b|"
                 rf"\b{re.escape(ref)}\b[^\n.!?]{{0,120}}?\b(?:is now|was|has been|to add|to implement)\s+(?:created|written|implemented|modified|updated|edited|added|fixed|built|patched)\b|"
-                rf"(?:^|\n)\s*[-*]\s*(?:(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^\n]{{0,120}}?\b{re.escape(ref)}\b|\b{re.escape(ref)}\b[^\n]{{0,120}}?\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b)",
+                rf"(?:^|\s)[-*]\s*(?:(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^\n]{{0,120}}?\b{re.escape(ref)}\b|\b{re.escape(ref)}\b[^\n]{{0,120}}?\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b)",
                 re.IGNORECASE
             )
-            if pattern.search(agent_text):
+            if any(pattern.search(clause) for clause in clauses):
                 is_modified = any(
                     norm_ref == os.path.normpath(m) or os.path.normpath(m).endswith(os.sep + norm_ref)
                     for m in modified_paths
@@ -1153,6 +1216,8 @@ def handle_stop(payload: dict) -> dict:
         s_clean = s.strip()
         if len(s_clean) > 15 and action_triggers.search(s_clean):
             if imperative_filter.search(s_clean):
+                continue
+            if re.search(r"\b(?:documentation|docs|readme|changelog)\b", s_clean, re.IGNORECASE) and not re.search(r"\b(?:test|tests|passed|suite|feature|pipeline|integration|bug)\b", s_clean, re.IGNORECASE):
                 continue
             if descriptive_filter.search(s_clean):
                 prefix_match = re.match(r"^\s*(?:quote:|example:|sample:)\s*", s_clean, re.IGNORECASE)
@@ -1242,6 +1307,7 @@ if __name__ == "__main__":
         payload = json.loads(raw_in) if raw_in.strip() else {}
     except Exception:
         payload = {}
+    payload = normalize_payload(payload)
 
     try:
         if mode in ["post_tool", "PostToolUse"]:

@@ -44,6 +44,10 @@ def get_daemon_api_token() -> str:
         pass
     if os.path.exists(path):
         try:
+            os.chmod(path, 0o400)
+        except Exception:
+            pass
+        try:
             with open(path, "r", encoding="utf-8") as f:
                 tok = f.read().strip()
                 if len(tok) >= 32:
@@ -70,23 +74,32 @@ def validate_api_token(token: Optional[str]) -> bool:
     return hmac.compare_digest(str(token), expected)
 
 def strip_shell_prefixes(cmd: str) -> str:
-    """Strips leading cd <dir> && and environment variable assignments."""
+    """Strips leading cd <dir> &&, environment variable assignments, and standard package manager wrappers."""
     cmd_clean = (cmd or "").strip()
-    cd_match = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*&&\s*", cmd_clean)
-    if cd_match:
-        cmd_clean = cmd_clean[cd_match.end():].strip()
     while True:
+        cd_match = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*&&\s*", cmd_clean)
+        if cd_match:
+            cmd_clean = cmd_clean[cd_match.end():].strip()
+            continue
         env_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S+)\s+", cmd_clean)
         if env_match:
             cmd_clean = cmd_clean[env_match.end():].strip()
-        else:
-            break
+            continue
+        wrapper_match = re.match(
+            r"^(?:poetry\s+run|uv\s+run|pipenv\s+run|pdm\s+run|hatch\s+run|bundle\s+exec|npx|pnpm\s+exec|yarn\s+exec|nohup|time|timeout\s+\d+|env)\s+",
+            cmd_clean,
+            re.IGNORECASE
+        )
+        if wrapper_match:
+            cmd_clean = cmd_clean[wrapper_match.end():].strip()
+            continue
+        break
     return cmd_clean
 
 
 # Canonical test runners anchored to command invocation start
 TEST_RUNNER_PREFIX_PATTERN = re.compile(
-    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest)\b",
+    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test)\b",
     re.IGNORECASE
 )
 
@@ -99,18 +112,18 @@ STATIC_CHECK_PREFIX_PATTERN = re.compile(
 # Legacy aliases for backward compatibility where needed
 TEST_CMD_PATTERN = TEST_RUNNER_PREFIX_PATTERN
 VERIFICATION_CMD_PATTERN = re.compile(
-    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
     re.IGNORECASE
 )
 
 VERIFICATION_ANYWHERE_PATTERN = re.compile(
-    r"(?:^|[\s;&|(\r\n])(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    r"(?:^|[\s;&|(\r\n])(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
     re.IGNORECASE
 )
 
-# Chained shell operators, pipes, subshells, newlines, or conditionals that mask exit codes
+# Chained shell operators, pipes, subshells, newlines, negation, or conditionals that mask exit codes
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
-    r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))",
+    r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|^\s*!\s*|^\s*not\s+|\beval\b|\bexec\b|\(|\))",
     re.IGNORECASE
 )
 
@@ -193,8 +206,7 @@ def classify_file(filepath: str, workspace_dir: Optional[str] = None) -> str:
     """Returns 'source', 'doc', or 'other'."""
     basename = os.path.basename(filepath or "")
     if basename in [
-        "Makefile", "GNUmakefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh",
-        "setup.py", "setup.cfg", "pyproject.toml", "Cargo.toml", "package.json", "tsconfig.json"
+        "Makefile", "GNUmakefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh"
     ]:
         return "source"
 
@@ -473,16 +485,16 @@ class DaemonLedger:
                         error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
                         harness_status = "tainted_shell_operator"
 
-                    # Open Item #2: Monotonic Step Index Enforcement
+                    # Monotonic Step Index Enforcement (defeats step backdating on indexed harnesses)
                     conv_str = str(conversation_id)
                     if hasattr(self, "_sessions") and conv_str in self._sessions:
                         last_step = self._sessions[conv_str].get("last_step_idx", -1)
-                        if step_idx < last_step:
+                        if last_step > 0 and step_idx < last_step:
                             raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
                         self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
                     elif hasattr(self, "_step_counters"):
                         last_step = self._step_counters.get(conv_str, -1)
-                        if step_idx < last_step:
+                        if last_step > 0 and step_idx < last_step:
                             raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
                         self._step_counters[conv_str] = max(last_step, step_idx)
 

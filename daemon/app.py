@@ -202,7 +202,7 @@ class HandoffVerifyRequest(BaseModel):
     workspace_path: str = Field(..., max_length=1024)
     conversationId: Optional[str] = Field(None, max_length=128)
     test_command: Optional[str] = Field(None, max_length=2048)
-    timeout_sec: Optional[int] = 60
+    timeout_sec: Optional[int] = Field(60, ge=1, le=300)
 
 class HandoffVerifyResponse(BaseModel):
     status: str

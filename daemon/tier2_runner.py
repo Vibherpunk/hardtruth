@@ -15,7 +15,36 @@ import re
 import hashlib
 import shlex
 import signal
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Set
+
+
+_pinned_runners: Dict[Tuple[str, str], str] = {}
+_session_baseline_failures: Dict[Tuple[str, str], Set[str]] = {}
+
+
+def extract_test_failures(output: str) -> Set[str]:
+    failures = set()
+    if not output:
+        return failures
+    for line in output.splitlines():
+        line_s = line.strip()
+        if line_s.startswith("FAILED ") or line_s.startswith("ERROR "):
+            parts = line_s.split()
+            if len(parts) >= 2:
+                failures.add(parts[1].split(" - ")[0])
+        elif line_s.startswith("FAIL: ") or line_s.startswith("ERROR: "):
+            parts = line_s.split()
+            if len(parts) >= 2:
+                failures.add(parts[1])
+        elif line_s.startswith("FAIL ") or line_s.startswith("✕ "):
+            failures.add(line_s)
+        elif " ... FAILED" in line_s:
+            failures.add(line_s.split()[1] if len(line_s.split()) >= 2 else line_s)
+        elif line_s.startswith("--- FAIL:"):
+            parts = line_s.split()
+            if len(parts) >= 3:
+                failures.add(parts[2])
+    return failures
 
 
 MANIFEST_FILES = [
@@ -28,6 +57,65 @@ MANIFEST_FILES = [
 MANIFEST_PATTERNS = MANIFEST_FILES + [":(glob)**/conftest.py", ":(glob)*.mk", ":(glob)Makefile.*"]
 
 
+def is_actual_manifest_tampering(workspace_path: str, fname: str, baseline_sha: Optional[str] = None) -> bool:
+    """
+    Distinguishes legitimate dependency/configuration edits from test-weakening/tampering.
+    Dedicated test manifests (conftest.py, pytest.ini, jest.config.*, etc.) are always tampering.
+    Dual-use manifests (package.json, pyproject.toml, setup.cfg, Makefile, Cargo.toml)
+    are only tampering if test runner commands, test configurations, or test dependencies are altered.
+    """
+    base = os.path.basename(fname)
+    if "conftest" in base or "pytest.ini" in base or "tox.ini" in base or "jest" in base or "vitest" in base or "mocharc" in base or "noxfile" in base:
+        return True
+
+    ws_abs = os.path.abspath(workspace_path)
+    diff_args = [
+        "git", "-c", f"safe.directory={ws_abs}",
+        "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "diff"
+    ]
+    if baseline_sha:
+        diff_args.append(baseline_sha)
+    diff_args.extend(["--", fname])
+    diff_text = ""
+    try:
+        proc = subprocess.run(diff_args, cwd=workspace_path, capture_output=True, text=True, timeout=2.0)
+        diff_text = proc.stdout if proc.returncode == 0 else ""
+    except Exception:
+        return True
+
+    if not diff_text:
+        try:
+            proc = subprocess.run([
+                "git", "-c", f"safe.directory={ws_abs}",
+                "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "diff", "--", fname
+            ], cwd=workspace_path, capture_output=True, text=True, timeout=2.0)
+            diff_text = proc.stdout if proc.returncode == 0 else ""
+        except Exception:
+            return True
+
+    if not diff_text:
+        return True
+
+    if base in ("package.json", "tsconfig.json"):
+        if re.search(r'^\+[^\n]*"(?:test|test:[\w-]+|scripts)"', diff_text, re.MULTILINE):
+            return True
+        return False
+    elif base in ("setup.cfg", "pyproject.toml"):
+        if re.search(r'^\+[^\n]*(?:\[tool\.pytest|\[tool:pytest|addopts|testpaths|ignore|norecursedirs)', diff_text, re.MULTILINE | re.IGNORECASE):
+            return True
+        return False
+    elif base in ("Makefile", "GNUmakefile"):
+        if re.search(r'(?:^|\n)[ \t\+-]*(?:test|check)\s*:', diff_text) or re.search(r'^\+[^\n]*(?:test|check)\b', diff_text, re.MULTILINE):
+            return True
+        return False
+    elif base == "Cargo.toml":
+        if re.search(r'^\+[^\n]*\[\[test\]\]', diff_text, re.MULTILINE):
+            return True
+        return False
+
+    return True
+
+
 def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None) -> Tuple[bool, List[str]]:
     """
     Detects if build/test manifests have uncommitted modifications OR were modified in commits during this session.
@@ -36,12 +124,13 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
     if not workspace_path or not os.path.exists(os.path.join(workspace_path, ".git")):
         return False, []
 
+    ws_abs = os.path.abspath(workspace_path)
     modified = set()
 
     # 1. Check working tree for uncommitted manifest edits
     try:
         proc = subprocess.run(
-            ["git", "-c", "safe.directory=*", "status", "--porcelain", "--"] + MANIFEST_PATTERNS,
+            ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "status", "--porcelain", "--"] + MANIFEST_PATTERNS,
             cwd=workspace_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -62,10 +151,10 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
         return True, [f"<git-exception: {str(e)[:200]}>"]
 
     # 2. Check committed modifications against session baseline commit
+    baseline_sha = None
     if conv_id:
         safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
         conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-        baseline_sha = None
 
         # Check daemon ledger immutable baseline
         try:
@@ -82,7 +171,7 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
         if not baseline_sha:
             try:
                 proc_ref = subprocess.run(
-                    ["git", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
                     cwd=workspace_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -108,7 +197,7 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
         if baseline_sha:
             try:
                 proc_diff = subprocess.run(
-                    ["git", "-c", "safe.directory=*", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_PATTERNS,
+                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_PATTERNS,
                     cwd=workspace_path,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -125,8 +214,16 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
             except Exception as e:
                 return True, [f"<git-diff-exception: {str(e)[:200]}>"]
 
-    if modified:
-        return True, sorted(list(modified))
+    # Filter modified manifests to actual tampering vs normal dependency additions
+    tampered = []
+    for f in modified:
+        if f.startswith("<git-"):
+            tampered.append(f)
+        elif is_actual_manifest_tampering(workspace_path, f, baseline_sha):
+            tampered.append(f)
+
+    if tampered:
+        return True, sorted(tampered)
     return False, []
 
 
@@ -162,14 +259,21 @@ def detect_test_runner(workspace_path: str, tampered_manifests: Optional[List[st
     if os.path.exists(go_mod) and shutil.which("go"):
         return "go test ./..."
 
-    # 4. Node.js (npm test) - only if package.json has not been modified
+    # 4. Node.js (npm test, pnpm test, yarn test, bun test) - only if package.json has not been modified
     package_json = os.path.join(workspace_path, "package.json")
     if os.path.exists(package_json) and "package.json" not in tampered:
         try:
             with open(package_json, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if "test" in data.get("scripts", {}):
-                    return "npm test"
+                    if os.path.exists(os.path.join(workspace_path, "pnpm-lock.yaml")) and shutil.which("pnpm"):
+                        return "pnpm test"
+                    elif os.path.exists(os.path.join(workspace_path, "yarn.lock")) and shutil.which("yarn"):
+                        return "yarn test"
+                    elif os.path.exists(os.path.join(workspace_path, "bun.lockb")) and shutil.which("bun"):
+                        return "bun test"
+                    elif shutil.which("npm"):
+                        return "npm test"
         except Exception:
             pass
 
@@ -424,7 +528,47 @@ def run_independent_verification(
                 "isolation": "input_validation"
             }
 
-    canonical_runner = test_cmd or detect_test_runner(workspace_path, tampered_manifests=tampered_files)
+    session_key = (str(conv_id), os.path.abspath(workspace_path)) if conv_id else None
+    pinned_runner = None
+    baseline_failures: Set[str] = set()
+
+    halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id or "default"))[:32]
+    conv_hash = hashlib.sha256(str(conv_id or "default").encode("utf-8")).hexdigest()[:16]
+    baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+
+    if session_key:
+        pinned_runner = _pinned_runners.get(session_key)
+        if session_key in _session_baseline_failures:
+            baseline_failures = _session_baseline_failures[session_key]
+
+    if not pinned_runner and os.path.exists(baseline_file):
+        try:
+            with open(baseline_file, "r") as f:
+                bdata = json.load(f)
+                pinned_runner = bdata.get("pinned_runner")
+                if "baseline_failures" in bdata:
+                    baseline_failures = set(bdata["baseline_failures"])
+        except Exception:
+            pass
+
+    if test_cmd:
+        canonical_runner = test_cmd
+    elif pinned_runner:
+        canonical_runner = pinned_runner
+    else:
+        canonical_runner = detect_test_runner(workspace_path, tampered_manifests=tampered_files)
+        if canonical_runner and session_key:
+            _pinned_runners[session_key] = canonical_runner
+            if os.path.exists(baseline_file):
+                try:
+                    with open(baseline_file, "r") as f:
+                        bdata = json.load(f)
+                    bdata["pinned_runner"] = canonical_runner
+                    with open(baseline_file, "w") as f:
+                        json.dump(bdata, f)
+                except Exception:
+                    pass
 
     if not canonical_runner:
         return {
@@ -439,6 +583,12 @@ def run_independent_verification(
     if os.environ.get("HARDTRUTH_PREFER_DOCKER_TIER2") == "1":
         container_res = run_container_verification(workspace_path, canonical_runner, timeout_sec=timeout_sec)
         if container_res is not None:
+            if not container_res.get("success") and container_res.get("exit_code") not in (0, None):
+                curr_failures = extract_test_failures(container_res.get("output", ""))
+                if curr_failures and baseline_failures and curr_failures.issubset(baseline_failures):
+                    container_res["success"] = True
+                    container_res["status"] = "verified_regression_free"
+                    container_res["output"] = f"Tier 2 verified (no new regressions: {len(curr_failures)} pre-existing failures matched baseline set).\n" + container_res.get("output", "")
             return container_res
 
     # 2. Clean Subprocess Sandbox Execution (Clean Environment Boundary)
@@ -480,7 +630,7 @@ def run_independent_verification(
         exit_code = proc.returncode
         output = (stdout or "").strip()
 
-        return {
+        sub_res = {
             "status": "verified" if exit_code == 0 else "failed",
             "success": exit_code == 0,
             "exit_code": exit_code,
@@ -488,6 +638,14 @@ def run_independent_verification(
             "output": output[:4000],
             "isolation": "clean_subprocess_sandbox"
         }
+        if not sub_res["success"] and sub_res["exit_code"] not in (0, None):
+            curr_failures = extract_test_failures(sub_res.get("output", ""))
+            if curr_failures and baseline_failures and curr_failures.issubset(baseline_failures):
+                sub_res["success"] = True
+                sub_res["status"] = "verified_regression_free"
+                sub_res["output"] = f"Tier 2 verified (no new regressions: {len(curr_failures)} pre-existing failures matched baseline set).\n" + sub_res.get("output", "")
+
+        return sub_res
 
     except subprocess.TimeoutExpired:
         try:
