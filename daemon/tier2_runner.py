@@ -259,6 +259,7 @@ def run_container_verification(
         "-e", "CARGO_TARGET_DIR=/tmp/target",
         "-e", "npm_config_cache=/tmp/npm-cache",
         "-e", "TMPDIR=/tmp",
+        "-e", "HARDTRUTH_TIER2_SANDBOX=1",
         image,
         "sh", "-c", actual_cmd
     ]
@@ -393,6 +394,7 @@ def run_independent_verification(
     clean_env.pop("HARDTRUTH_CIRCUIT_BREAKER_LEGACY_ALLOW", None)
     clean_env["PYTHONUNBUFFERED"] = "1"
     clean_env["CI"] = "true"
+    clean_env["HARDTRUTH_TIER2_SANDBOX"] = "1"
 
     actual_cmd = canonical_runner
     if actual_cmd.startswith("pytest") and "-o cache_dir" not in actual_cmd:

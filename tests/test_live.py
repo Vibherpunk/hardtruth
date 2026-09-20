@@ -457,7 +457,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         import urllib.request, urllib.error
         from client.hardtruth_hook import get_api_token
         daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
-        if os.environ.get("CI") == "true":
+        if os.environ.get("HARDTRUTH_TIER2_SANDBOX") == "1":
             self.skipTest("Tier 2 in-container run: live daemon tests skipped")
         try:
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
@@ -501,7 +501,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         import urllib.request, urllib.error
         from client.hardtruth_hook import get_api_token
         daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
-        if os.environ.get("CI") == "true":
+        if os.environ.get("HARDTRUTH_TIER2_SANDBOX") == "1":
             self.skipTest("Tier 2 in-container run: live daemon tests skipped")
         try:
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
@@ -528,7 +528,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         import urllib.request, urllib.error, urllib.parse
         from client.hardtruth_hook import get_api_token
         daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
-        if os.environ.get("CI") == "true":
+        if os.environ.get("HARDTRUTH_TIER2_SANDBOX") == "1":
             self.skipTest("Tier 2 in-container run: live daemon tests skipped")
         try:
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
@@ -556,7 +556,7 @@ class TestSystemOneSentinel(unittest.TestCase):
         import urllib.request, urllib.error, urllib.parse
         from client.hardtruth_hook import get_api_token
         daemon_base = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
-        if os.environ.get("CI") == "true":
+        if os.environ.get("HARDTRUTH_TIER2_SANDBOX") == "1":
             self.skipTest("Tier 2 in-container run: live daemon tests skipped")
         try:
             urllib.request.urlopen(daemon_base + "/health", timeout=2)
