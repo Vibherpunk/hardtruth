@@ -23,9 +23,9 @@ VERIFICATION_CMD_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Chained shell operators, pipes, subshells, or conditionals that mask exit codes
+# Chained shell operators, pipes, subshells, newlines, or conditionals that mask exit codes
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
-    r"(?:\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))",
+    r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))",
     re.IGNORECASE
 )
 
@@ -140,17 +140,21 @@ def can_suite_resolve_failure(
         raw_clean_target = m_clean.group(1).rstrip("/")
         raw_failed_target = m_failed.group(1).rstrip("/")
 
-        # Strip :: test function specifiers (e.g. tests/test_billing.py::test_calc -> tests/test_billing.py)
-        clean_file = raw_clean_target.split("::")[0]
+        # If clean is a specific subtest (contains ::), it can ONLY resolve that exact subtest.
+        # It must NEVER resolve a sibling subtest (e.g. test_passing resolving test_broken) or the whole file!
+        if "::" in raw_clean_target:
+            return raw_clean_target == raw_failed_target
+
+        clean_file = raw_clean_target
         failed_file = raw_failed_target.split("::")[0]
 
         clean_norm = os.path.normpath(clean_file)
         failed_norm = os.path.normpath(failed_file)
 
-        # 1. Exact match or same test file
+        # 1. Clean ran the entire file that contains failed_cmd (whether failed was whole file or subtest)
         if failed_norm == clean_norm:
             return True
-        # 2. Parent directory encompassment
+        # 2. Clean ran a parent directory that encompasses failed_cmd
         if failed_norm.startswith(clean_norm + os.sep):
             return True
         return False
@@ -185,6 +189,7 @@ class DaemonLedger:
         self.ledger_path = ledger_path or os.environ.get("HARDTRUTH_DAEMON_LEDGER", DEFAULT_LEDGER_PATH)
         self.key_path = key_path or os.environ.get("HARDTRUTH_DAEMON_KEY", DEFAULT_KEY_PATH)
         self._key = self._load_or_create_key()
+        self._session_baselines: Dict[Tuple[str, str], str] = {}
 
     def _load_or_create_key(self) -> bytes:
         key_dir = os.path.dirname(os.path.abspath(self.key_path))
@@ -321,6 +326,60 @@ class DaemonLedger:
             "index": index,
             "hash": record_hash
         }
+
+    def set_session_baseline(self, conversation_id: str, workspace_path: str, baseline_sha: str) -> str:
+        """
+        Registers the session baseline commit SHA for (conversation_id, workspace_path).
+        IMMUTABLE: once registered, subsequent calls return the existing baseline SHA to prevent tampering.
+        """
+        workspace_norm = os.path.abspath(workspace_path)
+        key = (str(conversation_id), workspace_norm)
+        existing = self.get_session_baseline(conversation_id, workspace_path)
+        if existing:
+            return existing
+
+        self._session_baselines[key] = baseline_sha
+        # Append to hash-chained ledger for physical persistence & tamper-evidence
+        self.record_entry(
+            conversation_id=conversation_id,
+            step_idx=0,
+            tool="__session_baseline__",
+            target=workspace_norm,
+            diff_stat=baseline_sha
+        )
+        return baseline_sha
+
+    def get_session_baseline(self, conversation_id: str, workspace_path: str) -> Optional[str]:
+        """
+        Retrieves the immutable session baseline commit SHA for (conversation_id, workspace_path).
+        """
+        workspace_norm = os.path.abspath(workspace_path)
+        key = (str(conversation_id), workspace_norm)
+        if key in self._session_baselines:
+            return self._session_baselines[key]
+
+        # Search HMAC-chained ledger for historical record
+        if os.path.exists(self.ledger_path):
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if not line_s:
+                        continue
+                    try:
+                        record = json.loads(line_s)
+                        entry = record.get("entry", record)
+                        if (
+                            entry.get("conversationId") == conversation_id
+                            and entry.get("tool") == "__session_baseline__"
+                            and entry.get("target") == workspace_norm
+                        ):
+                            sha = entry.get("diff_stat")
+                            if sha:
+                                self._session_baselines[key] = sha
+                                return sha
+                    except Exception:
+                        continue
+        return None
 
     def verify_chain(self) -> Tuple[bool, int, str]:
         """Validates the entire HMAC hash chain from 0 to N-1."""
@@ -518,3 +577,8 @@ class DaemonLedger:
             "unresolved_failures": list(unresolved_failures.values()),
             "records_count": len(conv_records)
         }
+
+
+# Default module-level singleton instance
+_ledger = DaemonLedger()
+

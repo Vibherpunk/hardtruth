@@ -398,6 +398,67 @@ class TestHybridArchitecture(unittest.TestCase):
         # Running unrelated directory does NOT resolve
         self.assertFalse(can_suite_resolve_failure("pytest tests/", "pytest integration_tests/test_api.py::test_login"))
 
+    def test_multiline_shell_masking_tainted(self):
+        """Multiline strings (e.g. pytest\\nexit 0) are tainted as chained execution."""
+        self.assertTrue(is_tainted_shell_command("pytest tests/test_failing.py\nexit 0"))
+        self.assertTrue(is_tainted_shell_command("pytest tests/test_failing.py\r\nexit 0"))
+        self.assertTrue(is_tainted_shell_command("exit 0\npytest tests/test_failing.py"))
+
+    def test_sibling_subtests_cannot_resolve_each_other(self):
+        """Running a different passing subtest in the same file must NEVER resolve a broken subtest."""
+        # Sibling subtests in same file: MUST NOT resolve
+        self.assertFalse(can_suite_resolve_failure(
+            "pytest tests/test_foo.py::test_passing",
+            "pytest tests/test_foo.py::test_broken"
+        ))
+        # Exact same subtest: DOES resolve
+        self.assertTrue(can_suite_resolve_failure(
+            "pytest tests/test_foo.py::test_broken",
+            "pytest tests/test_foo.py::test_broken"
+        ))
+        # Running the entire file: DOES resolve the subtest
+        self.assertTrue(can_suite_resolve_failure(
+            "pytest tests/test_foo.py",
+            "pytest tests/test_foo.py::test_broken"
+        ))
+        # Running a single subtest does NOT resolve a whole-file failure
+        self.assertFalse(can_suite_resolve_failure(
+            "pytest tests/test_foo.py::test_passing",
+            "pytest tests/test_foo.py"
+        ))
+
+    def test_baseline_survives_local_halt_dir_deletion(self):
+        """Deleting ~/.hardtruth/halts/ cannot reset the baseline when git ref or daemon has it."""
+        git_repo_dir = os.path.join(self.test_dir, "survive_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        main_file = os.path.join(git_repo_dir, "main.py")
+        with open(main_file, "w") as f:
+            f.write("# v1\n")
+        subprocess.run(["git", "add", "main.py"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=git_repo_dir, check=True)
+
+        conv = f"survive-{uuid.uuid4().hex}"
+        from client.hardtruth_hook import get_or_set_session_baseline
+        initial_sha = get_or_set_session_baseline(git_repo_dir, conv)
+        self.assertIsNotNone(initial_sha)
+
+        # Agent edits main.py and commits it
+        with open(main_file, "a") as f:
+            f.write("def bar():\n    return 99\n")
+        subprocess.run(["git", "commit", "--no-verify", "-am", "v2"], cwd=git_repo_dir, check=True)
+
+        # Agent maliciously wipes the local halt directory
+        shutil.rmtree(self.halt_dir, ignore_errors=True)
+        self.assertFalse(os.path.exists(self.halt_dir))
+
+        # Hook MUST recover baseline from git refs or daemon, NOT reset to HEAD
+        recovered_sha = get_or_set_session_baseline(git_repo_dir, conv)
+        self.assertEqual(recovered_sha, initial_sha)
+
 
 if __name__ == "__main__":
     unittest.main()

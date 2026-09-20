@@ -128,25 +128,79 @@ IGNORED_BUILD_DIRS = {".git", ".pytest_cache", "__pycache__", "node_modules", "t
 def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
     """
     Records and returns the git commit SHA at the start of the session.
-    Enables universal file tracking across git commits (defeating the 'commit & run' loophole).
+    Enforces multi-layer baseline persistence:
+    1. Isolated Daemon (tamper-evident, survives local rm -rf ~/.hardtruth/halts)
+    2. Git internal ref (refs/hardtruth/baseline/<conv_hash>)
+    3. Local cache file (~/.hardtruth/halts/baseline_*.json)
+    Defeats the 'commit & run' and baseline reset exploits completely.
     """
     if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
         return None
 
-    halt_dir = get_halt_counter_dir()
-    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
     safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
     conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
     baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+    ws_norm = os.path.abspath(workspace_dir)
 
+    # 1. Ask isolated daemon (primary source of truth, container-isolated from agent)
+    try:
+        resp = call_system_one(
+            f"v1/session/baseline?conversationId={urllib.parse.quote(str(conv_id))}&workspace_path={urllib.parse.quote(ws_norm)}",
+            {},
+            timeout=1.0
+        )
+        if resp and resp.get("baseline_sha"):
+            daemon_sha = resp.get("baseline_sha")
+            try:
+                with open(baseline_file, "w") as f:
+                    json.dump({"baseline_sha": daemon_sha, "created_at": time.time()}, f)
+            except Exception:
+                pass
+            return daemon_sha
+    except Exception:
+        pass
+
+    # 2. Check local git ref (refs/hardtruth/baseline/<conv_hash>)
+    try:
+        ref_proc = subprocess.run(
+            ["git", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if ref_proc.returncode == 0 and ref_proc.stdout.strip():
+            ref_sha = ref_proc.stdout.strip()
+            # Register with daemon if online
+            call_system_one("v1/session/baseline", {
+                "conversationId": conv_id,
+                "workspace_path": ws_norm,
+                "commit_sha": ref_sha
+            }, timeout=1.0)
+            return ref_sha
+    except Exception:
+        pass
+
+    # 3. Check local cache file
     if os.path.exists(baseline_file):
         try:
             with open(baseline_file, "r") as f:
                 data = json.load(f)
-                return data.get("baseline_sha")
+                cached_sha = data.get("baseline_sha")
+                if cached_sha:
+                    call_system_one("v1/session/baseline", {
+                        "conversationId": conv_id,
+                        "workspace_path": ws_norm,
+                        "commit_sha": cached_sha
+                    }, timeout=1.0)
+                    return cached_sha
         except Exception:
             pass
 
+    # 4. First initialization for this session: get current HEAD
     try:
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -158,8 +212,35 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
         )
         if res.returncode == 0 and res.stdout.strip():
             sha = res.stdout.strip()
-            with open(baseline_file, "w") as f:
-                json.dump({"baseline_sha": sha, "created_at": time.time()}, f)
+
+            # Register with daemon (daemon returns existing if already recorded)
+            resp = call_system_one("v1/session/baseline", {
+                "conversationId": conv_id,
+                "workspace_path": ws_norm,
+                "commit_sha": sha
+            }, timeout=1.0)
+            if resp and resp.get("baseline_sha"):
+                sha = resp.get("baseline_sha")
+
+            # Store in git ref
+            try:
+                subprocess.run(
+                    ["git", "update-ref", f"refs/hardtruth/baseline/{conv_hash}", sha],
+                    cwd=workspace_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=1.0
+                )
+            except Exception:
+                pass
+
+            # Cache locally
+            try:
+                with open(baseline_file, "w") as f:
+                    json.dump({"baseline_sha": sha, "created_at": time.time()}, f)
+            except Exception:
+                pass
+
             return sha
     except Exception:
         pass

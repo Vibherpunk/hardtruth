@@ -130,6 +130,11 @@ class GetPremiseResponse(BaseModel):
     broken_at_index: Optional[int] = None
     detail: Optional[str] = None
 
+class SessionBaselineRequest(BaseModel):
+    conversationId: str
+    workspace_path: str
+    commit_sha: Optional[str] = None
+
 class HandoffVerifyRequest(BaseModel):
     workspace_path: str
     conversationId: Optional[str] = None
@@ -202,6 +207,31 @@ def get_ledger_premise(conversationId: str = Query(..., description="Conversatio
     if premise_data.get("tampered"):
         return JSONResponse(status_code=400, content=premise_data)
     return premise_data
+
+@app.post("/v1/session/baseline")
+def set_session_baseline(req: SessionBaselineRequest):
+    """
+    Registers the session baseline commit SHA for (conversationId, workspace_path).
+    Immutable in daemon memory and physical HMAC-chained ledger.
+    """
+    baseline = _ledger.get_session_baseline(req.conversationId, req.workspace_path)
+    if baseline:
+        return {"baseline_sha": baseline, "status": "existing"}
+    if req.commit_sha:
+        saved = _ledger.set_session_baseline(req.conversationId, req.workspace_path, req.commit_sha)
+        return {"baseline_sha": saved, "status": "created"}
+    return {"baseline_sha": None, "status": "not_found"}
+
+@app.get("/v1/session/baseline")
+def get_session_baseline(
+    conversationId: str = Query(..., description="Conversation ID"),
+    workspace_path: str = Query(..., description="Workspace path")
+):
+    """
+    Retrieves the immutable session baseline commit SHA for (conversationId, workspace_path).
+    """
+    baseline = _ledger.get_session_baseline(conversationId, workspace_path)
+    return {"baseline_sha": baseline}
 
 @app.post("/v1/verify/handoff", response_model=HandoffVerifyResponse)
 def verify_handoff(req: HandoffVerifyRequest):

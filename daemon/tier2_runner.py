@@ -52,17 +52,47 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
 
     # 2. Check committed modifications against session baseline commit
     if conv_id:
-        halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
         safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
         conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-        baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
         baseline_sha = None
-        if os.path.exists(baseline_file):
+
+        # Check daemon ledger immutable baseline
+        try:
+            from ledger import _ledger
+            baseline_sha = _ledger.get_session_baseline(conv_id, workspace_path)
+        except Exception:
             try:
-                with open(baseline_file, "r") as f:
-                    baseline_sha = json.load(f).get("baseline_sha")
+                from daemon.ledger import _ledger
+                baseline_sha = _ledger.get_session_baseline(conv_id, workspace_path)
             except Exception:
                 pass
+
+        # Check git ref refs/hardtruth/baseline/<conv_hash>
+        if not baseline_sha:
+            try:
+                proc_ref = subprocess.run(
+                    ["git", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+                    cwd=workspace_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=1.0,
+                    text=True
+                )
+                if proc_ref.returncode == 0 and proc_ref.stdout.strip():
+                    baseline_sha = proc_ref.stdout.strip()
+            except Exception:
+                pass
+
+        # Check halt dir local fallback
+        if not baseline_sha:
+            halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
+            baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+            if os.path.exists(baseline_file):
+                try:
+                    with open(baseline_file, "r") as f:
+                        baseline_sha = json.load(f).get("baseline_sha")
+                except Exception:
+                    pass
 
         if baseline_sha:
             try:
