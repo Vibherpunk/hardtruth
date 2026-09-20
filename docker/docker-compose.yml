@@ -18,8 +18,10 @@ services:
       # daemon container so Tier 2 can verify agent workspaces.
       # Example: {"\\/Users\\/ai\\/dev":"\\/workspaces\\/dev"}
       HARDTRUTH_WORKSPACE_MAP: ${HARDTRUTH_WORKSPACE_MAP:-{}}
+      # Subprocess execution authorized inside containerized daemon (runs in dedicated container)
+      HARDTRUTH_TIER2_ALLOW_SUBPROCESS: "1"
     volumes:
-      # Share the physical ledger + API key with the host hook (single source of truth).
+      # Private state volume for ledger and keys (single source of truth).
       - ${HARDTRUTH_STATE_DIR:-~/.hardtruth}:/root/.hardtruth
-      # Mount any host workspace tree the daemon must verify (repeat per agent workspace).
+      # Mount host workspace strictly read-only into container.
       - ${HARDTRUTH_WORKSPACE:-/Users/ai/dev/hardtruth-fix}:${HARDTRUTH_WORKSPACE_MOUNT:-/Users/ai/dev/hardtruth-fix}:ro

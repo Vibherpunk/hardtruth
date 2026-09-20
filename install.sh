@@ -23,6 +23,11 @@ cp "$REPO_ROOT/client/hardtruth_hook.py" "$HARDTRUTH_LIB/hardtruth_hook.py"
 cp "$REPO_ROOT/daemon/ledger.py" "$HARDTRUTH_LIB/ledger.py"
 cp "$REPO_ROOT/daemon/tier2_runner.py" "$HARDTRUTH_LIB/tier2_runner.py"
 touch "$HARDTRUTH_LIB/__init__.py"
+# Also install at ~/.hardtruth/lib/ for direct top-level access
+cp "$REPO_ROOT/client/hardtruth_hook.py" "$HARDTRUTH_DIR/lib/hardtruth_hook.py"
+cp "$REPO_ROOT/client/ast_checker.py" "$HARDTRUTH_DIR/lib/ast_checker.py"
+cp "$REPO_ROOT/daemon/ledger.py" "$HARDTRUTH_DIR/lib/ledger.py"
+cp "$REPO_ROOT/daemon/tier2_runner.py" "$HARDTRUTH_DIR/lib/tier2_runner.py"
 echo "✓ HardTruth client library installed to $HARDTRUTH_LIB"
 
 # 2. Antigravity Configuration
@@ -36,32 +41,26 @@ if [ -d "$HOME/.gemini" ]; then
     cp "$REPO_ROOT/daemon/tier2_runner.py" "$ANTIGRAVITY_CONFIG_DIR/tier2_runner.py"
     chmod +x "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
     
-    cat > "$ANTIGRAVITY_CONFIG_DIR/hooks.json" << 'EOF'
-{
-  "hardtruth": {
-    "enabled": true,
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 ~/.gemini/config/hardtruth_hook.py post_tool",
-            "timeout": 20
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command",
-        "command": "python3 ~/.gemini/config/hardtruth_hook.py stop",
-        "timeout": 90
-      }
-    ]
-  }
+    HOOKS_FILE="$ANTIGRAVITY_CONFIG_DIR/hooks.json"
+    if [ -f "$HOOKS_FILE" ]; then
+        cp "$HOOKS_FILE" "$HOOKS_FILE.bak.$(date +%s)"
+    fi
+    python3 -c "
+import json, os
+p = os.path.expanduser('~/.gemini/config/hooks.json')
+try:
+    with open(p, 'r') as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['hardtruth'] = {
+    'enabled': True,
+    'PostToolUse': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'python3 ~/.gemini/config/hardtruth_hook.py post_tool', 'timeout': 20}]}],
+    'Stop': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'python3 ~/.gemini/config/hardtruth_hook.py stop', 'timeout': 90}]}]
 }
-EOF
+with open(p, 'w') as f:
+    json.dump(data, f, indent=2)
+"
     echo "✓ Antigravity configured with HardTruth Stop and PostToolUse hooks."
 fi
 
@@ -84,7 +83,7 @@ if [ -f "$PREV_HOOKS_FILE" ]; then
 fi
 
 python3 -c "
-import sys, os, subprocess
+import sys, os, subprocess, re
 sys.path.insert(0, os.path.expanduser('~/.hardtruth/lib'))
 from hardtruth.ast_checker import check_ast_stubs
 
@@ -96,8 +95,22 @@ except Exception:
 
 violations = []
 for f in files:
-    if os.path.isfile(f):
-        violations.extend(check_ast_stubs(f))
+    if os.path.isfile(f) and f.endswith(('.py', '.ts', '.js', '.rs', '.go')):
+        try:
+            diff_out = subprocess.check_output(
+                ['git', 'diff', '--cached', '-U0', '--', f], text=True)
+            changed_lines = set()
+            for line in diff_out.splitlines():
+                if line.startswith('@@'):
+                    m = re.search(r'\+(\d+)(?:,(\d+))?', line)
+                    if m:
+                        start = int(m.group(1))
+                        cnt = int(m.group(2)) if m.group(2) is not None else 1
+                        for ln in range(start, start + max(cnt, 1)):
+                            changed_lines.add(ln)
+            violations.extend(check_ast_stubs(f, modified_lines=changed_lines if changed_lines else None))
+        except Exception:
+            violations.extend(check_ast_stubs(f))
 
 if violations:
     print('🚨 HARDTRUTH COMMIT GATE REJECTED: Code contains stubs.')
@@ -109,14 +122,16 @@ EOF
 chmod +x "$GLOBAL_HOOKS_DIR/pre-commit"
 echo "✓ Pre-commit hook written to $GLOBAL_HOOKS_DIR/pre-commit"
 
-# 3. Claude Code Configuration (if ~/.claude exists)
+# 4. Claude Code Configuration (if ~/.claude exists)
 if [ -d "$HOME/.claude" ]; then
     echo "Configuring Claude Code global hooks..."
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-    if [ ! -f "$CLAUDE_SETTINGS" ]; then
+    if [ -f "$CLAUDE_SETTINGS" ]; then
+        cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.bak.$(date +%s)"
+    else
         echo "{}" > "$CLAUDE_SETTINGS"
     fi
-    # Safely merge or write HardTruth hooks for Claude Code
+    # Safely merge or write HardTruth hooks for Claude Code without destroying existing hooks
     python3 -c "
 import json, os
 p = os.path.expanduser('~/.claude/settings.json')
@@ -126,8 +141,17 @@ try:
 except Exception:
     data = {}
 hooks = data.setdefault('hooks', {})
-hooks['PostToolUse'] = [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]}]
-hooks['Stop'] = [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]}]
+post_hooks = hooks.setdefault('PostToolUse', [])
+stop_hooks = hooks.setdefault('Stop', [])
+
+ht_post = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]}
+ht_stop = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]}
+
+if not any('hardtruth_hook.py' in str(h) for h in post_hooks):
+    post_hooks.append(ht_post)
+if not any('hardtruth_hook.py' in str(h) for h in stop_hooks):
+    stop_hooks.append(ht_stop)
+
 with open(p, 'w') as f:
     json.dump(data, f, indent=2)
 "

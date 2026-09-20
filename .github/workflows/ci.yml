@@ -55,12 +55,11 @@ jobs:
         run: |
           docker build -t hardtruth-daemon -f docker/Dockerfile .
           docker volume create hardtruth_state
-          docker run -d -p 8000:8000 \
+          docker run -d -p 127.0.0.1:8000:8000 \
             -v hardtruth_state:/root/.hardtruth \
-            -v /var/run/docker.sock:/var/run/docker.sock \
             -e HARDTRUTH_API_TOKEN=dummy-ci-token \
             -e HARDTRUTH_WORKSPACE_MAP="{\"$GITHUB_WORKSPACE\": \"/workspace\"}" \
-            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
             --name hardtruth-daemon-container hardtruth-daemon
           for i in {1..30}; do
             if curl -s http://127.0.0.1:8000/health | grep -q "healthy"; then

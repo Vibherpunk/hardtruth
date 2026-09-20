@@ -411,6 +411,100 @@ def run_container_verification(
         return None
 
 
+def validate_runner_command(cmd: str) -> Optional[Dict[str, Any]]:
+    """
+    Validates runner command against command injection, shell metacharacters,
+    disallowed binaries, and interpreter code-execution flags (-c, --eval, -e).
+    Returns None if valid, or a rejection dict if invalid.
+    """
+    cmd_clean = (cmd or "").strip()
+    if not cmd_clean:
+        return {
+            "status": "rejected_empty_command",
+            "success": False,
+            "exit_code": 1,
+            "runner": "command_sanitizer",
+            "output": "🚨 TIER 2 HARD GATE REJECTED: Empty test command specified.",
+            "isolation": "input_validation"
+        }
+    if re.search(r"[;&|`$><\r\n]", cmd_clean):
+        return {
+            "status": "rejected_unsafe_command",
+            "success": False,
+            "exit_code": 1,
+            "runner": "command_sanitizer",
+            "output": f"🚨 TIER 2 HARD GATE REJECTED: Disallowed shell metacharacters detected in test runner command: {cmd}",
+            "isolation": "input_validation"
+        }
+    parts = shlex.split(cmd_clean)
+    if not parts:
+        return {
+            "status": "rejected_empty_command",
+            "success": False,
+            "exit_code": 1,
+            "runner": "command_sanitizer",
+            "output": "🚨 TIER 2 HARD GATE REJECTED: Empty test command specified.",
+            "isolation": "input_validation"
+        }
+    base_bin = os.path.basename(parts[0]).lower()
+    allowed_bins = {"pytest", "npm", "yarn", "bun", "cargo", "jest", "vitest", "tox", "ctest"}
+    if base_bin in ("python", "python3"):
+        if len(parts) >= 3 and parts[1] == "-m" and parts[2] in ("unittest", "pytest"):
+            pass
+        else:
+            return {
+                "status": "rejected_unauthorized_runner",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Python runner only allows '-m unittest' or '-m pytest', received: {cmd}",
+                "isolation": "input_validation"
+            }
+    elif base_bin == "go":
+        if len(parts) >= 2 and parts[1] == "test":
+            pass
+        else:
+            return {
+                "status": "rejected_unauthorized_runner",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Go runner only allows 'go test', received: {cmd}",
+                "isolation": "input_validation"
+            }
+    elif base_bin == "make":
+        if any(a in ("-f", "--file", "--makefile") for a in parts[1:]):
+            return {
+                "status": "rejected_unauthorized_runner",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Custom makefile flags are rejected: {cmd}",
+                "isolation": "input_validation"
+            }
+    elif base_bin not in allowed_bins:
+        return {
+            "status": "rejected_unauthorized_runner",
+            "success": False,
+            "exit_code": 1,
+            "runner": "command_sanitizer",
+            "output": f"🚨 TIER 2 HARD GATE REJECTED: Command binary '{parts[0]}' is not an authorized test runner.",
+            "isolation": "input_validation"
+        }
+
+    # Reject interpreter-escape flags across any runner
+    if any(a in ("-c", "--eval", "-e") for a in parts[1:]):
+        return {
+            "status": "rejected_unauthorized_runner",
+            "success": False,
+            "exit_code": 1,
+            "runner": "command_sanitizer",
+            "output": f"🚨 TIER 2 HARD GATE REJECTED: Code execution flag detected in '{cmd}'.",
+            "isolation": "input_validation"
+        }
+    return None
+
+
 def run_independent_verification(
     workspace_path: str,
     test_cmd: Optional[str] = None,
@@ -420,7 +514,7 @@ def run_independent_verification(
     """
     Executes the canonical test suite outside the agent context.
     Prioritizes ephemeral read-only Docker container isolation,
-    falling back to clean subprocess sandbox if Docker is unavailable.
+    falling back to clean subprocess sandbox if Docker is unavailable and subprocess execution is authorized.
     """
     orig_path = workspace_path
     workspace_path = resolve_workspace_path(workspace_path)
@@ -449,108 +543,15 @@ def run_independent_verification(
             "isolation": "manifest_tampering_check"
         }
 
-    # Validate test_cmd against command injection if supplied externally
-    if test_cmd:
-        cmd_clean = test_cmd.strip()
-        if re.search(r"[;&|`$><\r\n]", cmd_clean):
-            return {
-                "status": "rejected_unsafe_command",
-                "success": False,
-                "exit_code": 1,
-                "runner": "command_sanitizer",
-                "output": f"🚨 TIER 2 HARD GATE REJECTED: Disallowed shell metacharacters detected in requested test command: {test_cmd}",
-                "isolation": "input_validation"
-            }
-        parts = shlex.split(cmd_clean)
-        if not parts:
-            return {
-                "status": "rejected_empty_command",
-                "success": False,
-                "exit_code": 1,
-                "runner": "command_sanitizer",
-                "output": "🚨 TIER 2 HARD GATE REJECTED: Empty test command specified.",
-                "isolation": "input_validation"
-            }
-        base_bin = os.path.basename(parts[0]).lower()
-        allowed_bins = {"pytest", "npm", "yarn", "bun", "cargo", "jest", "vitest", "tox", "ctest"}
-        if base_bin in ("python", "python3"):
-            if len(parts) >= 3 and parts[1] == "-m" and parts[2] in ("unittest", "pytest"):
-                pass
-            else:
-                return {
-                    "status": "rejected_unauthorized_runner",
-                    "success": False,
-                    "exit_code": 1,
-                    "runner": "command_sanitizer",
-                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Python runner only allows '-m unittest' or '-m pytest', received: {test_cmd}",
-                    "isolation": "input_validation"
-                }
-        elif base_bin == "go":
-            if len(parts) >= 2 and parts[1] == "test":
-                pass
-            else:
-                return {
-                    "status": "rejected_unauthorized_runner",
-                    "success": False,
-                    "exit_code": 1,
-                    "runner": "command_sanitizer",
-                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Go runner only allows 'go test', received: {test_cmd}",
-                    "isolation": "input_validation"
-                }
-        elif base_bin == "make":
-            if any(a in ("-f", "--file", "--makefile") for a in parts[1:]):
-                return {
-                    "status": "rejected_unauthorized_runner",
-                    "success": False,
-                    "exit_code": 1,
-                    "runner": "command_sanitizer",
-                    "output": f"🚨 TIER 2 HARD GATE REJECTED: Custom makefile flags are rejected: {test_cmd}",
-                    "isolation": "input_validation"
-                }
-        elif base_bin not in allowed_bins:
-            return {
-                "status": "rejected_unauthorized_runner",
-                "success": False,
-                "exit_code": 1,
-                "runner": "command_sanitizer",
-                "output": f"🚨 TIER 2 HARD GATE REJECTED: Command binary '{parts[0]}' is not an authorized test runner.",
-                "isolation": "input_validation"
-            }
-
-        # Reject interpreter-escape flags across any runner
-        if any(a in ("-c", "--eval", "-e") for a in parts[1:]):
-            return {
-                "status": "rejected_unauthorized_runner",
-                "success": False,
-                "exit_code": 1,
-                "runner": "command_sanitizer",
-                "output": f"🚨 TIER 2 HARD GATE REJECTED: Code execution flag detected in '{test_cmd}'.",
-                "isolation": "input_validation"
-            }
-
     session_key = (str(conv_id), os.path.abspath(workspace_path)) if conv_id else None
     pinned_runner = None
     baseline_failures: Set[str] = set()
 
-    halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
-    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id or "default"))[:32]
-    conv_hash = hashlib.sha256(str(conv_id or "default").encode("utf-8")).hexdigest()[:16]
-    baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
-
+    # Authoritative memory/daemon state only (P3 fix: never trust agent-writable halt files)
     if session_key:
         pinned_runner = _pinned_runners.get(session_key)
         if session_key in _session_baseline_failures:
             baseline_failures = _session_baseline_failures[session_key]
-
-    if not pinned_runner and os.path.exists(baseline_file):
-        try:
-            with open(baseline_file, "r") as f:
-                bdata = json.load(f)
-                pinned_runner = bdata.get("pinned_runner")
-                if "baseline_failures" in bdata:
-                    baseline_failures = set(bdata["baseline_failures"])
-        except Exception:
-            pass
 
     if test_cmd:
         canonical_runner = test_cmd
@@ -560,15 +561,6 @@ def run_independent_verification(
         canonical_runner = detect_test_runner(workspace_path, tampered_manifests=tampered_files)
         if canonical_runner and session_key:
             _pinned_runners[session_key] = canonical_runner
-            if os.path.exists(baseline_file):
-                try:
-                    with open(baseline_file, "r") as f:
-                        bdata = json.load(f)
-                    bdata["pinned_runner"] = canonical_runner
-                    with open(baseline_file, "w") as f:
-                        json.dump(bdata, f)
-                except Exception:
-                    pass
 
     if not canonical_runner:
         return {
@@ -579,10 +571,15 @@ def run_independent_verification(
             "output": "🚨 TIER 2 HARD GATE FAILED: Code files were modified or verification was requested, but no canonical test suite or runner could be detected in the workspace. HardTruth never fails open: renaming or deleting test suites is not permitted."
         }
 
-    # 1. Attempt Ephemeral Docker Container Verification (Full Physical Boundary)
-    if os.environ.get("HARDTRUTH_PREFER_DOCKER_TIER2") == "1":
+    # P4 Fix: Unconditionally validate canonical_runner before ANY execution
+    validation_err = validate_runner_command(canonical_runner)
+    if validation_err:
+        return validation_err
+
+    # 1. Attempt Ephemeral Docker Container Verification (First-priority physical isolation)
+    if os.environ.get("HARDTRUTH_TIER2_CONTAINER") != "0":
         container_res = run_container_verification(workspace_path, canonical_runner, timeout_sec=timeout_sec)
-        if container_res is not None:
+        if container_res is not None and container_res.get("exit_code") != 127:
             if not container_res.get("success") and container_res.get("exit_code") not in (0, None):
                 curr_failures = extract_test_failures(container_res.get("output", ""))
                 if curr_failures and baseline_failures and curr_failures.issubset(baseline_failures):
@@ -590,6 +587,22 @@ def run_independent_verification(
                     container_res["status"] = "verified_regression_free"
                     container_res["output"] = f"Tier 2 verified (no new regressions: {len(curr_failures)} pre-existing failures matched baseline set).\n" + container_res.get("output", "")
             return container_res
+
+    # 2. Host Subprocess Execution Gate (S1 fix: host execution must be authorized)
+    allow_subprocess = os.environ.get("HARDTRUTH_TIER2_ALLOW_SUBPROCESS", "1" if (os.environ.get("CI") or os.environ.get("PYTEST_CURRENT_TEST")) else "0")
+    if allow_subprocess != "1":
+        return {
+            "status": "unverified_no_isolation",
+            "success": False,
+            "exit_code": 1,
+            "runner": "isolation_guard",
+            "output": (
+                "🚨 TIER 2 HARD GATE REJECTED: Ephemeral container isolation is unavailable and host subprocess execution is not explicitly authorized. "
+                "HardTruth never executes repository code unsandboxed on the host without operator approval. "
+                "To permit clean subprocess sandbox execution on the host in trusted environments, set HARDTRUTH_TIER2_ALLOW_SUBPROCESS=1."
+            ),
+            "isolation": "isolation_guard"
+        }
 
     # 2. Clean Subprocess Sandbox Execution (Clean Environment Boundary)
     # Construct clean_env from an explicit allowlist to prevent leaking daemon HMAC keys, API tokens, or ledger paths

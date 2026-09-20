@@ -138,11 +138,31 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
     """
     Returns set of line numbers in fpath modified since baseline commit (or unstaged working tree changes).
     Parses git diff -U0 hunk headers: @@ -l,s +start,count @@
+    If file is untracked (newly added by agent), returns all line numbers in file.
+    If file is tracked and has no changes, returns set() (0 modified lines).
     """
     if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
         return None
     rel_path = os.path.relpath(fpath, workspace_dir)
     ws_abs = os.path.abspath(workspace_dir)
+
+    # Check if untracked in git (brand new file created by agent)
+    try:
+        unmatch_check = subprocess.run(
+            ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+             "ls-files", "--error-unmatch", "--", rel_path],
+            cwd=workspace_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2.0
+        )
+        if unmatch_check.returncode != 0:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    cnt = sum(1 for _ in f)
+                return set(range(1, max(cnt, 1) + 1))
+            except Exception:
+                return None
+    except Exception:
+        pass
+
     diff_args = [
         "git", "-c", f"safe.directory={ws_abs}",
         "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
@@ -164,7 +184,7 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
                     count = int(m.group(2)) if m.group(2) is not None else 1
                     for ln in range(start, start + max(count, 1)):
                         changed.add(ln)
-        return changed if changed else None
+        return changed
     except Exception:
         return None
 
@@ -357,8 +377,17 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
         if resp and resp.get("baseline_sha"):
             daemon_sha = resp.get("baseline_sha")
             try:
+                data = {}
+                if os.path.exists(baseline_file):
+                    try:
+                        with open(baseline_file, "r") as f:
+                            data = json.load(f)
+                    except Exception:
+                        pass
+                data["baseline_sha"] = daemon_sha
+                data.setdefault("created_at", time.time())
                 with open(baseline_file, "w") as f:
-                    json.dump({"baseline_sha": daemon_sha, "created_at": time.time()}, f)
+                    json.dump(data, f)
             except Exception:
                 pass
             return daemon_sha
@@ -439,8 +468,17 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
 
             # Cache locally
             try:
+                data = {}
+                if os.path.exists(baseline_file):
+                    try:
+                        with open(baseline_file, "r") as f:
+                            data = json.load(f)
+                    except Exception:
+                        pass
+                data["baseline_sha"] = sha
+                data.setdefault("created_at", time.time())
                 with open(baseline_file, "w") as f:
-                    json.dump({"baseline_sha": sha, "created_at": time.time()}, f)
+                    json.dump(data, f)
             except Exception:
                 pass
 
@@ -466,96 +504,129 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     if not workspace_dir or not os.path.exists(workspace_dir):
         return source_files, doc_files, []
 
-    # 1. Uncommitted and untracked / ignored files in working tree (-uall for full recursion)
-    try:
-        res = subprocess.run(
-            ["git", "-c", "core.quotepath=false", "status", "--porcelain", "-uall", "--ignored=matching"],
-            cwd=workspace_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=1.0,
-            text=True
-        )
-        if res.returncode == 0 and res.stdout:
-            for line in res.stdout.splitlines():
-                line_clean = line.strip()
-                if len(line_clean) < 3:
-                    continue
-                filepath_rel = line_clean[2:].strip()
-                if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
-                    filepath_rel = filepath_rel[1:-1]
-                if " -> " in filepath_rel:
-                    filepath_rel = filepath_rel.split(" -> ")[1].strip()
+    ws_abs = os.path.abspath(workspace_dir)
+    git_safe_flags = [
+        "-c", f"safe.directory={ws_abs}",
+        "-c", "core.fsmonitor=",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.quotepath=false"
+    ]
+
+    is_git_repo = os.path.exists(os.path.join(workspace_dir, ".git"))
+
+    # 1. Uncommitted, untracked, and ignored source files in working tree
+    # Uses --ignored=matching with explicit pathspec exclusions to prevent crawling node_modules/venv
+    if is_git_repo:
+        exclude_pathspecs = [
+            "--", ".",
+            ":(exclude).git",
+            ":(exclude)node_modules",
+            ":(exclude).venv",
+            ":(exclude)venv",
+            ":(exclude)target",
+            ":(exclude).pytest_cache",
+            ":(exclude)__pycache__",
+            ":(exclude).tox",
+            ":(exclude).mypy_cache",
+            ":(exclude)build",
+            ":(exclude)dist"
+        ]
+        try:
+            res = subprocess.run(
+                ["git"] + git_safe_flags + ["status", "--porcelain", "-uall", "--ignored=matching"] + exclude_pathspecs,
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                text=True
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"git status failed with exit code {res.returncode}: {res.stderr.strip()}")
+            if res.stdout:
+                for line in res.stdout.splitlines():
+                    line_clean = line.strip()
+                    if len(line_clean) < 3:
+                        continue
+                    filepath_rel = line_clean[2:].strip()
                     if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
                         filepath_rel = filepath_rel[1:-1]
-                all_rel_paths.add(filepath_rel)
-    except Exception:
-        pass
+                    if " -> " in filepath_rel:
+                        filepath_rel = filepath_rel.split(" -> ")[1].strip()
+                        if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
+                            filepath_rel = filepath_rel[1:-1]
+                    all_rel_paths.add(filepath_rel)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("git status timed out after 5.0s during workspace verification")
 
     # 2. Committed files since session baseline
-    if conv_id:
+    if is_git_repo and conv_id:
         baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
         if baseline_sha:
             try:
                 res_diff = subprocess.run(
-                    ["git", "-c", "core.quotepath=false", "diff", "--name-only", baseline_sha, "HEAD", "--"],
+                    ["git"] + git_safe_flags + ["diff", "--name-only", baseline_sha, "HEAD", "--"],
                     cwd=workspace_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    timeout=2.0,
+                    timeout=5.0,
                     text=True
                 )
-                if res_diff.returncode == 0 and res_diff.stdout:
+                if res_diff.returncode != 0:
+                    raise RuntimeError(f"git diff failed with exit code {res_diff.returncode}: {res_diff.stderr.strip()}")
+                if res_diff.stdout:
                     for line in res_diff.stdout.splitlines():
                         f = line.strip()
                         if f.startswith('"') and f.endswith('"'):
                             f = f[1:-1]
                         if f:
                             all_rel_paths.add(f)
-            except Exception:
-                pass
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"git diff against baseline {baseline_sha} timed out after 5.0s")
 
     # 3. Check for git index manipulation (assume-unchanged or skip-worktree)
-    try:
-        res_v = subprocess.run(
-            ["git", "-c", "core.quotepath=false", "ls-files", "-v"],
-            cwd=workspace_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=1.0,
-            text=True
-        )
-        if res_v.returncode == 0 and res_v.stdout:
-            for line in res_v.stdout.splitlines():
-                if len(line) >= 3:
-                    tag = line[0]
-                    fname = line[2:].strip()
-                    if fname.startswith('"') and fname.endswith('"'):
-                        fname = fname[1:-1]
-                    if tag in ["h", "s", "S"]:
-                        try:
-                            cur_h = subprocess.run(
-                                ["git", "hash-object", "--", fname],
-                                cwd=workspace_dir,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                timeout=1.0,
-                                text=True
-                            ).stdout.strip()
-                            idx_out = subprocess.run(
-                                ["git", "ls-files", "-s", "--", fname],
-                                cwd=workspace_dir,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                timeout=1.0,
-                                text=True
-                            ).stdout.split()
-                            if len(idx_out) >= 2 and cur_h != idx_out[1]:
+    if is_git_repo:
+        try:
+            res_v = subprocess.run(
+                ["git"] + git_safe_flags + ["ls-files", "-v"],
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                text=True
+            )
+            if res_v.returncode != 0:
+                raise RuntimeError(f"git ls-files -v failed with exit code {res_v.returncode}: {res_v.stderr.strip()}")
+            if res_v.stdout:
+                for line in res_v.stdout.splitlines():
+                    if len(line) >= 3:
+                        tag = line[0]
+                        fname = line[2:].strip()
+                        if fname.startswith('"') and fname.endswith('"'):
+                            fname = fname[1:-1]
+                        if tag in ["h", "s", "S"]:
+                            try:
+                                cur_h = subprocess.run(
+                                    ["git"] + git_safe_flags + ["hash-object", "--", fname],
+                                    cwd=workspace_dir,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    timeout=2.0,
+                                    text=True
+                                ).stdout.strip()
+                                idx_out = subprocess.run(
+                                    ["git"] + git_safe_flags + ["ls-files", "-s", "--", fname],
+                                    cwd=workspace_dir,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                    timeout=2.0,
+                                    text=True
+                                ).stdout.split()
+                                if len(idx_out) >= 2 and cur_h != idx_out[1]:
+                                    all_rel_paths.add(fname)
+                            except Exception:
                                 all_rel_paths.add(fname)
-                        except Exception:
-                            all_rel_paths.add(fname)
-    except Exception:
-        pass
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("git ls-files timed out after 5.0s")
 
     # 4. Fallback if .git is missing (e.g. rm -rf .git)
     if not os.path.exists(os.path.join(workspace_dir, ".git")):
@@ -751,6 +822,19 @@ def handle_post_tool_use(payload: dict) -> dict:
             observed_exit_code = 1
             harness_status = "tainted_shell_operator"
             error_msg = f"TAINTED: Chained shell operators detected: {error_msg or ''}".strip()
+        elif payload.get("exitCode") is not None:
+            # Direct exitCode provided in hook payload (e.g. Claude Code or explicit harness event)
+            observed_exit_code = int(payload["exitCode"])
+            harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
+            tr = payload.get("tool_response") or payload.get("result") or payload.get("output") or {}
+            raw_out = ""
+            if isinstance(tr, dict):
+                raw_out = tr.get("stdout") or tr.get("output") or tr.get("text") or ""
+            elif isinstance(tr, str):
+                raw_out = tr
+            if raw_out:
+                lines = str(raw_out).splitlines()
+                stdout_tail = "\n".join(lines[-15:])[:1000] if lines else None
         elif transcript_path and os.path.exists(transcript_path):
             ec, tail, timed_out = poll_transcript_for_step(transcript_path, step_idx)
             if ec is not None:
@@ -896,10 +980,14 @@ def handle_stop(payload: dict) -> dict:
         if remediable:
             record_halt(counter_file, new_count)
         if new_count >= 3:
+            sys.stderr.write(
+                f"[HARDTRUTH OPERATOR NOTICE] Escalation halt reached for session {conv_id} ({new_count} consecutive halts).\n"
+                f"Counter file: {counter_file}\n"
+                f"Operator remediation instructions: Inspect and fix root cause before manual reset: rm {counter_file}\n"
+            )
             return _halt(
                 f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
-                "HardTruth never fails open. Manual verification or human escalation required.\n"
-                f"Operator remediation instructions: Inspect and fix the underlying issue. To reset strike counter: rm {counter_file}\n\n"
+                "HardTruth never fails open. Manual verification or human operator escalation required.\n\n"
                 f"Root Cause: {reason}"
             )
         return _halt(reason)
@@ -912,22 +1000,43 @@ def handle_stop(payload: dict) -> dict:
     if transcript_path:
         if not os.path.exists(transcript_path):
             return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript path does not exist on disk: {transcript_path}", remediable=False)
-        has_planner_response = False
+        has_agent_response = False
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
                         d = json.loads(line)
+                        # Antigravity schema: type == "PLANNER_RESPONSE"
                         if d.get("type") == "PLANNER_RESPONSE" and d.get("content"):
-                            has_planner_response = True
+                            has_agent_response = True
                             if not d.get("tool_calls"):
                                 agent_text = d.get("content")
+                        # Claude Code schema: type == "assistant" or role == "assistant"
+                        elif d.get("type") == "assistant" or d.get("role") == "assistant":
+                            msg = d.get("message") or d
+                            content = msg.get("content")
+                            if isinstance(content, list):
+                                text_parts = []
+                                has_tool = False
+                                for part in content:
+                                    if isinstance(part, dict):
+                                        if part.get("type") == "text":
+                                            text_parts.append(part.get("text", ""))
+                                        elif part.get("type") in ("tool_use", "tool_call"):
+                                            has_tool = True
+                                if text_parts:
+                                    has_agent_response = True
+                                    if not has_tool:
+                                        agent_text = "\n".join(text_parts)
+                            elif isinstance(content, str) and content.strip():
+                                has_agent_response = True
+                                agent_text = content
                     except Exception:
                         continue
         except Exception as e:
             return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript is unreadable: {e}", remediable=False)
 
-        if not has_planner_response:
+        if not has_agent_response:
             return fail_halt("🚨 HARDTRUTH REJECTED: Attached transcript contains no valid agent responses. Emptying or stripping transcripts to bypass gates is forbidden.", remediable=False)
 
     # Fetch Ledger Premise
@@ -979,7 +1088,11 @@ def handle_stop(payload: dict) -> dict:
         return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden.", remediable=False)
 
     # Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
-    git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
+    try:
+        git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
+    except Exception as e:
+        return fail_halt(f"🚨 HARDTRUTH UNDETERMINED: Git command failed or timed out during workspace verification: {e}. HardTruth fails closed.", remediable=False)
+
     ledger_src_count = premise_data.get("source_files_modified", 0)
     source_files_modified = max(ledger_src_count, len(git_src_files))
     verification_commands_executed = premise_data.get("verification_commands_executed", 0)
@@ -994,18 +1107,22 @@ def handle_stop(payload: dict) -> dict:
 
     # Evasion E4 Check: Git History Lineage (merge-base ancestor check)
     if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+        ws_abs = os.path.abspath(workspace_dir)
         baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
         if baseline_sha:
             try:
                 anc_res = subprocess.run(
-                    ["git", "merge-base", "--is-ancestor", baseline_sha, "HEAD"],
+                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                     "merge-base", "--is-ancestor", baseline_sha, "HEAD"],
                     cwd=workspace_dir,
-                    timeout=2.0
+                    timeout=5.0
                 )
                 if anc_res.returncode != 0:
                     return fail_halt(f"🚨 HARDTRUTH GATE HALTED (EVASION E4 DETECTED): Current HEAD is not a descendant of session baseline commit {baseline_sha[:10]}. Branch switching or history rewrites to hide changes are forbidden.")
-            except Exception:
-                pass
+            except subprocess.TimeoutExpired:
+                return fail_halt("🚨 HARDTRUTH UNDETERMINED: Git merge-base lineage check timed out. HardTruth fails closed.", remediable=False)
+            except Exception as e:
+                return fail_halt(f"🚨 HARDTRUTH UNDETERMINED: Git merge-base lineage check failed: {e}. HardTruth fails closed.", remediable=False)
 
     # Evasion E1 Check: Git Stash Detection
     if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
@@ -1158,8 +1275,10 @@ def handle_stop(payload: dict) -> dict:
             out_tail = (tier2_result.get("output", "") or "")[:600]
             return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
-    # If physical gates passed and no agent prose exists, allow stop
+    # If physical gates passed and no agent prose exists, check transcript requirement
     if not agent_text:
+        if not transcript_path and (source_files_modified > 0 or verification_commands_executed > 0):
+            return fail_halt("🚨 HARDTRUTH UNDETERMINED: Stop requested without transcriptPath when source code modifications or verification activity exist. Missing transcript prevents prose adjudication. HardTruth fails closed.", remediable=False)
         if os.path.exists(counter_file):
             try:
                 os.remove(counter_file)

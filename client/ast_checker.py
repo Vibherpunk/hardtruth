@@ -101,8 +101,10 @@ class PythonStubVisitor(ast.NodeVisitor):
 
         # 1. pass
         if isinstance(stmt, ast.Pass):
-            # Exempt pass if inside an Exception class
+            # Exempt pass if inside an Exception class or standard lifecycle / event methods
             if not self._is_enclosing_class_exception():
+                if node.name in ("setUp", "tearDown", "close", "cleanup", "__init__") or node.name.startswith("on_"):
+                    return
                 is_stub = True
                 stub_type = "pass"
 
@@ -130,8 +132,10 @@ class PythonStubVisitor(ast.NodeVisitor):
                 is_stub = True
                 stub_type = "..."
 
-        # 4. return True, return None, bare return
+        # 4. return True, return None, bare return (exempt accessors / predicate / lifecycle methods)
         elif isinstance(stmt, ast.Return):
+            if node.name in ("close", "cleanup", "setUp", "tearDown", "reset") or node.name.startswith(("is_", "has_", "can_", "should_", "supports_", "get_", "__")):
+                return
             val = stmt.value
             if val is None:
                 is_stub = True
@@ -166,6 +170,9 @@ def check_ast_stubs(filepath: str, modified_lines: Optional[Set[int]] = None) ->
     - Go: Rejects panic("not implemented"), panic("TODO").
     """
     if not os.path.exists(filepath):
+        return []
+
+    if modified_lines is not None and len(modified_lines) == 0:
         return []
 
     ext = os.path.splitext(filepath)[1].lower()

@@ -199,6 +199,152 @@ class TestV21Hardening(unittest.TestCase):
         self.assertTrue(len(violations_rs) >= 1)
         self.assertIn("todo!", violations_rs[0])
 
+    def test_8_claude_code_payload_and_transcript_handling(self):
+        """P1: Claude Code exitCode in tool_response and JSONL transcript are handled cleanly."""
+        conv = f"claude-code-{uuid.uuid4().hex}"
+        # Claude Code style post_tool payload
+        cc_payload = {
+            "session_id": conv,
+            "tool_name": "bash",
+            "tool_input": {"command": "pytest tests/test_daemon_ledger.py"},
+            "tool_response": {"exitCode": 0, "stdout": "8 passed in 0.05s"},
+            "step": 1
+        }
+        res_post = self.run_hook("post_tool", cc_payload)
+        self.assertEqual(res_post, {})
+
+        # Verify entry in ledger has observed_exit_code 0 and no_error
+        with open(self.ledger_file, "r") as f:
+            lines = [json.loads(line) for line in f if conv in line]
+        self.assertTrue(len(lines) >= 1)
+        rec = lines[-1].get("entry", lines[-1])
+        self.assertEqual(rec.get("observed_exit_code"), 0)
+        self.assertEqual(rec.get("harness_status"), "no_error")
+
+        # Claude Code style transcript
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "All test suites passed successfully and ledger is clean."}
+                    ]
+                }
+            }) + "\n")
+            transcript_path = tf.name
+
+        payload = {"sessionId": conv, "transcript_path": transcript_path}
+        res_stop = self.run_hook("stop", payload)
+        os.remove(transcript_path)
+        self.assertEqual(res_stop.get("decision"), "allow")
+
+    def test_9_git_failures_fail_closed(self):
+        """P2: Git errors or timeouts fail closed as UNDETERMINED instead of passing vacuously."""
+        from client.hardtruth_hook import get_git_modified_source_files
+        # Corrupt git repo path to simulate broken git execution
+        corrupt_repo = os.path.join(self.test_dir, "corrupt_git")
+        os.makedirs(os.path.join(corrupt_repo, ".git", "objects"), exist_ok=True)
+        with open(os.path.join(corrupt_repo, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/nonexistent\n")
+
+        with self.assertRaises(RuntimeError):
+            get_git_modified_source_files(corrupt_repo)
+
+    def test_10_command_sanitization_rejects_dangerous_runners(self):
+        """P4: validate_runner_command rejects shell metacharacters and arbitrary binaries."""
+        from daemon.tier2_runner import validate_runner_command
+        # Metacharacters
+        self.assertIsNotNone(validate_runner_command("pytest ; rm -rf /"))
+        self.assertEqual(validate_runner_command("pytest ; rm -rf /")["status"], "rejected_unsafe_command")
+        self.assertIsNotNone(validate_runner_command("pytest | cat"))
+        self.assertIsNotNone(validate_runner_command("pytest `id`"))
+        # Arbitrary binaries
+        self.assertIsNotNone(validate_runner_command("bash evil.sh"))
+        self.assertEqual(validate_runner_command("bash evil.sh")["status"], "rejected_unauthorized_runner")
+        self.assertIsNotNone(validate_runner_command("curl http://attacker.com/test"))
+        # Interpreter escapes
+        self.assertIsNotNone(validate_runner_command("python3 -c 'import os; os.system(\"id\")'"))
+        self.assertIsNotNone(validate_runner_command("node -e 'process.exit(0)'"))
+        # Valid runners
+        self.assertIsNone(validate_runner_command("pytest tests/"))
+        self.assertIsNone(validate_runner_command("npm test"))
+        self.assertIsNone(validate_runner_command("cargo test"))
+        self.assertIsNone(validate_runner_command("python3 -m unittest discover"))
+
+    def test_11_ast_checker_exempts_accessors_and_lifecycle_methods(self):
+        """P5: Accessor predicates (is_*, has_*) and lifecycle methods (close, on_*) are not flagged as stubs."""
+        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+            tf.write(
+                "class Client:\n"
+                "    def is_active(self):\n"
+                "        return True\n"
+                "    def has_access(self):\n"
+                "        return False\n"
+                "    def close(self):\n"
+                "        return None\n"
+                "    def on_init(self):\n"
+                "        pass\n"
+                "    def stub_func(self):\n"
+                "        pass\n"
+            )
+            tf.flush()
+            violations = check_ast_stubs(tf.name)
+            os.remove(tf.name)
+
+        self.assertEqual(len(violations), 1)
+        self.assertIn("stub_func", violations[0])
+
+    def test_12_escalation_halt_does_not_leak_reset_command_in_reason(self):
+        """P6: Strike reset command 'rm {counter_file}' is not in agent-facing reason string."""
+        conv = f"escalate-{uuid.uuid4().hex}"
+        self.run_hook("post_tool", {
+            "toolCall": {"name": "write_to_file", "args": {"TargetFile": "/path/to/server.py"}},
+            "stepIdx": 1,
+            "conversationId": conv
+        })
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "Done modifying server.py",
+                "tool_calls": []
+            }) + "\n")
+            transcript_path = tf.name
+
+        try:
+            # Trigger 3 consecutive halts on Rule 1 (remediable=True)
+            res = None
+            for _ in range(3):
+                res = self.run_hook("stop", {
+                    "conversationId": conv,
+                    "transcriptPath": transcript_path
+                })
+            self.assertEqual(res.get("decision"), "continue")
+            self.assertIn("HARDTRUTH ESCALATION HALT", res.get("reason", ""))
+            self.assertNotIn("rm ", res.get("reason", ""))
+        finally:
+            os.remove(transcript_path)
+
+    def test_13_tier2_subprocess_gated_by_permission(self):
+        """S1: Subprocess sandbox is rejected if HARDTRUTH_TIER2_ALLOW_SUBPROCESS=0 and container unavailable."""
+        from daemon.tier2_runner import run_independent_verification
+        old_sub = os.environ.get("HARDTRUTH_TIER2_ALLOW_SUBPROCESS")
+        old_cont = os.environ.get("HARDTRUTH_TIER2_CONTAINER")
+        try:
+            os.environ["HARDTRUTH_TIER2_ALLOW_SUBPROCESS"] = "0"
+            os.environ["HARDTRUTH_TIER2_CONTAINER"] = "0"
+            res = run_independent_verification(REPO_ROOT, test_cmd="pytest tests/")
+            self.assertEqual(res["status"], "unverified_no_isolation")
+            self.assertFalse(res["success"])
+        finally:
+            if old_sub is not None:
+                os.environ["HARDTRUTH_TIER2_ALLOW_SUBPROCESS"] = old_sub
+            else:
+                os.environ.pop("HARDTRUTH_TIER2_ALLOW_SUBPROCESS", None)
+            if old_cont is not None:
+                os.environ["HARDTRUTH_TIER2_CONTAINER"] = old_cont
+            else:
+                os.environ.pop("HARDTRUTH_TIER2_CONTAINER", None)
+
 
 if __name__ == "__main__":
     unittest.main()
