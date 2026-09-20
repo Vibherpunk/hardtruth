@@ -459,6 +459,67 @@ class TestHybridArchitecture(unittest.TestCase):
         recovered_sha = get_or_set_session_baseline(git_repo_dir, conv)
         self.assertEqual(recovered_sha, initial_sha)
 
+    def test_nested_git_repository_tracked_by_rule_1(self):
+        """Files inside nested git repositories (git init nested) are discovered by Rule 1."""
+        git_repo_dir = os.path.join(self.test_dir, "parent_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        # Agent creates nested repo inside parent workspace
+        nested_dir = os.path.join(git_repo_dir, "hidden_subrepo")
+        os.makedirs(nested_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=nested_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+
+        # Agent writes Python source code inside nested repo
+        nested_code = os.path.join(nested_dir, "exploit.py")
+        with open(nested_code, "w") as f:
+            f.write("def exploit(): return True\n")
+
+        from client.hardtruth_hook import get_git_modified_source_files
+        src_files, doc_files, all_paths = get_git_modified_source_files(git_repo_dir)
+        self.assertIn("exploit.py", src_files)
+
+    def test_fixtures_flag_rejected_as_verification(self):
+        """Informational introspection flags like --fixtures and --markers do not verify code."""
+        from daemon.ledger import is_verification_command, is_exploratory_command
+        self.assertFalse(is_verification_command("pytest tests/test_billing.py --fixtures"))
+        self.assertFalse(is_verification_command("pytest tests/test_billing.py --markers"))
+        self.assertFalse(is_verification_command("pytest tests/test_billing.py --setup-plan"))
+        self.assertTrue(is_exploratory_command("pytest tests/test_billing.py --fixtures"))
+
+    def test_k_flag_cannot_resolve_unfiltered_test_failure(self):
+        """Running filtered subtests (-k) cannot resolve a whole-file or unfiltered test failure."""
+        # Clean has -k, failed was whole file: CANNOT resolve
+        self.assertFalse(can_suite_resolve_failure(
+            "pytest tests/test_failing.py -k test_passing",
+            "pytest tests/test_failing.py"
+        ))
+        # Both have different -k filters: CANNOT resolve
+        self.assertFalse(can_suite_resolve_failure(
+            "pytest tests/test_failing.py -k test_passing",
+            "pytest tests/test_failing.py -k test_broken"
+        ))
+        # Exact same -k filter: DOES resolve
+        self.assertTrue(can_suite_resolve_failure(
+            "pytest tests/test_failing.py -k test_fixed",
+            "pytest tests/test_failing.py -k test_fixed"
+        ))
+        # Full unfiltered file run DOES resolve a previous filtered failure
+        self.assertTrue(can_suite_resolve_failure(
+            "pytest tests/test_failing.py",
+            "pytest tests/test_failing.py -k test_broken"
+        ))
+
+    def test_tier2_fails_closed_when_runner_missing(self):
+        """Tier 2 refuses to pass if no canonical test runner is detected."""
+        empty_dir = os.path.join(self.test_dir, "no_test_repo")
+        os.makedirs(empty_dir, exist_ok=True)
+        res = run_independent_verification(empty_dir)
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "unverified_no_runner")
+
 
 if __name__ == "__main__":
     unittest.main()

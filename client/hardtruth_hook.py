@@ -263,10 +263,10 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     if not workspace_dir or not os.path.exists(workspace_dir):
         return source_files, doc_files, []
 
-    # 1. Uncommitted and untracked / ignored files in working tree
+    # 1. Uncommitted and untracked / ignored files in working tree (-uall for full recursion)
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain", "--ignored=matching"],
+            ["git", "status", "--porcelain", "-uall", "--ignored=matching"],
             cwd=workspace_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -305,6 +305,43 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                             all_rel_paths.add(f)
             except Exception:
                 pass
+
+    # 3. Recurse into nested git repositories and untracked directories
+    expanded_paths = set()
+    for filepath_rel in all_rel_paths:
+        full_p = os.path.join(workspace_dir, filepath_rel)
+        if os.path.isdir(full_p):
+            # Check for nested git repository (git init nested)
+            if os.path.isdir(os.path.join(full_p, ".git")):
+                try:
+                    nested_res = subprocess.run(
+                        ["git", "status", "--porcelain", "-uall"],
+                        cwd=full_p,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=1.0,
+                        text=True
+                    )
+                    if nested_res.returncode == 0 and nested_res.stdout:
+                        for n_line in nested_res.stdout.splitlines():
+                            n_clean = n_line.strip()
+                            if len(n_clean) >= 3:
+                                n_path = n_clean[2:].strip()
+                                expanded_paths.add(os.path.join(filepath_rel, n_path))
+                except Exception:
+                    pass
+            # Also recurse into files inside directory
+            try:
+                for root, dirs, files in os.walk(full_p):
+                    dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
+                    for fname in files:
+                        rel_to_ws = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                        expanded_paths.add(rel_to_ws)
+            except Exception:
+                pass
+        else:
+            expanded_paths.add(filepath_rel)
+    all_rel_paths = expanded_paths
 
     # Classify all discovered files
     full_paths = []

@@ -19,7 +19,7 @@ import psutil
 import threading
 from typing import Dict, Any, Optional, List
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +49,20 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+@app.middleware("http")
+async def limit_payload_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > 2_000_000:  # 2MB payload limit
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Payload too large: maximum request body size is 2MB to prevent OOM"}
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
 
 # ---------------------------------------------------------------------------
 # Ledger Engine
@@ -84,8 +98,8 @@ def get_nli_direct():
 # ---------------------------------------------------------------------------
 
 class VerifyClaimRequest(BaseModel):
-    premise: str
-    hypothesis: str
+    premise: str = Field(..., max_length=65536)
+    hypothesis: str = Field(..., max_length=4096)
     threshold: Optional[float] = 0.70
 
 class VerifyClaimResponse(BaseModel):
@@ -95,25 +109,25 @@ class VerifyClaimResponse(BaseModel):
     latency_ms: float
 
 class RecordLedgerRequest(BaseModel):
-    conversationId: str
+    conversationId: str = Field(..., max_length=128)
     stepIdx: int = 0
-    tool: str
-    target: str = ""
+    tool: str = Field(..., max_length=64)
+    target: str = Field("", max_length=4096)
     observed_exit_code: Optional[int] = None
-    harness_status: Optional[str] = None
-    error: Optional[str] = None
-    stdout_tail: Optional[str] = None
-    diff_stat: Optional[str] = None
+    harness_status: Optional[str] = Field(None, max_length=64)
+    error: Optional[str] = Field(None, max_length=16384)
+    stdout_tail: Optional[str] = Field(None, max_length=16384)
+    diff_stat: Optional[str] = Field(None, max_length=4096)
     timestamp: Optional[float] = None
-    cwd: Optional[str] = None
+    cwd: Optional[str] = Field(None, max_length=1024)
 
 class UnresolvedFailureItem(BaseModel):
-    command: str
+    command: str = Field(..., max_length=4096)
     observed_exit_code: Optional[int] = None
-    error: Optional[str] = None
-    stdout_tail: Optional[str] = None
+    error: Optional[str] = Field(None, max_length=16384)
+    stdout_tail: Optional[str] = Field(None, max_length=16384)
     stepIdx: Optional[int] = None
-    cwd: Optional[str] = None
+    cwd: Optional[str] = Field(None, max_length=1024)
 
 class GetPremiseResponse(BaseModel):
     tampered: bool
@@ -131,14 +145,14 @@ class GetPremiseResponse(BaseModel):
     detail: Optional[str] = None
 
 class SessionBaselineRequest(BaseModel):
-    conversationId: str
-    workspace_path: str
-    commit_sha: Optional[str] = None
+    conversationId: str = Field(..., max_length=128)
+    workspace_path: str = Field(..., max_length=1024)
+    commit_sha: Optional[str] = Field(None, max_length=128)
 
 class HandoffVerifyRequest(BaseModel):
-    workspace_path: str
-    conversationId: Optional[str] = None
-    test_command: Optional[str] = None
+    workspace_path: str = Field(..., max_length=1024)
+    conversationId: Optional[str] = Field(None, max_length=128)
+    test_command: Optional[str] = Field(None, max_length=2048)
     timeout_sec: Optional[int] = 60
 
 class HandoffVerifyResponse(BaseModel):

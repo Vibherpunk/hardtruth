@@ -50,8 +50,8 @@ DOC_EXTENSIONS = {
 
 def is_verification_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
-    # Fake verification commands like pytest --version, pytest --help, cargo test --help are NOT verification runs
-    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only)(?:\s|$)", cmd_clean):
+    # Fake verification commands like pytest --version, pytest --help, pytest --fixtures, cargo test --help are NOT verification runs
+    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
         return False
     return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
 
@@ -66,7 +66,7 @@ def is_tainted_shell_command(cmd: str) -> bool:
 
 def is_exploratory_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
-    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only)(?:\s|$)", cmd_clean):
+    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
         return True
     return bool(EXPLORATORY_CMD_PATTERN.search(cmd_clean))
 
@@ -127,18 +127,42 @@ def can_suite_resolve_failure(
     if clean == failed:
         return True
 
+    # Filter flag check: if clean runs with test filters (-k, -m, --filter),
+    # it only tests a subset of tests. It can NEVER resolve a whole-file or broader failure!
+    # It can only resolve if failed had the exact same filtered command.
+    clean_has_filter = bool(re.search(r"(?:^|\s)(?:-k|-m|--filter)\b", clean))
+    if clean_has_filter:
+        return clean == failed
+
     # 1. Python pytest hierarchy
     # Bare pytest or pytest . runs all tests in the workspace root
     if clean in ["pytest", "pytest .", "python3 -m unittest", "python3 -m unittest discover"]:
         if failed.startswith("pytest") or "unittest" in failed:
             return True
 
-    # Check scoped pytest e.g. pytest tests/ vs pytest integration_tests/, or pytest tests/test_billing.py::test_calc
-    m_clean = re.match(r"^pytest\s+([^\s\-]+)", clean)
-    m_failed = re.match(r"^pytest\s+([^\s\-]+)", failed)
-    if m_clean and m_failed:
-        raw_clean_target = m_clean.group(1).rstrip("/")
-        raw_failed_target = m_failed.group(1).rstrip("/")
+    # Helper to extract target test file/dir token from pytest command
+    def extract_pytest_target(cmd_str: str) -> Optional[str]:
+        parts = cmd_str.split()
+        if not parts or parts[0] != "pytest":
+            return None
+        skip_next = False
+        for p in parts[1:]:
+            if skip_next:
+                skip_next = False
+                continue
+            if p in ["-k", "-m", "-c", "-o", "--override-ini", "--rootdir", "--ignore", "-W"]:
+                skip_next = True
+                continue
+            if p.startswith("-"):
+                continue
+            return p
+        return None
+
+    t_clean = extract_pytest_target(clean)
+    t_failed = extract_pytest_target(failed)
+    if t_clean and t_failed:
+        raw_clean_target = t_clean.rstrip("/")
+        raw_failed_target = t_failed.rstrip("/")
 
         # If clean is a specific subtest (contains ::), it can ONLY resolve that exact subtest.
         # It must NEVER resolve a sibling subtest (e.g. test_passing resolving test_broken) or the whole file!
@@ -158,7 +182,7 @@ def can_suite_resolve_failure(
         if failed_norm.startswith(clean_norm + os.sep):
             return True
         return False
-    elif m_clean and not m_failed:
+    elif t_clean and not t_failed:
         # e.g. clean is 'pytest tests/' but failed was bare 'pytest'
         return False
 

@@ -322,11 +322,11 @@ def run_independent_verification(
 
     if not canonical_runner:
         return {
-            "status": "verified",
-            "success": True,
-            "exit_code": 0,
+            "status": "unverified_no_runner",
+            "success": False,
+            "exit_code": 1,
             "runner": "none",
-            "output": "No standard test suite detected in workspace. Tier 2 passed by default."
+            "output": "🚨 TIER 2 HARD GATE FAILED: Code files were modified or verification was requested, but no canonical test suite or runner could be detected in the workspace. HardTruth never fails open: renaming or deleting test suites is not permitted."
         }
 
     # 1. Attempt Ephemeral Docker Container Verification (Full Physical Boundary)
