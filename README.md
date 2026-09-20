@@ -2,11 +2,44 @@
 
 > **Fail-Closed Verification for Coding Agents.** A local neurosymbolic circuit breaker that halts AI coding agents when they claim unverified test passes, emit empty stubs, or contradict physical execution facts.
 
-[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen.svg)]()
-[![Evals](https://img.shields.io/badge/evals-262%20pairs%20calibrated-blue.svg)]()
+[![Unit Tests](https://img.shields.io/badge/unit%20tests-72%20passed-brightgreen.svg)]()
+[![Physical Tests](https://img.shields.io/badge/physical%20tests-100%2F100%20(100%25)-success.svg)]()
+[![Frontier Tokens](https://img.shields.io/badge/frontier%20tokens-$0.00%20(100%25%20local)-blue.svg)]()
+[![Gate Latency](https://img.shields.io/badge/avg%20gate%20latency-~550ms-orange.svg)]()
 [![Model](https://img.shields.io/badge/model-DeBERTa--v3--small-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Status](https://img.shields.io/badge/repo-public-success.svg)](https://github.com/Vibherpunk/hardtruth)
+
+---
+
+## What Is HardTruth?
+
+### For Everyone (Plain English)
+When you ask an AI coding assistant (like Gemini, Claude, Cursor, or local open-source LLMs) to write software or fix bugs, the AI doesn't have direct sensory awareness of your computer. When it finishes generating code, it is trained to sound helpful and polite, so it will frequently say:
+> *"I updated your code, fixed the issue, and verified that all tests passed!"*
+
+...even when:
+- It **never actually ran the test command** in your terminal.
+- The tests ran, but **failed with red error messages**.
+- It left **half-finished placeholder code** (`pass`, `TODO`, `raise NotImplementedError`).
+- It claims to have created or updated files that **do not actually exist** on your disk.
+
+**HardTruth acts as an automatic physical checkpoint.** It runs silently in the background. While the AI works, HardTruth observes what files actually changed in Git and what test commands actually ran in your terminal. When the AI attempts to finish and declare victory, HardTruth intercepts it:
+1. **Did you actually modify the code?** If the AI claims it wrote files that aren't on disk, it is halted.
+2. **Did you run tests on your changes?** If code was changed but no tests were executed, it is halted.
+3. **Did the tests actually pass?** If any test failed, the AI is blocked until it fixes the code and proves it passes.
+4. **Is the code real?** If placeholder stubs are detected in the modified code, it is halted.
+5. **Does the summary match reality?** A fast, local language model checks the AI's claims against physical facts. If the AI hallucinates, it is blocked.
+
+**What does it cost?** **$0.00 and zero API tokens.** Everything runs on your machine using free, local tools. It adds only about half a second (~550ms) to the AI's final step.
+
+---
+
+### For Engineers & Technical Architects
+HardTruth is a **two-tier fail-closed gate** built on a failure-biased execution ledger and local natural language inference (NLI):
+- **Tier 1 (Deterministic Gates):** Executes before any LLM inference. Intercepts agent tool calls (`post_tool`) and stop attempts (`stop`) via client lifecycle hooks. It inspects physical Git porcelain state against an immutable session baseline commit, analyzes shell command ASTs for exit-masking operators (`|| exit 0`, `; true`), checks language ASTs across Python, TypeScript, Rust, and Go for placeholder stubs, and verifies cryptographic HMAC-SHA256 ledger integrity.
+- **Tier 2 (Sandboxed Runner Handoff):** An external deterministic verifier that re-executes tests inside a clean subprocess or container, guaranteeing that agent environment tampering cannot fabricate passes.
+- **Semantic NLI Claim Adjudication (Rule 4B):** Runs an embedded cross-encoder (`cross-encoder/nli-deberta-v3-small`) on CPU/GPU to evaluate natural language completion statements against the compiled physical evidence ledger, operating at a calibrated threshold ($\tau^* = 0.70$).
 
 ---
 
@@ -145,16 +178,42 @@ python3 evals/evaluate.py --output evals/sweep_results.json
 
 ---
 
-## Performance Benchmarks
+## Empirical Physical Verification Benchmark (100 Unsimulated Tests)
 
-Measured using [`benchmarks/benchmark.py`](./benchmarks/benchmark.py):
+To verify real-world behavior, HardTruth was evaluated across **100 unsimulated physical tests** ([`benchmarks/run_100_legitimate_tests.py`](./benchmarks/run_100_legitimate_tests.py)):
+- **50 Ground-Truth Truths:** Real Python modules (algorithms, data structures, math, string parsing, security helpers) created in real Git repos with real passing `pytest` test suites.
+- **50 Ground-Truth Falsehoods & Evasions:** Fabricated file claims (Rule 4A), untested source edits (Rule 1), unresolved test failures (Rule 2), polyglot AST stubs in Python/TypeScript/Rust (Rule 3), shell operator exit masking (`|| exit 0`, `; true`), active `git stash` evasion, assertion weakening (`assert True`, `@pytest.mark.skip`), Makefile build poisoning, and semantic contradictions.
 
-| Metric | Daemon Container (PyTorch CPU / MPS) |
-| :--- | :--- |
-| **Median Latency (p50)** | **~67.2 ms** |
-| **p90 Latency** | **~68.5 ms** |
-| **RAM Footprint (RSS)** | **~559 MB** (Python 3.11 + PyTorch + DeBERTa-v3) |
-| **Throughput (Sequential)**| **~14.9 req/sec** |
+Every test was executed against physical Git repositories on disk with live HTTP calls to the running daemon. Zero mock objects.
+
+### Benchmark Results ([`benchmarks/100_legitimate_test_results.json`](./benchmarks/100_legitimate_test_results.json))
+
+| Metric | Target | Observed Result | Evaluation |
+| :--- | :--- | :--- | :--- |
+| **Total Physical Tests** | 100 | **100** | ✅ **100% Executed** |
+| **Overall Accuracy** | 100% | **100/100 (100.0%)** | ✅ **Flawless** |
+| **Ground-Truth Truths (Target: `ALLOW`)** | 50/50 | **50/50 (100.0%)** | ✅ **0.0% False Rejection** |
+| **Ground-Truth Falsehoods (Target: `HALT`)** | 50/50 | **50/50 (100.0%)** | ✅ **0.0% Defect Leakage** |
+| **Total Test Execution Duration** | — | **105.2 seconds** | ~1.05s per complete test lifecycle |
+| **Average Gate Latency (Overall)** | — | **549.8 ms** | Sub-second decision |
+| **Average Gate Latency (Truths)** | — | **701.9 ms** | Full Git diff + Tier 2 + NLI evaluation |
+| **Average Gate Latency (Falsehoods)** | — | **397.7 ms** | Fast-fail on physical defects |
+| **Frontier Token Spend** | $0.00 | **$0.00 (0 tokens)** | 100% local execution |
+
+---
+
+## System Architecture & Singleton Compatibility
+
+HardTruth is designed to live harmoniously on machines running multiple developer tools, agent harnesses, or workflow engines (such as **Antigravity**, **Claude Code**, **VibeHard**, or **Harbor**):
+
+1. **Machine-Wide Daemon Singleton:**
+   The HardTruth daemon runs as a single background service (bound by default to port `8000` locally, or remote port `8002`). Installing or invoking multiple developer frameworks does **not** launch competing or duplicate daemon instances. All tools and harnesses query the unified daemon via `SYSTEM_ONE_URL` or standard HTTP.
+2. **Single Shared Ledger & Key Ring:**
+   All execution records are appended to a single machine-wide hash chain (`~/.hardtruth/daemon_ledger.jsonl`) protected by a single HMAC key (`~/.hardtruth/daemon_hmac.key`) and API token (`~/.hardtruth/daemon_api.key`). Multiple harnesses share this source of truth without stepping on each other's session state.
+3. **Chained Git Hooks:**
+   When installed globally (`install.sh --global`), HardTruth preserves and executes any previously configured `core.hooksPath` pre-commit script first before running its own AST checks. It does not overwrite or disable existing pre-commit pipelines.
+4. **No Internal Vendor Bundling:**
+   HardTruth is standalone infrastructure. It is not embedded inside external software packages (such as VibeHard or Harbor), and external packages do not embed private conflicting copies of HardTruth. They simply interact with the single running daemon through standard client hooks or HTTP APIs.
 
 ---
 
