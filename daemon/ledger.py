@@ -1,0 +1,382 @@
+"""
+HardTruth Daemon Ledger Engine
+Cryptographically tamper-evident, HMAC-SHA256 hash-chained, daemon-owned execution ledger.
+Maintains physical state, verification command tracking, and failure-biased resolution.
+"""
+
+from __future__ import annotations
+import os
+import re
+import json
+import time
+import hmac
+import hashlib
+import secrets
+from typing import Dict, List, Optional, Tuple, Any
+
+DEFAULT_LEDGER_PATH = os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl")
+DEFAULT_KEY_PATH = os.path.expanduser("~/.hardtruth/daemon_hmac.key")
+
+VERIFICATION_CMD_PATTERN = re.compile(
+    r"^(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint)\b",
+    re.IGNORECASE
+)
+
+EXPLORATORY_CMD_PATTERN = re.compile(
+    r"^(cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(status|log|diff|branch|show))\b",
+    re.IGNORECASE
+)
+
+SOURCE_CODE_EXTENSIONS = {
+    ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
+    ".cc", ".cxx", ".h", ".hpp", ".java", ".rb", ".sh", ".bash",
+    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig"
+}
+
+DOC_EXTENSIONS = {
+    ".md", ".txt", ".rst", ".adoc", ".csv", ".tsv", ".json", ".yaml",
+    ".yml", ".toml", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+    ".pdf", ".html", ".css", ".xml", ".lock", ".gitignore"
+}
+
+
+def is_verification_command(cmd: str) -> bool:
+    cmd_clean = (cmd or "").strip()
+    return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
+
+
+def is_exploratory_command(cmd: str) -> bool:
+    cmd_clean = (cmd or "").strip()
+    return bool(EXPLORATORY_CMD_PATTERN.search(cmd_clean))
+
+
+def classify_file(filepath: str) -> str:
+    """Returns 'source', 'doc', or 'other'."""
+    _, ext = os.path.splitext(filepath or "")
+    ext = ext.lower()
+    if ext in SOURCE_CODE_EXTENSIONS:
+        return "source"
+    elif ext in DOC_EXTENSIONS:
+        return "doc"
+    return "other"
+
+
+class DaemonLedger:
+    def __init__(self, ledger_path: str = None, key_path: str = None):
+        self.ledger_path = ledger_path or os.environ.get("HARDTRUTH_DAEMON_LEDGER", DEFAULT_LEDGER_PATH)
+        self.key_path = key_path or os.environ.get("HARDTRUTH_DAEMON_KEY", DEFAULT_KEY_PATH)
+        self._key = self._load_or_create_key()
+
+    def _load_or_create_key(self) -> bytes:
+        key_dir = os.path.dirname(os.path.abspath(self.key_path))
+        os.makedirs(key_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(key_dir, 0o700)
+        except Exception:
+            pass
+
+        if os.path.exists(self.key_path):
+            with open(self.key_path, "rb") as f:
+                key = f.read()
+                if len(key) == 32:
+                    return key
+
+        key = secrets.token_bytes(32)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o400
+        fd = os.open(self.key_path, flags, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(key)
+        try:
+            os.chmod(self.key_path, 0o400)
+        except Exception:
+            pass
+        return key
+
+    def _compute_hash(self, index: int, prev_hash: str, canonical_entry: str) -> str:
+        msg = f"{index}:{prev_hash}:{canonical_entry}".encode("utf-8")
+        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+
+    def get_last_record(self) -> Optional[dict]:
+        if not os.path.exists(self.ledger_path):
+            return None
+        last_line = None
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_s = line.strip()
+                if line_s:
+                    last_line = line_s
+        if last_line:
+            try:
+                return json.loads(last_line)
+            except Exception:
+                return None
+        return None
+
+    def record_entry(
+        self,
+        conversation_id: str,
+        step_idx: int,
+        tool: str,
+        target: str,
+        observed_exit_code: Optional[int] = None,
+        harness_status: Optional[str] = None,
+        error: Optional[str] = None,
+        stdout_tail: Optional[str] = None,
+        diff_stat: Optional[str] = None,
+        timestamp: Optional[float] = None
+    ) -> dict:
+        """
+        Appends an entry to the HMAC-SHA256 hash-chained daemon ledger.
+        """
+        ledger_dir = os.path.dirname(os.path.abspath(self.ledger_path))
+        os.makedirs(ledger_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(ledger_dir, 0o700)
+        except Exception:
+            pass
+
+        last_record = self.get_last_record()
+        if last_record is None:
+            index = 0
+            prev_hash = "0" * 64
+        else:
+            index = last_record.get("index", 0) + 1
+            prev_hash = last_record.get("hash", "0" * 64)
+
+        entry_data = {
+            "conversationId": conversation_id,
+            "stepIdx": step_idx,
+            "tool": tool,
+            "target": target,
+            "observed_exit_code": observed_exit_code,
+            "harness_status": harness_status or ("no_error" if observed_exit_code == 0 else "error" if observed_exit_code is not None else None),
+            "error": error,
+            "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
+            "diff_stat": diff_stat[:200] if diff_stat else None,
+            "timestamp": timestamp or time.time()
+        }
+
+        canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
+        record_hash = self._compute_hash(index, prev_hash, canonical_entry)
+
+        status_compat = "error" if error or (observed_exit_code is not None and observed_exit_code != 0) else "success"
+
+        record = {
+            "index": index,
+            "prev_hash": prev_hash,
+            "entry": entry_data,
+            "hash": record_hash,
+            # Top-level backwards compatibility fields
+            "target": target,
+            "status": status_compat,
+            "tool": tool,
+            "conversationId": conversation_id,
+            "stepIdx": step_idx,
+            "error": error
+        }
+
+        file_exists = os.path.exists(self.ledger_path)
+        with open(self.ledger_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+
+        if not file_exists:
+            try:
+                os.chmod(self.ledger_path, 0o600)
+            except Exception:
+                pass
+
+        return {
+            "status": "recorded",
+            "index": index,
+            "hash": record_hash
+        }
+
+    def verify_chain(self) -> Tuple[bool, int, str]:
+        """
+        Validates the entire HMAC hash chain from 0 to N-1.
+        Returns: (is_valid, records_checked, error_msg)
+        """
+        if not os.path.exists(self.ledger_path):
+            return True, 0, "EMPTY_LEDGER"
+
+        expected_prev_hash = "0" * 64
+        expected_index = 0
+
+        with open(self.ledger_path, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f):
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                try:
+                    record = json.loads(line_s)
+                except Exception as e:
+                    return False, expected_index, f"JSON_PARSE_ERROR on line {line_no}: {e}"
+
+                idx = record.get("index")
+                prev_h = record.get("prev_hash")
+                entry = record.get("entry")
+                rec_h = record.get("hash")
+
+                if idx != expected_index:
+                    return False, expected_index, f"INDEX_GAP: expected {expected_index}, got {idx}"
+
+                if prev_h != expected_prev_hash:
+                    return False, expected_index, f"CHAIN_BROKEN at index {idx}: expected prev {expected_prev_hash[:12]}, got {prev_h[:12]}"
+
+                canonical_entry = json.dumps(entry, sort_keys=True, separators=(',', ':'))
+                recomputed = self._compute_hash(idx, prev_h, canonical_entry)
+                if not hmac.compare_digest(recomputed, rec_h):
+                    return False, expected_index, f"HASH_MISMATCH at index {idx}: computed {recomputed[:12]} vs recorded {rec_h[:12]}"
+
+                expected_prev_hash = rec_h
+                expected_index += 1
+
+        return True, expected_index, "VALID"
+
+    def get_premise(self, conversation_id: str) -> dict:
+        """
+        Reads ledger records for conversation_id after validating chain integrity.
+        Compiles failure-biased premise, unresolved failures, and source modification stats.
+        """
+        valid, count, msg = self.verify_chain()
+        if not valid:
+            return {
+                "tampered": True,
+                "error": "LEDGER_TAMPER_DETECTED",
+                "detail": msg,
+                "broken_at_index": count,
+                "premise": f"LEDGER CORRUPTION DETECTED: {msg}",
+                "source_files_modified": 0,
+                "doc_files_modified": 0,
+                "modified_files": [],
+                "modified_file_paths": [],
+                "verification_commands_executed": 0,
+                "unresolved_failures": []
+            }
+
+        conv_records = []
+        if os.path.exists(self.ledger_path):
+            with open(self.ledger_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_s = line.strip()
+                    if line_s:
+                        try:
+                            rec = json.loads(line_s)
+                            entry = rec.get("entry", rec)
+                            if entry.get("conversationId") == conversation_id:
+                                conv_records.append(entry)
+                        except Exception:
+                            continue
+
+        unresolved_failures: Dict[str, dict] = {}
+        verification_commands_count = 0
+        modified_source_files = set()
+        modified_doc_files = set()
+        modified_file_paths = set()
+        diff_stats: Dict[str, str] = {}
+        all_commands = []
+
+        for e in conv_records:
+            tool = e.get("tool")
+            target = e.get("target", "")
+            exit_code = e.get("observed_exit_code")
+            error = e.get("error")
+            status = e.get("harness_status")
+
+            if tool == "run_command":
+                all_commands.append(e)
+                is_verif = is_verification_command(target)
+                if is_verif:
+                    verification_commands_count += 1
+                    failed = (exit_code is not None and exit_code != 0) or (error is not None)
+                    if failed:
+                        unresolved_failures[target] = {
+                            "command": target,
+                            "observed_exit_code": exit_code,
+                            "error": error,
+                            "stdout_tail": e.get("stdout_tail"),
+                            "stepIdx": e.get("stepIdx")
+                        }
+                    else:
+                        if target in unresolved_failures:
+                            del unresolved_failures[target]
+                        base_cmd = target.split()[0]
+                        resolved_keys = [
+                            k for k in unresolved_failures
+                            if k.startswith(base_cmd) and (target == base_cmd or target == f"{base_cmd} tests/" or target == f"{base_cmd} tests")
+                        ]
+                        for k in resolved_keys:
+                            unresolved_failures.pop(k, None)
+
+            elif tool in ["write_to_file", "replace_file_content"]:
+                ftype = classify_file(target)
+                base = os.path.basename(target)
+                modified_file_paths.add(target)
+                if ftype == "source":
+                    modified_source_files.add(base)
+                elif ftype == "doc":
+                    modified_doc_files.add(base)
+                if e.get("diff_stat"):
+                    diff_stats[base] = e.get("diff_stat")
+
+        premise_sections = []
+
+        # SECTION 1: UNRESOLVED FAILURES (Permanent)
+        if unresolved_failures:
+            fails = []
+            for cmd, info in unresolved_failures.items():
+                ec = info.get("observed_exit_code")
+                ec_str = f"exit code {ec}" if ec is not None else "failed"
+                tail = f" | Output: {info.get('stdout_tail')[:120]}" if info.get("stdout_tail") else ""
+                fails.append(f"FAILED: '{cmd}' ({ec_str}{tail})")
+            premise_sections.append(f"UNRESOLVED TEST FAILURES (CRITICAL): {'; '.join(fails)}.")
+
+        # SECTION 2: RECENT EXECUTIONS (up to 6)
+        if all_commands:
+            cmd_strs = []
+            for c in all_commands[-6:]:
+                cmd_name = c.get("target")
+                ec = c.get("observed_exit_code")
+                st = c.get("harness_status")
+                err = c.get("error")
+                if ec == 0:
+                    status_desc = "SUCCEEDED (exit 0)"
+                elif ec is not None:
+                    status_desc = f"FAILED (exit {ec})"
+                elif st == "no_error":
+                    status_desc = "HARNESS_STATUS: no_error (raw exit code uncorroborated by transcript)"
+                else:
+                    status_desc = f"ERROR ({err or 'unknown'})"
+
+                tail_str = f" [Tail: {c.get('stdout_tail')[:80]}]" if c.get("stdout_tail") else ""
+                cmd_strs.append(f"COMMAND: '{cmd_name}'. STATUS: {status_desc}{tail_str}.")
+            premise_sections.append(f"RECENT EXECUTIONS: {' '.join(cmd_strs)}")
+        else:
+            premise_sections.append("RECENT EXECUTIONS: No commands or test suites were executed.")
+
+        # SECTION 3: MODIFIED FILES & DIFF STATS
+        if modified_source_files or modified_doc_files:
+            all_mods = list(modified_source_files) + list(modified_doc_files)
+            mod_strs = []
+            for m in all_mods:
+                stat = f" ({diff_stats[m]})" if m in diff_stats else ""
+                mod_strs.append(f"{m}{stat}")
+            premise_sections.append(f"MODIFIED FILES: {', '.join(mod_strs)}.")
+        else:
+            premise_sections.append("MODIFIED FILES: No files were modified.")
+
+        premise_str = " ".join(premise_sections)[:1500]
+
+        return {
+            "tampered": False,
+            "conversationId": conversation_id,
+            "premise": premise_str,
+            "source_files_modified": len(modified_source_files),
+            "doc_files_modified": len(modified_doc_files),
+            "modified_files": sorted(list(modified_source_files | modified_doc_files)),
+            "modified_file_paths": sorted(list(modified_file_paths)),
+            "verification_commands_executed": verification_commands_count,
+            "unresolved_failures": list(unresolved_failures.values()),
+            "records_count": len(conv_records)
+        }

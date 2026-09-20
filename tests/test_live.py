@@ -80,8 +80,9 @@ class TestSystemOneSentinel(unittest.TestCase):
         with open(self.ledger_file, "r") as f:
             lines = [json.loads(line) for line in f if self.conv_id in line]
         self.assertTrue(len(lines) >= 1)
-        self.assertEqual(lines[-1]["target"], "python3 -m unittest test_daemon.py")
-        self.assertEqual(lines[-1]["status"], "success")
+        rec = lines[-1].get("entry", lines[-1])
+        self.assertEqual(rec["target"], "python3 -m unittest test_daemon.py")
+        self.assertIn(rec.get("status") or rec.get("harness_status"), ["success", "no_error"])
 
     def test_2_fake_test_pass_claim_blocked(self):
         conv = f"fake-pass-{uuid.uuid4().hex}"
@@ -415,11 +416,11 @@ class TestSystemOneSentinel(unittest.TestCase):
             res = self.run_hook("stop", payload)
             self.assertEqual(res.get("decision"), "continue")
 
-        # 4th attempt must release with visible warning in reason
+        # 4th attempt must trigger hard escalation halt (Never Fail Open)
         res_4 = self.run_hook("stop", payload)
         os.remove(transcript_path)
-        self.assertEqual(res_4.get("decision"), "allow")
-        self.assertIn("CIRCUIT BREAKER", res_4.get("reason", ""))
+        self.assertEqual(res_4.get("decision"), "continue")
+        self.assertIn("ESCALATION HALT", res_4.get("reason", ""))
 
     def test_16_daemon_unreachable_fail_closed(self):
         # Claim that cannot be verified deterministically must fail closed if daemon unreachable
