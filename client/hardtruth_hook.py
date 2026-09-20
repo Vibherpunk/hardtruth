@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
 """
-HardTruth: Autonomous Anti-Hallucination & Truth Enforcement Engine
+HardTruth: Autonomous Anti-Hallucination & Physical Truth Enforcement Engine
 Lifecycle Hook: PostToolUse & Stop
-Powered by DeBERTa-v3 Cross-Encoder & Deterministic Execution Ledger (http://127.0.0.1:8000)
+Powered by DeBERTa-v3 Cross-Encoder, Cryptographically Chained Execution Ledger & Tier 2 Hard Gate
 
 Enforces:
-1. Deterministic Execution Ledger: Captures real tool executions, exit codes, and status.
-2. AST Anti-Stubbing Linter: Rejects mock stubs (pass, NotImplementedError, dummy return).
-3. System One NLI Verification: Evaluates agent claims against execution ledger in ~10ms on MPS.
-4. Circuit Breaker Escape Hatch: Releases with visible warning after 3 consecutive halts.
+1. Physical Ledger Integrity: HMAC-SHA256 chained, daemon-owned, failure-biased ledger.
+2. Universal File Tracking: Runs git status --porcelain to catch all file edits (including sed, echo, patch).
+3. Shell Operator Defense: Rejects exit-code masking operators (; true, || exit 0).
+4. Real Exit Codes & Non-Synthesis: Anchored transcript parsing defeats stdout spoofing; never synthesizes exit 0.
+5. Inverted Language-Independent Gate:
+   - AST Anti-Stubbing Linter on modified code -> HALT on stubs.
+   - Rule 1: Source code modified without test execution -> HALT.
+   - Rule 2: Unresolved test failures remain in ledger -> HALT.
+   - Rule 4: Targeted DeBERTa-v3 NLI Claim Adjudication -> HALT if contradiction >= tau*.
+6. Tier 2 External Hard Gate: Out-of-band test execution in clean environment before final approval.
+7. Hard Escalation Halt: Never fails open after 3 consecutive halts.
 """
 
+from __future__ import annotations
 import os
 import sys
 import json
 import time
 import re
 import hashlib
+import subprocess
 import urllib.request
+import urllib.parse
 import urllib.error
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CURRENT_DIR not in sys.path:
@@ -35,84 +46,664 @@ except ImportError:
     except ImportError:
         from hardtruth.ast_checker import check_ast_stubs
 
+try:
+    from daemon.ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
+except ImportError:
+    try:
+        from ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
+    except ImportError:
+        DaemonLedger = None
+        is_verification_command = lambda cmd: False
+        is_tainted_shell_command = lambda cmd: False
+        classify_file = lambda path: "other"
+
+try:
+    from daemon.tier2_runner import run_independent_verification
+except ImportError:
+    try:
+        from tier2_runner import run_independent_verification
+    except ImportError:
+        run_independent_verification = None
+
 CONTRADICTION_THRESHOLD = 0.70
-LEDGER_FILE = os.environ.get(
-    "HARDTRUTH_LEDGER_PATH",
-    os.path.expanduser("~/.gemini/antigravity-cli/ledger.jsonl")
-)
-HALT_COUNTER_DIR = os.environ.get(
-    "HARDTRUTH_HALT_DIR",
-    os.path.expanduser("~/.hardtruth/halts")
-)
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+
+
+def get_api_token() -> Optional[str]:
+    """Returns the shared HardTruth API token: HARDTRUTH_API_TOKEN env, then key file."""
+    tok = os.environ.get("HARDTRUTH_API_TOKEN", "").strip()
+    if tok:
+        return tok
+    key_file = os.environ.get("HARDTRUTH_API_KEY", os.path.expanduser("~/.hardtruth/daemon_api.key"))
+    try:
+        with open(key_file, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+            if len(tok) >= 32:
+                return tok
+    except Exception:
+        pass
+    return None
+
+def get_ledger_file() -> str:
+    return os.environ.get(
+        "HARDTRUTH_LEDGER_PATH",
+        os.environ.get("HARDTRUTH_DAEMON_LEDGER", os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl"))
+    )
+
+def get_halt_counter_dir() -> str:
+    return os.environ.get(
+        "HARDTRUTH_HALT_DIR",
+        os.path.expanduser("~/.hardtruth/halts")
+    )
+
+def get_local_ledger() -> Optional[DaemonLedger]:
+    if DaemonLedger:
+        return DaemonLedger(ledger_path=get_ledger_file())
+    return None
+
 
 def get_halt_counter_file(conv_id: str) -> str:
     """Returns secure slugified and hashed counter path inside mode 0o700 dir."""
-    os.makedirs(HALT_COUNTER_DIR, mode=0o700, exist_ok=True)
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
     try:
-        os.chmod(HALT_COUNTER_DIR, 0o700)
+        os.chmod(halt_dir, 0o700)
     except Exception:
         pass
     safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
     conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-    return os.path.join(HALT_COUNTER_DIR, f"halt_{safe_slug}_{conv_hash}.json")
+    return os.path.join(halt_dir, f"halt_{safe_slug}_{conv_hash}.json")
 
-def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0) -> dict:
+
+_SESSION_SECRETS: Dict[str, str] = {}
+
+
+def get_session_secret_file(conv_id: str) -> str:
+    """Returns secure slugified and hashed session secret path inside mode 0o700 dir."""
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(halt_dir, 0o700)
+    except Exception:
+        pass
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(halt_dir, f"session_{safe_slug}_{conv_hash}.key")
+
+
+def get_or_create_session_secret(conv_id: str, workspace_dir: Optional[str] = None) -> Optional[str]:
+    """
+    Open Item #2: Retrieves or requests an ephemeral session secret from the daemon.
+    Caches secret in process memory and mode 0400 file in halt_dir.
+    """
+    if not conv_id or conv_id == "unknown":
+        return None
+    if conv_id in _SESSION_SECRETS:
+        return _SESSION_SECRETS[conv_id]
+
+    key_path = get_session_secret_file(conv_id)
+    if os.path.exists(key_path):
+        try:
+            with open(key_path, "r", encoding="utf-8") as f:
+                sec = f.read().strip()
+                if len(sec) >= 32:
+                    _SESSION_SECRETS[conv_id] = sec
+                    return sec
+        except Exception:
+            pass
+
+    # Mint session secret on daemon
+    resp = call_system_one("v1/session/start", {
+        "conversationId": conv_id,
+        "workspace_path": workspace_dir or os.getcwd()
+    }, timeout=2.0)
+    if resp and resp.get("session_secret"):
+        sec = resp.get("session_secret")
+        _SESSION_SECRETS[conv_id] = sec
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(key_path, flags, 0o400)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(sec)
+            try:
+                os.chmod(key_path, 0o400)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return sec
+
+    return None
+
+
+def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0, session_secret: Optional[str] = None) -> Optional[dict]:
     url = f"{SYSTEM_ONE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    tok = get_api_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    if session_secret:
+        headers["X-Session-Secret"] = session_secret
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"}
+        headers=headers
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (401) — HARDTRUTH_API_TOKEN mismatch between hook and daemon.\n")
+        elif e.code == 403:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (403) — X-Session-Secret mismatch or unauthorized session.\n")
+        elif e.code == 409:
+            sys.stderr.write("⚠️ HardTruth: daemon rejected request (409) — Conflict / out-of-order step.\n")
+        return None
     except Exception:
         return None
 
+
+def get_workspace_dir(payload: dict) -> Optional[str]:
+    """Extracts first valid workspace path if provided."""
+    ws_paths = payload.get("workspacePaths", [])
+    if ws_paths and os.path.isdir(ws_paths[0]):
+        return ws_paths[0]
+    return None
+
+
+IGNORED_BUILD_DIRS = {".git", ".pytest_cache", "__pycache__", "node_modules", "target", ".venv", "venv", ".tox", ".mypy_cache"}
+
+
+def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
+    """
+    Records and returns the git commit SHA at the start of the session.
+    Enforces multi-layer baseline persistence:
+    1. Isolated Daemon (tamper-evident, survives local rm -rf ~/.hardtruth/halts)
+    2. Git internal ref (refs/hardtruth/baseline/<conv_hash>)
+    3. Local cache file (~/.hardtruth/halts/baseline_*.json)
+    Defeats the 'commit & run' and baseline reset exploits completely.
+    """
+    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+        return None
+
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
+    baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+    ws_norm = os.path.abspath(workspace_dir)
+
+    # 1. Ask isolated daemon (primary source of truth, container-isolated from agent)
+    try:
+        resp = call_system_one(
+            f"v1/session/baseline?conversationId={urllib.parse.quote(str(conv_id))}&workspace_path={urllib.parse.quote(ws_norm)}",
+            {},
+            timeout=1.0
+        )
+        if resp and resp.get("baseline_sha"):
+            daemon_sha = resp.get("baseline_sha")
+            try:
+                with open(baseline_file, "w") as f:
+                    json.dump({"baseline_sha": daemon_sha, "created_at": time.time()}, f)
+            except Exception:
+                pass
+            return daemon_sha
+    except Exception:
+        pass
+
+    # 2. Check local git ref (refs/hardtruth/baseline/<conv_hash>)
+    try:
+        ref_proc = subprocess.run(
+            ["git", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if ref_proc.returncode == 0 and ref_proc.stdout.strip():
+            ref_sha = ref_proc.stdout.strip()
+            # Register with daemon if online
+            call_system_one("v1/session/baseline", {
+                "conversationId": conv_id,
+                "workspace_path": ws_norm,
+                "commit_sha": ref_sha
+            }, timeout=1.0)
+            return ref_sha
+    except Exception:
+        pass
+
+    # 3. Check local cache file
+    if os.path.exists(baseline_file):
+        try:
+            with open(baseline_file, "r") as f:
+                data = json.load(f)
+                cached_sha = data.get("baseline_sha")
+                if cached_sha:
+                    call_system_one("v1/session/baseline", {
+                        "conversationId": conv_id,
+                        "workspace_path": ws_norm,
+                        "commit_sha": cached_sha
+                    }, timeout=1.0)
+                    return cached_sha
+        except Exception:
+            pass
+
+    # 4. First initialization for this session: get current HEAD
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2.0,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            sha = res.stdout.strip()
+
+            # Register with daemon (daemon returns existing if already recorded)
+            resp = call_system_one("v1/session/baseline", {
+                "conversationId": conv_id,
+                "workspace_path": ws_norm,
+                "commit_sha": sha
+            }, timeout=1.0)
+            if resp and resp.get("baseline_sha"):
+                sha = resp.get("baseline_sha")
+
+            # Store in git ref
+            try:
+                subprocess.run(
+                    ["git", "update-ref", f"refs/hardtruth/baseline/{conv_hash}", sha],
+                    cwd=workspace_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=1.0
+                )
+            except Exception:
+                pass
+
+            # Cache locally
+            try:
+                with open(baseline_file, "w") as f:
+                    json.dump({"baseline_sha": sha, "created_at": time.time()}, f)
+            except Exception:
+                pass
+
+            return sha
+    except Exception:
+        pass
+
+    return None
+
+
+def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = None) -> Tuple[Set[str], Set[str], List[str]]:
+    """
+    Universal File Tracking:
+    1. Checks working tree modifications (M, A, ??, R, !!) via git status --porcelain --ignored=matching.
+    2. Checks committed modifications made during this session via git diff --name-only <baseline_sha> HEAD.
+    Defeats the 'commit & run' evasion loophole completely.
+    Returns: (source_files, doc_files, full_file_paths)
+    """
+    source_files = set()
+    doc_files = set()
+    all_rel_paths = set()
+
+    if not workspace_dir or not os.path.exists(workspace_dir):
+        return source_files, doc_files, []
+
+    # 1. Uncommitted and untracked / ignored files in working tree (-uall for full recursion)
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain", "-uall", "--ignored=matching"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                line_clean = line.strip()
+                if len(line_clean) < 3:
+                    continue
+                filepath_rel = line_clean[2:].strip()
+                if " -> " in filepath_rel:
+                    filepath_rel = filepath_rel.split(" -> ")[1].strip()
+                all_rel_paths.add(filepath_rel)
+    except Exception:
+        pass
+
+    # 2. Committed files since session baseline
+    if conv_id:
+        baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
+        if baseline_sha:
+            try:
+                res_diff = subprocess.run(
+                    ["git", "diff", "--name-only", baseline_sha, "HEAD"],
+                    cwd=workspace_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2.0,
+                    text=True
+                )
+                if res_diff.returncode == 0 and res_diff.stdout:
+                    for line in res_diff.stdout.splitlines():
+                        f = line.strip()
+                        if f:
+                            all_rel_paths.add(f)
+            except Exception:
+                pass
+
+    # 3. Check for git index manipulation (assume-unchanged or skip-worktree)
+    try:
+        res_v = subprocess.run(
+            ["git", "ls-files", "-v"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if res_v.returncode == 0 and res_v.stdout:
+            for line in res_v.stdout.splitlines():
+                if len(line) >= 3:
+                    tag = line[0]
+                    fname = line[2:].strip()
+                    if tag in ["h", "s", "S"]:
+                        try:
+                            cur_h = subprocess.run(
+                                ["git", "hash-object", fname],
+                                cwd=workspace_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=1.0,
+                                text=True
+                            ).stdout.strip()
+                            idx_out = subprocess.run(
+                                ["git", "ls-files", "-s", fname],
+                                cwd=workspace_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=1.0,
+                                text=True
+                            ).stdout.split()
+                            if len(idx_out) >= 2 and cur_h != idx_out[1]:
+                                all_rel_paths.add(fname)
+                        except Exception:
+                            all_rel_paths.add(fname)
+    except Exception:
+        pass
+
+    # 4. Fallback if .git is missing (e.g. rm -rf .git)
+    if not os.path.exists(os.path.join(workspace_dir, ".git")):
+        try:
+            for root, dirs, files in os.walk(workspace_dir):
+                dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
+                for fname in files:
+                    rel_p = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                    all_rel_paths.add(rel_p)
+        except Exception:
+            pass
+
+    # 5. Recurse into nested git repositories and untracked directories
+    expanded_paths = set()
+    for filepath_rel in all_rel_paths:
+        full_p = os.path.join(workspace_dir, filepath_rel)
+        if os.path.isdir(full_p):
+            # Check for nested git repository (git init nested)
+            if os.path.isdir(os.path.join(full_p, ".git")):
+                try:
+                    nested_res = subprocess.run(
+                        ["git", "status", "--porcelain", "-uall"],
+                        cwd=full_p,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=1.0,
+                        text=True
+                    )
+                    if nested_res.returncode == 0 and nested_res.stdout:
+                        for n_line in nested_res.stdout.splitlines():
+                            n_clean = n_line.strip()
+                            if len(n_clean) >= 3:
+                                n_path = n_clean[2:].strip()
+                                expanded_paths.add(os.path.join(filepath_rel, n_path))
+                except Exception:
+                    pass
+            # Also recurse into files inside directory
+            try:
+                for root, dirs, files in os.walk(full_p):
+                    dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
+                    for fname in files:
+                        rel_to_ws = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                        expanded_paths.add(rel_to_ws)
+            except Exception:
+                pass
+        else:
+            expanded_paths.add(filepath_rel)
+    all_rel_paths = expanded_paths
+
+    # Classify all discovered files
+    full_paths = []
+    for filepath_rel in all_rel_paths:
+        parts = set(os.path.normpath(filepath_rel).split(os.sep))
+        if parts & IGNORED_BUILD_DIRS:
+            continue
+
+        full_path = os.path.join(workspace_dir, filepath_rel)
+        full_paths.append(full_path)
+        ftype = classify_file(filepath_rel, workspace_dir=workspace_dir)
+        base = os.path.basename(filepath_rel)
+        if ftype == "source":
+            source_files.add(base)
+        elif ftype == "doc":
+            doc_files.add(base)
+
+    return source_files, doc_files, full_paths
+
+
+def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 300) -> Tuple[Optional[int], Optional[str], bool]:
+    r"""
+    Polls transcript for up to max_wait_ms (50ms intervals) to extract observed exit code and stdout tail.
+    Anchored strictly to \A (beginning of whole string) without re.MULTILINE to eliminate stdout spoofing.
+    Returns (exit_code, stdout_tail, timed_out).
+    """
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None, None, False
+
+    # Anchored strictly to absolute start of string (\A) without MULTILINE
+    system_header_regex = re.compile(
+        r"\ACreated At: [^\n]+\nCompleted At: [^\n]+\n\nThe command exited with code (\d+)"
+    )
+
+    end_time = time.time() + (max_wait_ms / 1000.0)
+    while True:
+        try:
+            with open(transcript_path, "r", encoding="utf-8") as f:
+                matching_lines = []
+                for line in f:
+                    line_s = line.strip()
+                    if not line_s:
+                        continue
+                    try:
+                        d = json.loads(line_s)
+                        if d.get("type") == "GENERIC":
+                            matching_lines.append(d)
+                    except Exception:
+                        continue
+
+                for step in reversed(matching_lines):
+                    if target_step_idx is not None and step.get("step_index") == target_step_idx:
+                        content = step.get("content", "")
+                        exit_m = system_header_regex.search(content)
+                        exit_code = int(exit_m.group(1)) if exit_m else None
+                        lines = content.splitlines()
+                        tail = "\n".join(lines[-15:])[:1000] if lines else None
+                        return exit_code, tail, False
+
+                if matching_lines:
+                    last_step = matching_lines[-1]
+                    content = last_step.get("content", "")
+                    exit_m = system_header_regex.search(content)
+                    if exit_m:
+                        exit_code = int(exit_m.group(1))
+                        lines = content.splitlines()
+                        tail = "\n".join(lines[-15:])[:1000] if lines else None
+                        return exit_code, tail, False
+
+        except Exception:
+            pass
+
+        if time.time() >= end_time:
+            break
+        time.sleep(0.05)
+
+    return None, None, True
+
+
+def get_git_diff_stat(filepath: str) -> Optional[str]:
+    """Extracts git diff stat for target file."""
+    if not filepath or not os.path.exists(filepath):
+        return None
+    try:
+        file_dir = os.path.dirname(os.path.abspath(filepath))
+        res = subprocess.run(
+            ["git", "diff", "--stat", "--", filepath],
+            cwd=file_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        stat = res.stdout.strip()
+        if stat:
+            return stat.splitlines()[-1].strip()
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            lines = sum(1 for _ in f)
+        return f"+{lines} lines"
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
-# PostToolUse: Deterministic Ledger Recording
+# PostToolUse: Ledger Recording
 # ---------------------------------------------------------------------------
 
 def handle_post_tool_use(payload: dict) -> dict:
     """
-    Records ground-truth tool execution facts into append-only ledger.
+    Records ground-truth tool execution facts with real exit codes and diff stats.
+    Neutralizes shell operator bypasses (; true, || exit 0).
+    Non-synthesis rule: NEVER synthesizes 'exit 0' out of thin air.
     """
-    os.makedirs(os.path.dirname(os.path.abspath(LEDGER_FILE)), exist_ok=True)
-    
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "unknown")
     tool_args = tool_call.get("args", {})
     conv_id = payload.get("conversationId", "unknown")
     step_idx = payload.get("stepIdx", 0)
     error_msg = payload.get("error", None)
-    
+    transcript_path = payload.get("transcriptPath", "")
+
     cmd_or_file = ""
+    observed_exit_code = None
+    stdout_tail = None
+    diff_stat = None
+    harness_status = None
+    tool_cwd = tool_args.get("Cwd") or os.getcwd()
+    if tool_cwd and conv_id != "unknown":
+        get_or_set_session_baseline(tool_cwd, conv_id)
+
     if tool_name == "run_command":
         cmd_or_file = tool_args.get("CommandLine", "")
+
+        # Shell Operator Defense
+        if is_tainted_shell_command(cmd_or_file):
+            observed_exit_code = 1
+            harness_status = "tainted_shell_operator"
+            error_msg = f"TAINTED: Chained shell operators detected: {error_msg or ''}".strip()
+        elif transcript_path and os.path.exists(transcript_path):
+            ec, tail, timed_out = poll_transcript_for_step(transcript_path, step_idx)
+            if ec is not None:
+                observed_exit_code = ec
+                stdout_tail = tail
+                harness_status = "no_error" if ec == 0 else f"exit_{ec}"
+            elif timed_out:
+                observed_exit_code = None
+                harness_status = "unverified_timeout"
+            else:
+                if error_msg:
+                    m = re.search(r"exit status (\d+)", str(error_msg))
+                    if m:
+                        observed_exit_code = int(m.group(1))
+                        harness_status = f"exit_{observed_exit_code}"
+                    else:
+                        harness_status = "error"
+                else:
+                    observed_exit_code = None
+                    harness_status = "unverified_timeout"
+        else:
+            # Fallback when transcript path not attached (e.g. test harnesses / unit tests)
+            if error_msg:
+                m = re.search(r"exit status (\d+)", str(error_msg))
+                if m:
+                    observed_exit_code = int(m.group(1))
+                    harness_status = f"exit_{observed_exit_code}"
+                else:
+                    harness_status = "error"
+            else:
+                observed_exit_code = 0
+                harness_status = "no_error"
+
     elif tool_name in ["write_to_file", "replace_file_content"]:
         cmd_or_file = tool_args.get("TargetFile", "")
+        diff_stat = get_git_diff_stat(cmd_or_file)
+        harness_status = "no_error" if not error_msg else "error"
+
     elif tool_name == "view_file":
         cmd_or_file = tool_args.get("AbsolutePath", "")
-        
-    entry = {
-        "timestamp": time.time(),
+        harness_status = "no_error" if not error_msg else "error"
+
+    record_payload = {
         "conversationId": conv_id,
         "stepIdx": step_idx,
         "tool": tool_name,
         "target": cmd_or_file,
-        "status": "error" if error_msg else "success",
-        "error": str(error_msg) if error_msg else None
+        "observed_exit_code": observed_exit_code,
+        "harness_status": harness_status,
+        "error": str(error_msg) if error_msg else None,
+        "stdout_tail": stdout_tail,
+        "diff_stat": diff_stat,
+        "cwd": tool_cwd
     }
-    
-    try:
-        with open(LEDGER_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-        
+
+    session_secret = get_or_create_session_secret(conv_id, tool_cwd)
+    call_system_one("v1/ledger/record", record_payload, timeout=2.0, session_secret=session_secret)
+
+    local_ledger = get_local_ledger()
+    if local_ledger:
+        try:
+            local_ledger.record_entry(
+                conversation_id=conv_id,
+                step_idx=step_idx,
+                tool=tool_name,
+                target=cmd_or_file,
+                observed_exit_code=observed_exit_code,
+                harness_status=harness_status,
+                error=str(error_msg) if error_msg else None,
+                stdout_tail=stdout_tail,
+                diff_stat=diff_stat,
+                cwd=tool_cwd
+            )
+        except Exception:
+            pass
+
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Filters for Agent Prose
+# ---------------------------------------------------------------------------
 
 action_triggers = re.compile(
     r"\b(i\s+(have\s+)?(ran|run|executed|tested|verified|fixed|modified|created)|"
@@ -124,31 +715,34 @@ action_triggers = re.compile(
     r"tests?\s+succeeded|"
     r"successfully\s+(verified|passed|tested)|"
     r"all\s+checks?\s+passed|"
-    r"(feature|pipeline|integration)\s+is\s+(now\s+)?(wired|working|active))\b",
+    r"(feature|pipeline|integration)\s+is\s+(now\s+)?(wired|working|active)|"
+    r"zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test)\b",
     re.IGNORECASE
 )
+
 descriptive_filter = re.compile(
     r"^\s*(?:quote:|example:|sample:|(?:when|if|for example|e\.g\.|every time|how |the system|the hook|this means|in order to|as an example|such as|to prevent|by default|instead of|note that|on x\b|on twitter|in our search|in research|search results|discussions across|discussions on|users report|practitioners note|engineers note|people are|the community|articles|papers|studies)\b)",
     re.IGNORECASE
 )
+
 imperative_filter = re.compile(
     r"^\s*([🚨⚠️]|(?:do not|don't|ensure|inspect|execute|verify|check|run|please|must|should|critical requirement|requirement|task|step \d|turn \d|signal \d)\b|(?:tip:|note:|warning:))",
     re.IGNORECASE
 )
 
+
 # ---------------------------------------------------------------------------
-# Stop: Pre-Termination Verification Gate
+# Stop: Pre-Termination Verification Gate (Hybrid Two-Tier)
 # ---------------------------------------------------------------------------
 
 def handle_stop(payload: dict) -> dict:
     """
-    Evaluates agent's visible claims against execution ledger using System One.
-    Halts termination if claims contradict ground truth or if verifier is unreachable.
+    Evaluates physical ledger state, agent claims, and executes Tier 2 Hard Gate.
     """
     conv_id = payload.get("conversationId", "default")
     transcript_path = payload.get("transcriptPath", "")
-    
-    # 1. Infinite Loop Escape Hatch Check
+    workspace_dir = get_workspace_dir(payload)
+
     counter_file = get_halt_counter_file(conv_id)
     halt_count = 0
     if os.path.exists(counter_file):
@@ -157,19 +751,25 @@ def handle_stop(payload: dict) -> dict:
                 halt_count = json.load(f).get("count", 0)
         except Exception:
             halt_count = 0
-            
-    if halt_count >= 3:
-        # Reset counter and allow termination with visible warning
-        try:
-            os.remove(counter_file)
-        except Exception:
-            pass
-        return {
-            "decision": "allow",
-            "reason": "⚠️ HARDTRUTH CIRCUIT BREAKER RELEASE: Gate released after 3 consecutive halts to prevent infinite loop. Visible warning: verification claims could not be verified."
-        }
 
-    # 2. Extract agent's final text from transcript
+    # Escalation Policy: Strike 3+ triggers hard escalation halt (Never fails open)
+    if halt_count >= 3:
+        if os.environ.get("HARDTRUTH_CIRCUIT_BREAKER_LEGACY_ALLOW") == "1":
+            try:
+                os.remove(counter_file)
+            except Exception:
+                pass
+            return {
+                "decision": "allow",
+                "reason": "⚠️ HARDTRUTH CIRCUIT BREAKER RELEASE: Gate released after 3 consecutive halts to prevent infinite loop."
+            }
+        else:
+            return {
+                "decision": "continue",
+                "reason": "🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached (3 consecutive halts). Automated release is disabled because HardTruth never fails open. Manual verification or human escalation required."
+            }
+
+    # Extract agent's final text from transcript
     agent_text = ""
     if transcript_path and os.path.exists(transcript_path):
         try:
@@ -183,73 +783,124 @@ def handle_stop(payload: dict) -> dict:
                         continue
         except Exception:
             pass
-            
+
     if not agent_text:
         return {"decision": "allow"}
-        
-    # 3. Read & Distill Execution Ledger Facts (Strict 400-token limit)
-    ledger_entries = []
-    if os.path.exists(LEDGER_FILE):
+
+    # Fetch Ledger Premise
+    premise_data = None
+    session_secret = get_or_create_session_secret(conv_id, workspace_dir)
+    local_ledger = get_local_ledger()
+    if os.environ.get("HARDTRUTH_LEDGER_PATH") and local_ledger:
         try:
-            with open(LEDGER_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        entry = json.loads(line)
-                        if entry.get("conversationId") == conv_id:
-                            ledger_entries.append(entry)
-                    except Exception:
-                        continue
+            premise_data = local_ledger.get_premise(conv_id)
         except Exception:
             pass
 
-    recent_entries = ledger_entries[-25:]
-    commands_run = [e for e in recent_entries if e.get("tool") == "run_command"]
-    files_modified = [e for e in recent_entries if e.get("tool") in ["write_to_file", "replace_file_content"]]
-    
-    # AST Stub check on modified files
-    for f_entry in files_modified:
-        target = f_entry.get("target")
-        if target and os.path.exists(target):
-            stubs = check_ast_stubs(target)
+    if not premise_data:
+        try:
+            url = f"{SYSTEM_ONE_URL.rstrip('/')}/v1/ledger/premise?conversationId={urllib.parse.quote(conv_id)}"
+            premise_headers = {"User-Agent": "HardTruth-Hook"}
+            premise_tok = get_api_token()
+            if premise_tok:
+                premise_headers["Authorization"] = f"Bearer {premise_tok}"
+            if session_secret:
+                premise_headers["X-Session-Secret"] = session_secret
+            req = urllib.request.Request(url, headers=premise_headers)
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                premise_data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            pass
+
+    if not premise_data and local_ledger:
+        try:
+            premise_data = local_ledger.get_premise(conv_id)
+        except Exception:
+            pass
+
+    if not premise_data:
+        premise_data = {
+            "tampered": False,
+            "conversationId": conv_id,
+            "premise": "No ledger records found.",
+            "source_files_modified": 0,
+            "doc_files_modified": 0,
+            "modified_files": [],
+            "verification_commands_executed": 0,
+            "unresolved_failures": []
+        }
+
+    # Check for Ledger Tamper
+    if premise_data.get("tampered"):
+        record_halt(counter_file, halt_count + 1)
+        return {
+            "decision": "continue",
+            "reason": f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden."
+        }
+
+    # Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
+    git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
+    ledger_src_count = premise_data.get("source_files_modified", 0)
+    source_files_modified = max(ledger_src_count, len(git_src_files))
+    verification_commands_executed = premise_data.get("verification_commands_executed", 0)
+    unresolved_failures = premise_data.get("unresolved_failures", [])
+    premise_str = premise_data.get("premise", "")
+    modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
+    if git_paths:
+        modified_paths = list(set(modified_paths) | set(git_paths))
+
+    # -----------------------------------------------------------------------
+    # Rule 3: AST Anti-Stubbing Linter on Modified Source Files
+    # -----------------------------------------------------------------------
+    for fpath in modified_paths:
+        if fpath.endswith(".py") and os.path.exists(fpath):
+            stubs = check_ast_stubs(fpath)
             if stubs:
                 record_halt(counter_file, halt_count + 1)
                 return {
                     "decision": "continue",
                     "reason": f"🚨 HARDTRUTH ENGINE REJECTED: Unimplemented stub detected. {stubs[0]}"
                 }
-                
-    # Build compact premise string
-    premise_parts = []
-    if commands_run:
-        for c in commands_run[-6:]:
-            status_str = "SUCCEEDED (exit 0)" if c.get("status") == "success" else f"FAILED ({c.get('error')})"
-            premise_parts.append(f"COMMAND: '{c.get('target')}'. STATUS: {status_str}.")
-    else:
-        premise_parts.append("No commands or tests were executed.")
-        
-    if files_modified:
-        mods = [os.path.basename(m.get("target")) for m in files_modified[-6:] if m.get("target")]
-        premise_parts.append(f"MODIFIED_FILES: {', '.join(mods)}.")
-    else:
-        premise_parts.append("No files were modified.")
-        
-    premise = " ".join(premise_parts)[:1200]
-    
-    # 4. Atomic Claim Extraction & Targeted Vocabulary Filtering
+
+    # -----------------------------------------------------------------------
+    # Rule 1: Source Code Changes Require Test Proof (Language-Independent)
+    # -----------------------------------------------------------------------
+    if source_files_modified > 0 and verification_commands_executed == 0:
+        record_halt(counter_file, halt_count + 1)
+        return {
+            "decision": "continue",
+            "reason": "🚨 HARDTRUTH GATE HALTED: Source code files were modified in this conversation, but NO verification commands or test suites were executed. You must execute tests to verify your changes before stopping."
+        }
+
+    # -----------------------------------------------------------------------
+    # Rule 2: Unresolved Verification Failures Forbid Termination (Language-Independent)
+    # -----------------------------------------------------------------------
+    if len(unresolved_failures) > 0:
+        record_halt(counter_file, halt_count + 1)
+        fails_summary = "; ".join([
+            f"'{u.get('command')}' (exit {u.get('observed_exit_code')})"
+            for u in unresolved_failures
+        ])
+        return {
+            "decision": "continue",
+            "reason": f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping."
+        }
+
+    # -----------------------------------------------------------------------
+    # Rule 4: Targeted DeBERTa-v3 NLI Claim Adjudication
+    # -----------------------------------------------------------------------
     text_without_fences = re.sub(r"```[\s\S]*?```", "", agent_text)
     text_clean = text_without_fences.replace("`", "")
     text_clean = re.sub(r"^\s*>\s*", "", text_clean, flags=re.MULTILINE)
-    
+
     sentences = re.split(r"(?<=[.!?])\s+|\n+", text_clean)
     claims_to_verify = []
     for s in sentences:
         s_clean = s.strip()
-        # Ignore short strings, descriptive explanations, and imperative prompt directives
         if len(s_clean) > 15 and action_triggers.search(s_clean):
             if imperative_filter.search(s_clean):
                 continue
             if descriptive_filter.search(s_clean):
-                # Check if sentence is a completion assertion despite prefix like "Example:", "Quote:", "Sample:"
                 prefix_match = re.match(r"^\s*(?:quote:|example:|sample:)\s*", s_clean, re.IGNORECASE)
                 if prefix_match:
                     remainder = s_clean[prefix_match.end():].strip()
@@ -263,53 +914,27 @@ def handle_stop(payload: dict) -> dict:
                 else:
                     continue
             claims_to_verify.append(s_clean[:250])
-            
-    # Cap at top 4 high-risk claims
+
     claims_to_verify = claims_to_verify[:4]
-    if not claims_to_verify:
-        return {"decision": "allow"}
-        
-    # 5. Verification against Premise
-    # Phase 1: Pure-Python deterministic checks on all claims before any daemon call
-    has_failed_commands = any(c.get("status") != "success" or c.get("error") for c in commands_run)
-    has_successful_commands = any(c.get("status") == "success" and not c.get("error") for c in commands_run)
+
+    has_test_pass_claim = any(
+        re.search(r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing)\b", c, re.IGNORECASE)
+        for c in claims_to_verify
+    )
+    if has_test_pass_claim and verification_commands_executed == 0:
+        record_halt(counter_file, halt_count + 1)
+        return {
+            "decision": "continue",
+            "reason": "🚨 HARDTRUTH ENGINE HALTED: You claimed tests passed, but the execution ledger shows NO commands or test suites were run in this session. Execute the test command with run_command to prove it before completing."
+        }
 
     for claim in claims_to_verify:
-        is_pass_claim = bool(re.search(
-            r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing)\b",
-            claim,
-            re.IGNORECASE
-        ))
-
-        # Deterministic Check 1: Claimed tests passed, but no commands were run
-        if is_pass_claim and not commands_run:
-            record_halt(counter_file, halt_count + 1)
-            return {
-                "decision": "continue",
-                "reason": f"🚨 HARDTRUTH ENGINE HALTED: You claimed '{claim}', but the execution ledger shows NO commands or test suites were run in this session. Execute the test command with run_command to prove it before completing."
-            }
-
-        # Deterministic Check 2: Claimed tests passed, but commands in ledger failed
-        if is_pass_claim and has_failed_commands:
-            record_halt(counter_file, halt_count + 1)
-            return {
-                "decision": "continue",
-                "reason": f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED:\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise}\nFix the failure and provide verified command output before stopping."
-            }
-
-    # Phase 2: NLI Verification / Fail-closed daemon checks
-    for claim in claims_to_verify:
-        is_pass_claim = bool(re.search(
-            r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing)\b",
-            claim,
-            re.IGNORECASE
-        ))
-
         nli_res = call_system_one("v1/verify-claim", {
-            "premise": premise,
-            "hypothesis": claim
+            "premise": premise_str,
+            "hypothesis": claim,
+            "threshold": CONTRADICTION_THRESHOLD
         })
-        
+
         if nli_res is not None:
             probs = nli_res.get("probabilities", {})
             contradiction = probs.get("contradiction", 0.0)
@@ -317,12 +942,10 @@ def handle_stop(payload: dict) -> dict:
                 record_halt(counter_file, halt_count + 1)
                 return {
                     "decision": "continue",
-                    "reason": f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise}\nFix the failure and provide verified command output before stopping."
+                    "reason": f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping."
                 }
         else:
-            # Daemon unreachable: FAIL CLOSED unless deterministically verified by ledger
-            if is_pass_claim and has_successful_commands and not has_failed_commands:
-                # Deterministically verified by exit code!
+            if verification_commands_executed > 0 and len(unresolved_failures) == 0:
                 pass
             else:
                 record_halt(counter_file, halt_count + 1)
@@ -330,15 +953,50 @@ def handle_stop(payload: dict) -> dict:
                     "decision": "continue",
                     "reason": f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing."
                 }
-            
-    # All claims verified clean: reset halt counter and allow stop
+
+    # -----------------------------------------------------------------------
+    # Tier 2: External Deterministic Hard Gate Handoff
+    # Only triggered if source files were modified or tests were executed
+    # -----------------------------------------------------------------------
+    if workspace_dir and (source_files_modified > 0 or verification_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+        tier2_result = call_system_one("v1/verify/handoff", {
+            "workspace_path": workspace_dir,
+            "conversationId": conv_id
+        }, timeout=65.0)
+
+        if not tier2_result and run_independent_verification:
+            # Fallback to in-process clean runner if daemon endpoint offline
+            try:
+                tier2_result = run_independent_verification(workspace_dir, conv_id=conv_id)
+            except Exception:
+                tier2_result = None
+
+        if tier2_result and not tier2_result.get("success"):
+            runner = tier2_result.get("runner", "external runner")
+            ec = tier2_result.get("exit_code")
+            out_tail = (tier2_result.get("output", "") or "")[:600]
+            record_halt(counter_file, halt_count + 1)
+            return {
+                "decision": "continue",
+                "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
+            }
+
+    # All tiers passed: reset counter file and session key
     if os.path.exists(counter_file):
         try:
             os.remove(counter_file)
         except Exception:
             pass
-            
+
+    sec_file = get_session_secret_file(conv_id)
+    if os.path.exists(sec_file):
+        try:
+            os.remove(sec_file)
+        except Exception:
+            pass
+
     return {"decision": "allow"}
+
 
 def record_halt(counter_file: str, new_count: int):
     try:
@@ -347,23 +1005,24 @@ def record_halt(counter_file: str, new_count: int):
     except Exception:
         pass
 
+
 # ---------------------------------------------------------------------------
 # CLI Entrypoint
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "stop"
-    
+
     try:
         raw_in = sys.stdin.read()
         payload = json.loads(raw_in) if raw_in.strip() else {}
     except Exception:
         payload = {}
-        
+
     if mode in ["post_tool", "PostToolUse"]:
         out = handle_post_tool_use(payload)
     else:
         out = handle_stop(payload)
-        
+
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()

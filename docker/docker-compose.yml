@@ -9,3 +9,17 @@ services:
     restart: always
     ports:
       - "127.0.0.1:8000:8000"
+    environment:
+      # Round 7: daemon API write token. Set the SAME value for the hook via
+      # HARDTRUTH_API_TOKEN env, or place it in ~/.hardtruth/daemon_api.key.
+      # Generate one with: python3 -c "import secrets; print(secrets.token_hex(32))"
+      HARDTRUTH_API_TOKEN: ${HARDTRUTH_API_TOKEN:?set HARDTRUTH_API_TOKEN in your environment}
+      # Round 7: map host workspace prefixes to their mount point inside the
+      # daemon container so Tier 2 can verify agent workspaces.
+      # Example: {"\\/Users\\/ai\\/dev":"\\/workspaces\\/dev"}
+      HARDTRUTH_WORKSPACE_MAP: ${HARDTRUTH_WORKSPACE_MAP:-{}}
+    volumes:
+      # Share the physical ledger + API key with the host hook (single source of truth).
+      - ${HARDTRUTH_STATE_DIR:-~/.hardtruth}:/root/.hardtruth
+      # Mount any host workspace tree the daemon must verify (repeat per agent workspace).
+      - ${HARDTRUTH_WORKSPACE:-/Users/ai/dev/hardtruth-fix}:${HARDTRUTH_WORKSPACE_MOUNT:-/Users/ai/dev/hardtruth-fix}:ro

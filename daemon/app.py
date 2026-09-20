@@ -1,29 +1,97 @@
 #!/usr/bin/env python3
 """
 HardTruth Verification Daemon (Port 8000)
-Exposes sub-15ms Non-Autoregressive NLI Verification via DeBERTa-v3 Cross-Encoder:
-- cross-encoder/nli-deberta-v3-small
-Evaluates (premise, hypothesis) token pairs directly on Apple Silicon MPS or CPU.
+Exposes:
+1. Sub-15ms Non-Autoregressive NLI Verification via DeBERTa-v3 Cross-Encoder:
+   - cross-encoder/nli-deberta-v3-small
+2. Cryptographically tamper-evident, HMAC-SHA256 hash-chained Daemon Ledger:
+   - POST /v1/ledger/record
+   - GET /v1/ledger/premise
+3. Tier 2 External Deterministic Verification Gate (Outer Loop):
+   - POST /v1/verify/handoff
 """
 
 from __future__ import annotations
 import os
 import sys
 import time
-import psutil
+import hmac
 import threading
-from typing import Dict, Any
-from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException
+try:
+    import psutil
+except ImportError:
+    psutil = None
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+
+_CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _CURRENT_DIR not in sys.path:
+    sys.path.insert(0, _CURRENT_DIR)
+
+try:
+    from ledger import DaemonLedger, validate_api_token
+except ImportError:
+    try:
+        from daemon.ledger import DaemonLedger, validate_api_token
+    except ImportError:
+        from hardtruth.ledger import DaemonLedger, validate_api_token
+
+try:
+    from tier2_runner import run_independent_verification
+except ImportError:
+    try:
+        from daemon.tier2_runner import run_independent_verification
+    except ImportError:
+        from hardtruth.tier2_runner import run_independent_verification
 
 app = FastAPI(
     title="HardTruth Verification Daemon",
-    description="Sub-15ms Natural Language Inference verification for agent execution claims",
-    version="1.0.0",
+    description="Sub-15ms Natural Language Inference verification, Tamper-Evident Ledger & Tier 2 Gate",
+    version="1.2.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+@app.middleware("http")
+async def limit_payload_size(request: Request, call_next):
+    cl = request.headers.get("content-length")
+    if cl:
+        try:
+            if int(cl) > 2_000_000:  # 2MB payload limit
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Payload too large: maximum request body size is 2MB to prevent OOM"}
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
+
+# ---------------------------------------------------------------------------
+# Ledger Engine
+# ---------------------------------------------------------------------------
+
+_ledger = DaemonLedger()
+
+
+# ---------------------------------------------------------------------------
+# API Write Authentication (Round 7 Finding A)
+# ---------------------------------------------------------------------------
+def require_daemon_auth(authorization: Optional[str] = Header(None)):
+    """
+    Requires the shared HardTruth API token on all state-changing endpoints.
+    Prevents any local process from forging ledger/baseline records or from
+    triggering external execution / NLI inference (Round 7 Finding A).
+    """
+    token = None
+    if authorization:
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
+        else:
+            token = authorization.strip()
+    if not validate_api_token(token):
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid HardTruth API token")
 
 # ---------------------------------------------------------------------------
 # Model Engine (DeBERTa-v3 NLI Direct Token Pair Evaluation)
@@ -48,19 +116,96 @@ def get_nli_direct():
                 _nli_direct_model.eval()
     return _nli_direct_tok, _nli_direct_model
 
+
+def _warmup_nli_in_background():
+    """Round 8 (#5): eager-load the NLI model at startup (weights are baked into the
+    image by the Dockerfile preload step), so /health reports nli_loaded quickly and
+    the first /v1/verify-claim doesn't pay a cold-start download/load penalty."""
+    try:
+        get_nli_direct()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warmup_nli_in_background, daemon=True, name="nli-warmup").start()
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
 class VerifyClaimRequest(BaseModel):
-    premise: str
-    hypothesis: str
+    premise: str = Field(..., max_length=65536)
+    hypothesis: str = Field(..., max_length=4096)
+    threshold: Optional[float] = 0.70
 
 class VerifyClaimResponse(BaseModel):
     status: str  # ENTAILED | CONTRADICTION | NEUTRAL
     confidence: float
     probabilities: Dict[str, float]
     latency_ms: float
+
+class RecordLedgerRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    stepIdx: int = 0
+    tool: str = Field(..., max_length=64)
+    target: str = Field("", max_length=4096)
+    observed_exit_code: Optional[int] = None
+    harness_status: Optional[str] = Field(None, max_length=64)
+    error: Optional[str] = Field(None, max_length=16384)
+    stdout_tail: Optional[str] = Field(None, max_length=16384)
+    diff_stat: Optional[str] = Field(None, max_length=4096)
+    timestamp: Optional[float] = None
+    cwd: Optional[str] = Field(None, max_length=1024)
+
+class UnresolvedFailureItem(BaseModel):
+    command: str = Field(..., max_length=4096)
+    observed_exit_code: Optional[int] = None
+    error: Optional[str] = Field(None, max_length=16384)
+    stdout_tail: Optional[str] = Field(None, max_length=16384)
+    stepIdx: Optional[int] = None
+    cwd: Optional[str] = Field(None, max_length=1024)
+
+class GetPremiseResponse(BaseModel):
+    tampered: bool
+    conversationId: str
+    premise: str
+    source_files_modified: int
+    doc_files_modified: int
+    modified_files: List[str]
+    modified_file_paths: Optional[List[str]] = []
+    verification_commands_executed: int
+    unresolved_failures: List[UnresolvedFailureItem]
+    records_count: int
+    error: Optional[str] = None
+    broken_at_index: Optional[int] = None
+    detail: Optional[str] = None
+
+class SessionStartRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    workspace_path: Optional[str] = Field(None, max_length=1024)
+
+class SessionStartResponse(BaseModel):
+    conversationId: str
+    session_secret: Optional[str] = None
+    status: str
+
+class SessionBaselineRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    workspace_path: str = Field(..., max_length=1024)
+    commit_sha: Optional[str] = Field(None, max_length=128)
+
+class HandoffVerifyRequest(BaseModel):
+    workspace_path: str = Field(..., max_length=1024)
+    conversationId: Optional[str] = Field(None, max_length=128)
+    test_command: Optional[str] = Field(None, max_length=2048)
+    timeout_sec: Optional[int] = 60
+
+class HandoffVerifyResponse(BaseModel):
+    status: str
+    success: bool
+    exit_code: int
+    runner: Optional[str]
+    output: str
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -69,22 +214,146 @@ class VerifyClaimResponse(BaseModel):
 @app.get("/health")
 @app.get("/v1/health")
 def health_check():
-    process = psutil.Process(os.getpid())
-    rss_mb = process.memory_info().rss / (1024 * 1024)
+    rss_mb = 0.0
+    if psutil:
+        try:
+            process = psutil.Process(os.getpid())
+            rss_mb = process.memory_info().rss / (1024 * 1024)
+        except Exception:
+            pass
+    valid_chain, records_count, chain_msg = _ledger.verify_chain()
     return {
         "status": "healthy",
         "service": "hardtruth-daemon",
+        "version": "1.2.0",
         "substrate": "free_local_open_source",
         "models": {
             "nli_deberta": "cross-encoder/nli-deberta-v3-small"
         },
         "rss_memory_mb": round(rss_mb, 2),
         "nli_loaded": _nli_direct_model is not None,
-        "nli_direct_loaded": _nli_direct_model is not None,
+        "ledger": {
+            "path": _ledger.ledger_path,
+            "chain_valid": valid_chain,
+            "records_count": records_count,
+            "chain_msg": chain_msg
+        },
+        "tier2_hard_gate": "enabled",
         "docs_url": "http://127.0.0.1:8000/docs"
     }
 
-@app.post("/v1/verify-claim", response_model=VerifyClaimResponse)
+@app.post("/v1/session/start", response_model=SessionStartResponse, dependencies=[Depends(require_daemon_auth)])
+def session_start(req: SessionStartRequest):
+    """
+    Open Item #2: Register session and mint ephemeral 256-bit session secret.
+    Returns session_secret ONLY on creation. Subsequent calls return status: already_active
+    without secret to prevent credential leakage.
+    """
+    status, secret = _ledger.start_session(req.conversationId, req.workspace_path)
+    return SessionStartResponse(
+        conversationId=req.conversationId,
+        session_secret=secret,
+        status=status
+    )
+
+@app.post("/v1/ledger/record", dependencies=[Depends(require_daemon_auth)])
+def record_ledger_entry(
+    req: RecordLedgerRequest,
+    x_session_secret: Optional[str] = Header(None, alias="X-Session-Secret")
+):
+    """
+    Appends an execution event to the HMAC-SHA256 hash-chained ledger.
+    Validates X-Session-Secret if session is registered.
+    Enforces monotonic step sequencing.
+    """
+    session = _ledger.get_session(req.conversationId)
+    if session:
+        if not x_session_secret:
+            raise HTTPException(status_code=403, detail="Forbidden: missing X-Session-Secret for active session")
+        if not hmac.compare_digest(str(x_session_secret), session["secret"]):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid X-Session-Secret")
+
+    try:
+        res = _ledger.record_entry(
+            conversation_id=req.conversationId,
+            step_idx=req.stepIdx,
+            tool=req.tool,
+            target=req.target,
+            observed_exit_code=req.observed_exit_code,
+            harness_status=req.harness_status,
+            error=req.error,
+            stdout_tail=req.stdout_tail,
+            diff_stat=req.diff_stat,
+            timestamp=req.timestamp,
+            cwd=req.cwd
+        )
+        return res
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+@app.get("/v1/ledger/premise", dependencies=[Depends(require_daemon_auth)])
+def get_ledger_premise(
+    conversationId: str = Query(..., description="Conversation ID to query"),
+    x_session_secret: Optional[str] = Header(None, alias="X-Session-Secret")
+):
+    """
+    Validates HMAC hash-chain integrity, extracts execution evidence, and compiles failure-biased premise.
+    Validates X-Session-Secret if session is registered.
+    """
+    session = _ledger.get_session(conversationId)
+    if session:
+        if not x_session_secret:
+            raise HTTPException(status_code=403, detail="Forbidden: missing X-Session-Secret for active session")
+        if not hmac.compare_digest(str(x_session_secret), session["secret"]):
+            raise HTTPException(status_code=403, detail="Forbidden: invalid X-Session-Secret")
+
+    premise_data = _ledger.get_premise(conversationId)
+    if premise_data.get("tampered"):
+        return JSONResponse(status_code=400, content=premise_data)
+    return premise_data
+
+@app.post("/v1/session/baseline", dependencies=[Depends(require_daemon_auth)])
+def set_session_baseline(req: SessionBaselineRequest):
+    """
+    Registers the session baseline commit SHA for (conversationId, workspace_path).
+    Immutable in daemon memory and physical HMAC-chained ledger.
+    """
+    baseline = _ledger.get_session_baseline(req.conversationId, req.workspace_path)
+    if baseline:
+        return {"baseline_sha": baseline, "status": "existing"}
+    if req.commit_sha:
+        saved = _ledger.set_session_baseline(req.conversationId, req.workspace_path, req.commit_sha)
+        return {"baseline_sha": saved, "status": "created"}
+    return {"baseline_sha": None, "status": "not_found"}
+
+@app.get("/v1/session/baseline", dependencies=[Depends(require_daemon_auth)])
+def get_session_baseline(
+    conversationId: str = Query(..., description="Conversation ID"),
+    workspace_path: str = Query(..., description="Workspace path")
+):
+    """
+    Retrieves the immutable session baseline commit SHA for (conversationId, workspace_path).
+    """
+    baseline = _ledger.get_session_baseline(conversationId, workspace_path)
+    return {"baseline_sha": baseline}
+
+@app.post("/v1/verify/handoff", response_model=HandoffVerifyResponse, dependencies=[Depends(require_daemon_auth)])
+def verify_handoff(req: HandoffVerifyRequest):
+    """
+    Tier 2 External Deterministic Verification Gate.
+    Executes the canonical test suite in a clean, out-of-band runner outside the agent's shell.
+    """
+    result = run_independent_verification(
+        workspace_path=req.workspace_path,
+        test_cmd=req.test_command,
+        timeout_sec=req.timeout_sec or 60,
+        conv_id=req.conversationId
+    )
+    if not result.get("success"):
+        return JSONResponse(status_code=406, content=result)
+    return result
+
+@app.post("/v1/verify-claim", response_model=VerifyClaimResponse, dependencies=[Depends(require_daemon_auth)])
 def verify_claim(req: VerifyClaimRequest):
     """
     Evaluates premise vs hypothesis using DeBERTa-v3 cross-encoder directly.
@@ -108,7 +377,6 @@ def verify_claim(req: VerifyClaimRequest):
         logits = model(**inputs).logits
         probs = torch.softmax(logits, dim=-1)[0].tolist()
 
-    # cross-encoder/nli-deberta-v3-small label order: 0: contradiction, 1: entailment, 2: neutral
     contradiction, entailment, neutral = probs[0], probs[1], probs[2]
     prob_dict = {
         "contradiction": round(contradiction, 4),
@@ -116,7 +384,8 @@ def verify_claim(req: VerifyClaimRequest):
         "neutral": round(neutral, 4)
     }
 
-    if contradiction >= 0.70:
+    threshold = req.threshold or 0.70
+    if contradiction >= threshold:
         verdict = "CONTRADICTION"
         conf = contradiction
     elif entailment >= 0.50:

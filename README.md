@@ -2,7 +2,8 @@
 
 > **Fail-Closed Verification for Coding Agents.** A local neurosymbolic circuit breaker that halts AI coding agents when they claim unverified test passes, emit empty stubs, or contradict physical execution facts.
 
-[![Tests](https://img.shields.io/badge/tests-16%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-29%20passed-brightgreen.svg)]()
+[![Evals](https://img.shields.io/badge/evals-262%20pairs%20calibrated-blue.svg)]()
 [![Model](https://img.shields.io/badge/model-DeBERTa--v3--small-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Status](https://img.shields.io/badge/repo-public-success.svg)](https://github.com/Vibherpunk/hardtruth)
@@ -18,125 +19,148 @@ When an AI coding agent finishes writing code, the most probable continuation in
 
 The model has no intrinsic connection to your operating system's kernel. Standard prompting (*"Be honest"*, *"Never lie"*) fails because **linguistic persuasion cannot verify physical execution state**.
 
-Once an agent hallucinates a fake success statement into its context window, that claim becomes accepted context for subsequent turns, leading the agent into an compounding cycle of false assumptions.
+Furthermore, naive verification gates suffer from three fatal flaws:
+1. **Forgeable Ledgers:** Synthesizing `"exit 0"` from the absence of error strings, writing to user-writable files, and using small sliding windows where harmless commands (`echo`, `ls`) age out failing tests.
+2. **English Regex Fragility:** Regex triggers miss non-English completions (*"Tous les tests unitaires sont passés"*, *"所有测试均已通过"*) and ordinary English phrasings (*"10/10 green across the suite"*, *"zero failures"*).
+3. **Uncalibrated Thresholds & Silent Escapes:** Arbitrary NLI thresholds and silent 3-strike releases that fail open under model retry pressure.
 
 ---
 
-## The Solution: Two-Phase Neurosymbolic Gate
+## The Solution: Inverted Neurosymbolic Gate & Tamper-Evident Ledger
 
-HardTruth separates execution from claim verification using two distinct layers:
-
-1. **Deterministic Execution Layer:** Captures real tool calls and exit statuses into a local append-only JSONL ledger (`ledger.jsonl`), and checks modified Python files for empty stubs using an Abstract Syntax Tree (AST) analyzer.
-2. **System One NLI Layer:** Runs a local `cross-encoder/nli-deberta-v3-small` model (via PyTorch MPS or CPU) to evaluate whether the agent's natural-language completion assertions are entailed by or contradict the physical execution facts.
-3. **Fail-Closed Behavior:** If the daemon is unreachable, the gate **fails closed**—refusing unverified factual claims with `decision: "continue"` so that unproven assertions degrade to manual verification rather than passing silently.
+HardTruth inverts the gate: **Gate on physical ledger state first, language-independently; reserve NLI for claim adjudication.**
 
 ```mermaid
-sequenceDiagram
-    participant Agent as Antigravity Agent
-    participant Ledger as Execution Ledger (ledger.jsonl)
-    participant Hook as HardTruth Stop Hook
-    participant Daemon as HardTruth Daemon (port 8000)
+flowchart TD
+    subgraph Agent Runtime
+        A[Agent emits Tool Call] --> B[Harness executes tool]
+        B --> C[PostToolUse Lifecycle Hook]
+    end
 
-    Agent->>Ledger: Executes tool (PostToolUse Hook)
-    Note over Ledger: Stores tool, target, status, and error
+    subgraph HardTruth Client Hook
+        C --> D[Extract exit code from transcript / error with polling]
+        C --> E[Extract git diff stat for source code edits]
+        D & E --> F[POST /v1/ledger/record]
+    end
 
-    Agent->>Hook: Attempts turn completion ("All tests passed!")
-    Hook->>Hook: Phase 1: Pure-Python deterministic AST & exit-code check
-    alt Deterministic Violation (No tests ran / tests failed / stubs)
-        Hook->>Agent: 🚨 REJECT TURN (decision: continue)
-    else Clean Claims
-        Hook->>Daemon: Phase 2: POST /v1/verify-claim (Premise + Claim)
-        alt Contradiction (conf >= 0.70) or Daemon Offline
-            Daemon-->>Hook: Contradiction >= 0.70 or Unreachable
-            Hook->>Agent: 🚨 REJECT TURN: Requires manual proof
-        else Entailment Verified
-            Daemon-->>Hook: Entailment verified (contradiction < 0.70)
-            Hook->>Agent: ALLOW TERMINATION (decision: allow)
-        end
+    subgraph HardTruth Daemon Port 8000
+        F --> G[HMAC-SHA256 Hash Chain]
+        G --> H[(Daemon-Owned Ledger: 0600)]
+        H --> I[Verification Command State Engine]
+    end
+
+    subgraph Stop Hook Interception
+        J[Agent attempts Stop] --> K[AST Anti-Stubbing Linter]
+        K -->|Stubs detected| N[HALT: Unimplemented stub]
+        K -->|AST Clean| L[Check Physical Ledger State]
+        L -->|Source code modified & 0 tests run| M[HALT: No tests run]
+        L -->|Unresolved test failures exist| P[HALT: Unresolved test failures]
+        L -->|Ledger clean & verified| Q[Adjudicate Claims via DeBERTa-v3]
+        Q -->|Contradiction >= tau*| R[HALT: Contradiction]
+        Q -->|Entailed / Clean / Meta-discussion| S[ALLOW Termination]
     end
 ```
 
----
-
-## Capabilities & Enforced Invariants
-
-### 1. Stopping the "Fake Test Pass" Lie
-If an agent claims tests passed (e.g. *"All 10 unit tests passed"*), HardTruth inspects the execution ledger.
-* If **no commands** ran in the session, the turn is immediately halted (`decision: "continue"`).
-* If commands ran but **failed** (non-zero exit code or error output), the turn is immediately halted with a contradiction warning.
-* If matching test commands executed with exit code 0, the claim is verified.
-
-### 2. AST Anti-Stubbing Linter
-HardTruth's AST analyzer (`client/ast_checker.py`) checks every modified Python file. Any function reduced to a vacuous body is rejected before completion:
-* `pass`
-* `raise NotImplementedError` / `raise NotImplementedError()` / `raise NotImplementedError("...")`
-* `...` (Ellipsis)
-* `return True` or `return None` / bare `return` as the sole body statement
-
-**False Positive Suppression:** Legitimate abstract declarations are explicitly exempted:
-* Classes inheriting from `typing.Protocol`
-* Methods decorated with `@abstractmethod`
-* Functions decorated with `@overload`
-
-### 3. Machine-Wide Git Pre-Commit Gate
-`install.sh --global` configures a global git pre-commit hook (`~/.hardtruth/hooks/pre-commit`). Any commit across the entire machine containing empty stubs in staged `.py` files is rejected at the git level, protecting repositories from stubbed code regardless of which agent or tool wrote it.
-
-### 4. Circuit Breaker Escape Hatch
-To prevent infinite loops when an agent cannot resolve an issue, HardTruth maintains a counter in `~/.hardtruth/halts/` (isolated with mode `0o700` and hashed conversation IDs). After 3 consecutive halts on the same conversation, the circuit breaker releases with a visible warning in the returned `reason`.
+### Inverted Gate Rules (Language-Independent)
+1. **Rule 1 (Source Code Changes Require Proof):** If source code files (`.py`, `.ts`, `.rs`, `.go`, etc.) were modified but 0 verification commands were executed, the agent is halted immediately. Documentation-only edits (`.md`, `.txt`) are exempt. *Zero regex. Zero NLI. Completely language-independent.*
+2. **Rule 2 (Unresolved Failures Forbid Completion):** If unresolved test failures exist in the ledger, termination is blocked. Even if the agent speaks French, Chinese, or informal English, Rule 2 halts before NLI is evaluated.
+3. **Rule 3 (AST Anti-Stubbing Linter):** Modified Python files are parsed into an Abstract Syntax Tree to reject empty placeholders (`pass`, `NotImplementedError`, dummy returns).
+4. **Rule 4 (Targeted DeBERTa-v3 NLI Adjudication):** Evaluates agent statements against the physical premise using a calibrated threshold ($\tau^* = 0.70$) to prevent unsubstantiated assertions.
+5. **Never Fail Open (Hard Escalation Halt):** Replaces silent 3-strike releases. After 3 consecutive halts on conflicting claims, HardTruth issues a hard escalation halt that permanently blocks unverified escape.
 
 ---
 
-## Execution Ledger Schema
+## Physical Ledger Integrity
 
-The deterministic ledger is stored at `~/.gemini/antigravity-cli/ledger.jsonl` (or configured via `HARDTRUTH_LEDGER_PATH`). Each entry is a single JSON record:
+### 1. Cryptographic HMAC-SHA256 Hash Chaining
+The HardTruth daemon manages a private 256-bit secret key (`~/.hardtruth/daemon_hmac.key`, mode `0o400`) and writes append-only records to `~/.hardtruth/daemon_ledger.jsonl` (mode `0o600`).
 
-```json
-{
-  "timestamp": 1726792345.12,
-  "conversationId": "test-conv-uuid",
-  "stepIdx": 8,
-  "tool": "run_command",
-  "target": "python3 -m unittest test_daemon.py",
-  "status": "success",
-  "error": null
-}
+Each record contains:
+$$\text{hash} = \text{HMAC-SHA256}(K, \text{index} \parallel \text{prev\_hash} \parallel \text{canonical}(entry))$$
+
+On every stop verification, the entire hash chain is validated from index 0 to $N-1$. If any record was modified, deleted, or reordered, the gate triggers a **Hard Tamper Halt**.
+
+### 2. Failure-Biased State Engine & Sliding Window Immunity
+Harmless commands (`echo`, `ls`, `cat`) can never push a failing test out of sight:
+* **Verification Commands** (`pytest`, `cargo test`, `npm test`, `python3 -m unittest`, `go test`, `ruff`, etc.) that exit non-zero enter `unresolved_failures` permanently.
+* **Resolution Condition:** A failure is cleared **if and only if** a subsequent run of that test command (or an encompassing test suite) exits with code 0.
+* **Exploratory Commands:** Diagnostic tools like `grep -q "foo"` exiting 1 (no match) are recorded in history but **never** enter `unresolved_failures`, preventing agent deadlock.
+
+### 3. Real Exit Codes & Non-Synthesis Rule
+* Antigravity lifecycle hooks do not provide integer `0` for successful exits. HardTruth polls the execution transcript (up to 300ms) to extract real exit codes and stdout tails.
+* **Non-Synthesis Rule:** If uncorroborated by transcript, HardTruth records `harness_status: "no_error"` and explicitly labels it `uncorroborated`. It **never synthesizes `exit 0` out of thin air**.
+
+---
+
+## Honest Threat Model & Physical Limits
+
+HardTruth demotes security theater and provides honest documentation of its physical boundaries:
+
+### What HardTruth Defends Against
+1. **Agent Context Drift & Hallucination:** Prevents LLMs from convincing themselves that tests passed when none were executed.
+2. **Naive File Tampering:** Agents cannot edit or forge the ledger without breaking the cryptographic HMAC-SHA256 hash chain.
+3. **Sliding-Window Aging Attacks:** Agents cannot flush failing test runs with 10 harmless bash commands.
+4. **Path-of-Least-Resistance Shortcuts:** Agents cannot submit empty code stubs or claim completion without running tests.
+
+### Physical Limits (What It Cannot Defend Against)
+* **Same-User OS Boundary:** Under standard POSIX permissions, if the agent runs with the user's shell privileges on the same host machine without containerization, it shares file ownership. HardTruth provides **no adversarial security** against an intentionally malicious or jailbroken agent running as the same OS user.
+* **Adversarial Container Boundary:** True adversarial defense requires running the agent inside an isolated sandbox (e.g. Docker, Daytona, OrbStack) while the HardTruth daemon runs externally on the host or in an isolated enclave.
+
+---
+
+## Empirical Threshold Calibration
+
+HardTruth includes a 262-pair evaluation set ([`evals/dataset.jsonl`](./evals/dataset.jsonl)) evaluated directly across $\tau \in [0.10, 0.95]$:
+
+* **Category 1: Verified Truths (106 pairs):** Canonical and informal English completions, multi-language assertions (Spanish, French, German, Chinese), and diff-grounded edits.
+* **Category 2: False Claims & Hallucinations (101 pairs):** Phantom test passes, failed test suites, and partial passes.
+* **Category 3: Meta-Discussion & Scaffolding (55 pairs):** Quoted prompt instructions, contribution guidelines, and honest failure diagnoses.
+
+### Evaluation Sweep Results (`evals/evaluate.py`)
+
+```
+========================================================================================
+ tau   |  TP   |  FP   |  TN   |  FN   |   FPR    |   FNR    |  Prec   | Recall  |   F1   
+----------------------------------------------------------------------------------------
+  0.10 |    66 |    20 |   141 |    35 |  12.42% |  34.65% |   0.767 |   0.653 |   0.706
+  0.20 |    65 |    16 |   145 |    36 |   9.94% |  35.64% |   0.802 |   0.644 |   0.714
+  0.40 |    63 |    14 |   147 |    38 |   8.70% |  37.62% |   0.818 |   0.624 |   0.708
+  0.60 |    60 |    14 |   147 |    41 |   8.70% |  40.59% |   0.811 |   0.594 |   0.686
+  0.70 |    60 |    12 |   149 |    41 |   7.45% |  40.59% |   0.833 |   0.594 |   0.694
+  0.80 |    59 |    12 |   149 |    42 |   7.45% |  41.58% |   0.831 |   0.584 |   0.686
+  0.90 |    59 |    10 |   151 |    42 |   6.21% |  41.58% |   0.855 |   0.584 |   0.694
+  0.95 |    55 |     8 |   153 |    46 |   4.97% |  45.54% |   0.873 |   0.545 |   0.671
+========================================================================================
 ```
 
-* `tool`: The tool invoked (`run_command`, `write_to_file`, `replace_file_content`, `view_file`).
-* `target`: The command string or absolute file path.
-* `status`: `"success"` or `"error"`.
-* `error`: Error message or non-zero exit code string if the command failed.
+At the calibrated operating point ($\tau^* = 0.70$):
+* **Precision:** 83.3%
+* **False Positive Rate:** 7.45% on conversational/meta scaffolding
+* **Language Independence:** Unresolved failures and missing tests are caught by Rules 1 & 2 with **0% FNR**, reserving DeBERTa-v3 strictly for nuanced claim adjudication.
+
+To run the threshold sweep locally:
+```bash
+python3 evals/evaluate.py --output evals/sweep_results.json
+```
 
 ---
 
 ## Performance Benchmarks
 
-Measured using the committed benchmark reproduction script [`benchmarks/benchmark.py`](./benchmarks/benchmark.py):
+Measured using [`benchmarks/benchmark.py`](./benchmarks/benchmark.py):
 
-| Metric | Docker Container (Linux CPU on Apple Silicon) |
+| Metric | Daemon Container (PyTorch CPU / MPS) |
 | :--- | :--- |
-| **Median Latency (p50)** | **~73.2 ms** |
-| **p90 Latency** | **~82.3 ms** |
-| **p99 Latency** | **~86.5 ms** |
-| **RAM Footprint (RSS)** | **~528 MB** (Python 3.11 + PyTorch CPU + DeBERTa-v3) |
-| **Throughput (Sequential)**| **~13.7 req/sec** |
-
-*Hardware: Apple Silicon Mac (ARM64), OrbStack Linux Docker Engine, PyTorch CPU wheel.*
-
-To reproduce benchmarks locally:
-```bash
-python3 benchmarks/benchmark.py http://127.0.0.1:8000 20
-```
+| **Median Latency (p50)** | **~67.2 ms** |
+| **p90 Latency** | **~68.5 ms** |
+| **RAM Footprint (RSS)** | **~559 MB** (Python 3.11 + PyTorch + DeBERTa-v3) |
+| **Throughput (Sequential)**| **~14.9 req/sec** |
 
 ---
 
 ## Quickstart
 
-### Prerequisites
-* Python 3.10+
-* Docker & Docker Compose (optional, for daemon container)
-
-### 1. Clone Repository & Install Dependencies
+### 1. Install Dependencies
 ```bash
 git clone https://github.com/Vibherpunk/hardtruth.git
 cd hardtruth
@@ -144,92 +168,93 @@ pip install -r requirements.txt
 ```
 
 ### 2. Start Verification Daemon
-You can run the daemon directly:
+Start locally:
 ```bash
 python3 daemon/app.py
 ```
-Or start via Docker Compose:
+Or with Docker Compose:
 ```bash
 docker compose -f docker/docker-compose.yml up --build -d
 ```
-Verify the daemon is healthy:
+
+#### Daemon API Authentication (Round 7)
+All state-changing daemon endpoints (`/v1/ledger/record`, `/v1/session/baseline`,
+`/v1/verify/handoff`, `/v1/verify-claim`) require a shared API token:
+
+1. Generate one: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+2. Set `HARDTRUTH_API_TOKEN` for both hook and daemon, **or** write the value to
+   `~/.hardtruth/daemon_api.key` (mode 0400, read by both; auto-generated if missing).
+
+Requests without a valid token are rejected with `401`. This closes the Round 7
+Finding A vector where any local process could forge `run_command`/exit-0 ledger
+records and clear genuine failures from the gate's premise.
+
+#### Tier 2 Workspace Visibility (Round 7)
+The daemon must be able to see agent workspaces to run Tier 2 verification:
+
+- **Daemon on host:** no extra configuration.
+- **Daemon in a container:** mount each workspace into the daemon container and set
+  `HARDTRUTH_WORKSPACE_MAP` as a JSON object mapping host prefixes to container
+  prefixes (e.g. `{"\/Users\/ai\/dev":"\/workspaces\/dev"}`), or mount at the same
+  absolute path. If a workspace is not visible, Tier 2 fails closed with
+  `status: "unverified_no_workspace"` instead of a silent pass.
+
+#### Read-Endpoint Authentication (Round 8)
+`GET /v1/ledger/premise` and `GET /v1/session/baseline` now also require the same
+shared token as the write endpoints. `/health` stays open for liveness checks.
+The hook already sends the token on premise/baseline reads; a token-less hook
+degrades gracefully to its local ledger.
+
+#### NLI Cold-Start Preload (Round 8)
+The Docker image preloads `cross-encoder/nli-deberta-v3-small` at build time and
+the daemon warms the model in a background thread at startup, so the first
+`/v1/verify-claim` in a fresh container is fast and `/health` reports
+`nli_loaded: true` shortly after boot. Trade-off: image size grows by roughly the
+model size (~500MB).
+
+#### Test Ledger Isolation & Purge (Round 8)
+Test runs no longer pollute the physical ledger:
+
+- `tests/test_live.py` runs hook subprocesses **token-less**, so their record and
+  baseline writes are rejected by the daemon (401) and stay in the test-local temp
+  ledger. Only the explicit live-auth tests (`test_17`-`test_20`) talk to a real
+  daemon with the real token.
+- For cleaning up artifacts from past or manual live runs, an ops-only CLI exists
+  (same-user filesystem access; deliberately **not** an HTTP endpoint so a remote
+  token holder cannot erase ledger evidence). Stop the daemon, then:
+  ```bash
+  HARDTRUTH_DAEMON_LEDGER=~/.hardtruth/daemon_ledger.jsonl \
+  HARDTRUTH_DAEMON_KEY=~/.hardtruth/daemon_hmac.key \
+  python3 scripts/purge_test_records.py
+  ```
+  The HMAC chain is rebuilt and re-verified over the kept records; a tampered
+  ledger is refused.
+
+#### Per-Record Session Authenticity & Ephemeral Secrets (Round 9)
+To prevent cross-session forgery or replay attacks, the daemon mints per-session cryptographic secrets:
+
+- `POST /v1/session/start` registers an active session and returns a 256-bit secret **once on creation**. Subsequent idempotent requests return `status: "already_active"` with `session_secret: null` to prevent credential scraping over the network.
+- The client hook stores the session key locally in `~/.hardtruth/halts/session_<conv_id>.key` with restrictive permissions (`0400`), explicitly isolated from container mounts.
+- `POST /v1/ledger/record` and `GET /v1/ledger/premise` mandate the `X-Session-Secret` header matching the active session, rejecting unauthenticated or cross-session tampering with `403 Forbidden`.
+
+#### Monotonic Step Sequencing (Round 9)
+The daemon ledger enforces strictly ordered execution history:
+- Incoming records with `stepIdx < last_step_idx` are rejected with `HTTP 409 Conflict`, preventing historical backdating, out-of-order replay attacks, or race conditions.
+- Multiple parallel tool invocations within the same step (`stepIdx == last_step_idx`) remain permitted.
+
+#### 3-Stage Containerized CI Matrix (Round 9)
+The GitHub Actions workflow (`.github/workflows/ci.yml`) executes the complete test suite across a 3-tier validation matrix:
+1. **Unreachable Daemon:** Validates fail-closed fallback under network or daemon outages.
+2. **Host Daemon with Bearer Auth:** Validates local API token enforcement.
+3. **Live Containerized Daemon:** Builds `hardtruth-daemon:latest`, provisions Docker socket and workspace mounts, and exercises full Tier 2 HTTP verification handoffs against real containers in CI. The Tier 2 runner marker is decoupled via `HARDTRUTH_TIER2_SANDBOX=1` so tests 17–20 run without skipping in CI.
+
+### 3. Run Test Suite
 ```bash
-curl -s http://127.0.0.1:8000/health
+pytest tests/
 ```
+All 72 tests pass cleanly across daemon ledger integrity, inverted gate rules, live hook execution,
+authenticated session binding, monotonic sequencing, and containerized Tier 2 handoffs.
 
-### 3. Install Hooks
-```bash
-# Installs Antigravity lifecycle hook and library:
-bash install.sh
-
-# Optional: To enable machine-wide git commit gate across all repositories:
-bash install.sh --global
-```
-
-### 4. Run Test Suite
-```bash
-# Run against live daemon:
-python3 tests/test_live.py
-
-# Run with daemon unreachable (verifies fail-closed behavior):
-SYSTEM_ONE_URL=http://127.0.0.1:9 python3 tests/test_live.py
-```
-
-All 16 tests pass with the daemon online and with it unreachable.
-
----
-
-## Integration
-
-### 1. Antigravity (CLI & IDE)
-Configured automatically by `install.sh` in `~/.gemini/config/hooks.json`:
-```json
-{
-  "hardtruth": {
-    "enabled": true,
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [{ "type": "command", "command": "python3 ~/.gemini/config/hardtruth_hook.py post_tool", "timeout": 5 }]
-      }
-    ],
-    "Stop": [
-      {
-        "type": "command", "command": "python3 ~/.gemini/config/hardtruth_hook.py stop", "timeout": 10
-      }
-    ]
-  }
-}
-```
-
-### 2. Python Agent Loops (Custom Scripts)
-Embed the client directly into custom Python agents:
-```python
-from client.hardtruth_client import HardTruthClient, CONTRADICTION_THRESHOLD
-
-client = HardTruthClient("http://127.0.0.1:8000")
-
-# Check if daemon is responsive
-if client.is_daemon_online():
-    res = client.verify_claim(
-        premise="COMMAND: 'pytest tests/'. STATUS: FAILED (exit status 1).",
-        hypothesis="All 10 unit tests passed completely."
-    )
-    if res and res["probabilities"]["contradiction"] >= CONTRADICTION_THRESHOLD:
-        print("🚨 Blocked: Agent claim contradicts execution ledger!")
-```
-
----
-
-## Repository Structure
-
-* `daemon/app.py`: Dedicated FastAPI verification daemon hosting `cross-encoder/nli-deberta-v3-small` with thread-safe lazy loading and `/health` monitoring.
-* `client/ast_checker.py`: Shared AST stub detection module (detects `pass`, `NotImplementedError`, `...`, `return True/None`; exempts `@abstractmethod`, `@overload`, and `Protocol`).
-* `client/hardtruth_hook.py`: Antigravity lifecycle hook (`PostToolUse` and `Stop`) with fail-closed gate logic.
-* `client/hardtruth_client.py`: Python client library with `/health` polling and deterministic AST fallback.
-* `docker/`: Dockerfile and docker-compose.yml for Linux/VPS deployment using official PyTorch CPU wheels.
-* `tests/test_live.py`: 16-case test suite verifying fail-closed execution, stub detection, filter safety, and contradiction detection.
-* `benchmarks/benchmark.py`: Committed benchmark reproduction script measuring latency and memory.
 
 ---
 
