@@ -126,8 +126,8 @@ try:
 except Exception:
     data = {}
 hooks = data.setdefault('hooks', {})
-hooks['PostToolUse'] = [{'matcher': '*', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]
-hooks['Stop'] = [{'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]
+hooks['PostToolUse'] = [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]}]
+hooks['Stop'] = [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]}]
 with open(p, 'w') as f:
     json.dump(data, f, indent=2)
 "
