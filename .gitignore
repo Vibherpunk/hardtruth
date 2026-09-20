@@ -7,3 +7,9 @@ __pycache__/
 .venv/
 env/
 .pytest_cache/
+
+# Handoff and audit battery documents
+HANDOFF_PROMPT.md
+*audit_findings*.md
+round*_audit_findings.md
+

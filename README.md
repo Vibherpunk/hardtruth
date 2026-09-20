@@ -230,13 +230,31 @@ Test runs no longer pollute the physical ledger:
   The HMAC chain is rebuilt and re-verified over the kept records; a tampered
   ledger is refused.
 
+#### Per-Record Session Authenticity & Ephemeral Secrets (Round 9)
+To prevent cross-session forgery or replay attacks, the daemon mints per-session cryptographic secrets:
+
+- `POST /v1/session/start` registers an active session and returns a 256-bit secret **once on creation**. Subsequent idempotent requests return `status: "already_active"` with `session_secret: null` to prevent credential scraping over the network.
+- The client hook stores the session key locally in `~/.hardtruth/halts/session_<conv_id>.key` with restrictive permissions (`0400`), explicitly isolated from container mounts.
+- `POST /v1/ledger/record` and `GET /v1/ledger/premise` mandate the `X-Session-Secret` header matching the active session, rejecting unauthenticated or cross-session tampering with `403 Forbidden`.
+
+#### Monotonic Step Sequencing (Round 9)
+The daemon ledger enforces strictly ordered execution history:
+- Incoming records with `stepIdx < last_step_idx` are rejected with `HTTP 409 Conflict`, preventing historical backdating, out-of-order replay attacks, or race conditions.
+- Multiple parallel tool invocations within the same step (`stepIdx == last_step_idx`) remain permitted.
+
+#### 3-Stage Containerized CI Matrix (Round 9)
+The GitHub Actions workflow (`.github/workflows/ci.yml`) executes the complete test suite across a 3-tier validation matrix:
+1. **Unreachable Daemon:** Validates fail-closed fallback under network or daemon outages.
+2. **Host Daemon with Bearer Auth:** Validates local API token enforcement.
+3. **Live Containerized Daemon:** Builds `hardtruth-daemon:latest`, provisions Docker socket and workspace mounts, and exercises full Tier 2 HTTP verification handoffs against real containers in CI. The Tier 2 runner marker is decoupled via `HARDTRUTH_TIER2_SANDBOX=1` so tests 17–20 run without skipping in CI.
+
 ### 3. Run Test Suite
 ```bash
 pytest tests/
 ```
-All tests pass cleanly across daemon ledger integrity, inverted gate rules, live hook execution,
-and live daemon auth (Round 7/8). Tests that need a live daemon (`test_10`, `test_17`-`test_20`)
-self-skip under `CI=true` or when the daemon is unreachable.
+All 72 tests pass cleanly across daemon ledger integrity, inverted gate rules, live hook execution,
+authenticated session binding, monotonic sequencing, and containerized Tier 2 handoffs.
+
 
 ---
 

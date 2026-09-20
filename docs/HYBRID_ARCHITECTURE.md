@@ -96,3 +96,29 @@ chmod +x ~/.gemini/antigravity-cli/hooks/*.py
 
 echo "Hybrid Architecture Successfully Provisioned."
 ```
+
+---
+
+## 5. Ledger Security, Session Authenticity & Monotonicity (Round 7–9)
+
+To ensure the Physical Ledger is completely immune to out-of-band manipulation, session hijacking, credential leakage, and out-of-order execution, the following security constraints are enforced at the protocol level:
+
+### 5.1 Daemon API Authentication (Bearer Token)
+- All state-changing endpoints (`POST /v1/ledger/record`, `POST /v1/session/baseline`, `POST /v1/verify/handoff`, `POST /v1/verify-claim`) and sensitive read endpoints (`GET /v1/ledger/premise`, `GET /v1/session/baseline`) require a shared bearer token (`HARDTRUTH_API_TOKEN` or `~/.hardtruth/daemon_api.key`, mode `0400`).
+- Missing or invalid tokens return `HTTP 401 Unauthorized`. Constant-time comparison (`hmac.compare_digest`) prevents timing side-channel attacks.
+
+### 5.2 Per-Record Session Authenticity
+- **Single-Minting Session Secrets (`POST /v1/session/start`):** On session initialization, the daemon registers the `conversationId` and generates an ephemeral 256-bit cryptographic secret.
+- **Idempotency Leak Prevention:** The secret is returned in the response payload **only once** upon creation. Subsequent idempotent calls for the same `conversationId` return `status: "already_active"` with `session_secret: null`. This prevents an agent holding the general API token from querying the endpoint to steal an active session's secret over the loopback network.
+- **Local Key Storage:** The client hook caches this secret locally at `~/.hardtruth/halts/session_<conv_id>.key` with strict `0400` POSIX permissions, isolated from the Tier 2 container mount.
+- **Per-Record Validation:** Every `/v1/ledger/record` and `/v1/ledger/premise` invocation requires an `X-Session-Secret` header matching the active session. Missing or mismatched secrets return `HTTP 403 Forbidden`.
+
+### 5.3 Monotonic Step Sequencing
+- The daemon ledger maintains an in-memory monotonic step counter per registered session.
+- Any incoming record with `stepIdx < last_step_idx` is rejected with `HTTP 409 Conflict`.
+- This strictly prohibits backdating, replayed steps, or retroactive failure masking, while preserving support for parallel tool executions within the same step index (`stepIdx == last_step_idx`).
+
+### 5.4 Containerized Workspace Visibility & Decoupled CI
+- `resolve_workspace_path` parses `HARDTRUTH_WORKSPACE_MAP` (longest-prefix match) to translate host paths into container mount paths. Unmapped workspaces fail closed with `status: "unverified_no_workspace"`.
+- Ephemeral runners set `HARDTRUTH_TIER2_SANDBOX=1` to cleanly decouple sandbox isolation checks from standard `CI=true` runner environments, ensuring 100% CI coverage across unreachable, host, and live containerized daemons.
+
