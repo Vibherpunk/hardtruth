@@ -56,11 +56,20 @@ def is_verification_command(cmd: str) -> bool:
     return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
 
 
+DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
+    r"(?:^|[\s;\|\&])(?:PATH|PYTHONPATH|PYTHONHOME|LD_PRELOAD|DYLD_INSERT_LIBRARIES|DYLD_LIBRARY_PATH|NODE_OPTIONS|PERL5LIB|RUBYLIB)=",
+    re.IGNORECASE
+)
+
+
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects verification commands chained with masking operators or conditionals (||, ;, &&, |, if, subshells)."""
+    """Detects verification commands chained with masking operators or dangerous env overrides (PATH=, LD_PRELOAD=)."""
     cmd_clean = (cmd or "").strip()
     if VERIFICATION_CMD_PATTERN.search(cmd_clean):
-        return bool(SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean))
+        if SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean):
+            return True
+        if DANGEROUS_ENV_OVERRIDE_PATTERN.search(cmd_clean):
+            return True
     return False
 
 
@@ -134,12 +143,6 @@ def can_suite_resolve_failure(
     if clean_has_filter:
         return clean == failed
 
-    # 1. Python pytest hierarchy
-    # Bare pytest or pytest . runs all tests in the workspace root
-    if clean in ["pytest", "pytest .", "python3 -m unittest", "python3 -m unittest discover"]:
-        if failed.startswith("pytest") or "unittest" in failed:
-            return True
-
     # Helper to extract target test file/dir token from pytest command
     def extract_pytest_target(cmd_str: str) -> Optional[str]:
         parts = cmd_str.split()
@@ -160,6 +163,19 @@ def can_suite_resolve_failure(
 
     t_clean = extract_pytest_target(clean)
     t_failed = extract_pytest_target(failed)
+
+    # 1. Python pytest hierarchy
+    # A root-level pytest invocation with flags only (e.g. pytest -v, pytest -x, pytest --exitfirst)
+    # or bare pytest runs all tests in the workspace root, encompassing any pytest failure.
+    clean_parts = clean.split()
+    is_root_clean_pytest = (
+        bool(clean_parts) and (clean_parts[0] == "pytest" or "unittest" in clean)
+        and not clean_has_filter
+        and (t_clean is None or t_clean in [".", "./"])
+    )
+    if is_root_clean_pytest and (failed.startswith("pytest") or "unittest" in failed):
+        return True
+
     if t_clean and t_failed:
         raw_clean_target = t_clean.rstrip("/")
         raw_failed_target = t_failed.rstrip("/")

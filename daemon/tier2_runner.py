@@ -16,7 +16,13 @@ import hashlib
 from typing import Optional, Dict, Any, Tuple, List
 
 
-MANIFEST_FILES = ["Makefile", "package.json", "pyproject.toml", "Cargo.toml", "setup.py", "pytest.ini"]
+MANIFEST_FILES = [
+    "Makefile", "package.json", "pyproject.toml", "Cargo.toml", "setup.py",
+    "pytest.ini", ".pytest.ini", "tox.ini",
+    "conftest.py", "tests/conftest.py",
+    "jest.config.js", "jest.config.ts", "jest.setup.js", "setupTests.js",
+    "vite.config.js", "vite.config.ts", "vitest.config.js", "vitest.config.ts"
+]
 
 
 def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None) -> Tuple[bool, List[str]]:
@@ -317,6 +323,16 @@ def run_independent_verification(
                             }
                 except Exception:
                     pass
+
+        if any("conftest" in f for f in tampered_files):
+            return {
+                "status": "tampered",
+                "success": False,
+                "exit_code": 1,
+                "runner": "manifest_integrity_guard",
+                "output": "🚨 TIER 2 HARD GATE REJECTED: Pytest fixture 'conftest.py' was created or modified during this session. Tier 2 refuses to execute agent-modified test fixtures to prevent hijacking.",
+                "isolation": "manifest_tampering_check"
+            }
 
     canonical_runner = test_cmd or detect_test_runner(workspace_path, tampered_manifests=tampered_files)
 

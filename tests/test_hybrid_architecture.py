@@ -520,6 +520,64 @@ class TestHybridArchitecture(unittest.TestCase):
         self.assertFalse(res["success"])
         self.assertEqual(res["status"], "unverified_no_runner")
 
+    def test_assume_unchanged_index_manipulation_detected(self):
+        """git update-index --assume-unchanged is detected via git ls-files -v."""
+        git_repo_dir = os.path.join(self.test_dir, "assume_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        main_file = os.path.join(git_repo_dir, "main.py")
+        with open(main_file, "w") as f:
+            f.write("# v1\n")
+        subprocess.run(["git", "add", "main.py"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "v1"], cwd=git_repo_dir, check=True)
+
+        # Agent edits main.py and hides it using --assume-unchanged
+        with open(main_file, "a") as f:
+            f.write("def bypass(): return True\n")
+        subprocess.run(["git", "update-index", "--assume-unchanged", "main.py"], cwd=git_repo_dir, check=True)
+
+        # git status shows clean
+        status_out = subprocess.run(["git", "status", "--porcelain"], cwd=git_repo_dir, capture_output=True, text=True).stdout.strip()
+        self.assertEqual(status_out, "")
+
+        # But get_git_modified_source_files MUST catch main.py!
+        from client.hardtruth_hook import get_git_modified_source_files
+        src_files, doc_files, all_paths = get_git_modified_source_files(git_repo_dir)
+        self.assertIn("main.py", src_files)
+
+    def test_path_spoofing_tainted(self):
+        """Prepending PATH= or other dangerous env vars to test commands is tainted."""
+        self.assertTrue(is_tainted_shell_command('PATH="/tmp/bin:$PATH" pytest'))
+        self.assertTrue(is_tainted_shell_command('LD_PRELOAD=/tmp/fake.so pytest'))
+        self.assertTrue(is_tainted_shell_command('PYTHONPATH=/tmp/evil pytest'))
+        self.assertFalse(is_tainted_shell_command('CI=1 pytest'))
+
+    def test_conftest_tampering_rejected_by_tier2(self):
+        """Creating or modifying conftest.py triggers manifest tampering in Tier 2."""
+        git_repo_dir = os.path.join(self.test_dir, "conftest_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        # Agent injects conftest.py
+        conftest_file = os.path.join(git_repo_dir, "conftest.py")
+        with open(conftest_file, "w") as f:
+            f.write("import sys\ndef pytest_sessionstart(session):\n    sys.exit(0)\n")
+
+        res = run_independent_verification(git_repo_dir)
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "tampered")
+
+    def test_flag_only_pytest_resolves_root_and_file_failures(self):
+        """Root pytest executions with flags only (pytest -v, pytest -x) resolve prior failures."""
+        self.assertTrue(can_suite_resolve_failure("pytest -v", "pytest tests/test_billing.py"))
+        self.assertTrue(can_suite_resolve_failure("pytest -x", "pytest"))
+        self.assertTrue(can_suite_resolve_failure("pytest --exitfirst", "pytest tests/test_foo.py::test_bar"))
+
 
 if __name__ == "__main__":
     unittest.main()

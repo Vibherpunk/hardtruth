@@ -59,3 +59,32 @@ All 51 tests passing cleanly across all 4 suites (`pytest -v`):
 - `tests/test_daemon_ledger.py` (7 tests)
 - `tests/test_live.py` (16 tests)
 
+---
+
+## Round 6 Adversarial Audit Findings & Remediations
+
+An unconstrained adversarial audit conducted by Opus subagent `f60dda15` identified 4 critical vectors:
+
+1. **Git Index Manipulation (`--assume-unchanged` / `--skip-worktree`):**
+   - *Vulnerability:* An agent could modify source code and execute `git update-index --assume-unchanged <file>` to hide changes from `git status`.
+   - *Remediation:* Added `git ls-files -v` inspection in [`client/hardtruth_hook.py`](file:///Users/ai/dev/hardtruth-fix/client/hardtruth_hook.py). Any file flagged with `h` or `s`/`S` has its object hash compared against the index (`git hash-object` vs `git ls-files -s`). Modified files are unconditionally surfaced to Rule 1. If `.git` is deleted, the hook scans the filesystem directly.
+2. **PATH Spoofing & Environment Variable Hijacking:**
+   - *Vulnerability:* An agent could prepend `PATH="/tmp/bin:$PATH"` or `LD_PRELOAD=/evil.so` before verification commands to execute a fake binary that always exits 0.
+   - *Remediation:* Added `DANGEROUS_ENV_OVERRIDE_PATTERN` to [`daemon/ledger.py`](file:///Users/ai/dev/hardtruth-fix/daemon/ledger.py). Any verification command prepending `PATH=`, `PYTHONPATH=`, `LD_PRELOAD=`, `DYLD_INSERT_LIBRARIES=`, or `NODE_OPTIONS=` is flagged as `TAINTED` and forced to exit code 1.
+3. **`conftest.py` Test Fixture Hijacking:**
+   - *Vulnerability:* An agent could modify or create `conftest.py` (`pytest_sessionstart: sys.exit(0)`) to bypass Tier 2 without modifying tracked manifests.
+   - *Remediation:* Expanded `MANIFEST_FILES` in [`daemon/tier2_runner.py`](file:///Users/ai/dev/hardtruth-fix/daemon/tier2_runner.py) to include `conftest.py`, `tests/conftest.py`, and test runners configs. Any session modifications to `conftest.py` immediately trigger `status: "tampered"`.
+4. **Flag-Only Pytest Resolution Denial of Service:**
+   - *Vulnerability:* In [`daemon/ledger.py`](file:///Users/ai/dev/hardtruth-fix/daemon/ledger.py), running `pytest -v` or `pytest -x` without an explicit directory returned `None` for the target path, preventing it from resolving prior failures.
+   - *Remediation:* Root pytest invocations with flags only are recognized as root workspace runs, resolving previous file or root failures.
+
+---
+
+## Final Verification Status
+All 55 tests passing cleanly across all 4 suites (`pytest -v`):
+- `tests/test_hybrid_architecture.py` (26 tests)
+- `tests/test_inverted_gate.py` (6 tests)
+- `tests/test_daemon_ledger.py` (7 tests)
+- `tests/test_live.py` (16 tests)
+
+

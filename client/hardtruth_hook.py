@@ -306,7 +306,58 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
             except Exception:
                 pass
 
-    # 3. Recurse into nested git repositories and untracked directories
+    # 3. Check for git index manipulation (assume-unchanged or skip-worktree)
+    try:
+        res_v = subprocess.run(
+            ["git", "ls-files", "-v"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if res_v.returncode == 0 and res_v.stdout:
+            for line in res_v.stdout.splitlines():
+                if len(line) >= 3:
+                    tag = line[0]
+                    fname = line[2:].strip()
+                    if tag in ["h", "s", "S"]:
+                        try:
+                            cur_h = subprocess.run(
+                                ["git", "hash-object", fname],
+                                cwd=workspace_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=1.0,
+                                text=True
+                            ).stdout.strip()
+                            idx_out = subprocess.run(
+                                ["git", "ls-files", "-s", fname],
+                                cwd=workspace_dir,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                timeout=1.0,
+                                text=True
+                            ).stdout.split()
+                            if len(idx_out) >= 2 and cur_h != idx_out[1]:
+                                all_rel_paths.add(fname)
+                        except Exception:
+                            all_rel_paths.add(fname)
+    except Exception:
+        pass
+
+    # 4. Fallback if .git is missing (e.g. rm -rf .git)
+    if not os.path.exists(os.path.join(workspace_dir, ".git")):
+        try:
+            for root, dirs, files in os.walk(workspace_dir):
+                dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
+                for fname in files:
+                    rel_p = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                    all_rel_paths.add(rel_p)
+        except Exception:
+            pass
+
+    # 5. Recurse into nested git repositories and untracked directories
     expanded_paths = set()
     for filepath_rel in all_rel_paths:
         full_p = os.path.join(workspace_dir, filepath_rel)
