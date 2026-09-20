@@ -153,6 +153,7 @@ class TestRound7ApiToken(unittest.TestCase):
     """Round 7 Finding A: daemon API write-token validation (constant-time)."""
 
     def test_validate_api_token_env(self):
+        old_tok = os.environ.get("HARDTRUTH_API_TOKEN")
         os.environ["HARDTRUTH_API_TOKEN"] = "test-token-0123456789abcdef"
         try:
             self.assertTrue(validate_api_token("test-token-0123456789abcdef"))
@@ -160,13 +161,20 @@ class TestRound7ApiToken(unittest.TestCase):
             self.assertFalse(validate_api_token(""))
             self.assertFalse(validate_api_token(None))
         finally:
-            os.environ.pop("HARDTRUTH_API_TOKEN", None)
+            if old_tok is not None:
+                os.environ["HARDTRUTH_API_TOKEN"] = old_tok
+            else:
+                os.environ.pop("HARDTRUTH_API_TOKEN", None)
 
     def test_get_daemon_api_token_min_length(self):
-        os.environ.pop("HARDTRUTH_API_TOKEN", None)
-        tok = get_daemon_api_token()
-        self.assertGreaterEqual(len(tok), 32)
-        self.assertTrue(validate_api_token(tok))
+        old_tok = os.environ.pop("HARDTRUTH_API_TOKEN", None)
+        try:
+            tok = get_daemon_api_token()
+            self.assertGreaterEqual(len(tok), 32)
+            self.assertTrue(validate_api_token(tok))
+        finally:
+            if old_tok is not None:
+                os.environ["HARDTRUTH_API_TOKEN"] = old_tok
 
 
 class TestRound8PurgeRecords(unittest.TestCase):
