@@ -87,7 +87,8 @@ class TestV21Hardening(unittest.TestCase):
             "toolCall": {"name": "run_command", "args": {"CommandLine": "bun test"}},
             "stepIdx": 1,
             "conversationId": conv,
-            "error": None
+            "error": None,
+            "exitCode": 0
         })
 
         # Agent claims in prose that it implemented src/gate/waivers.ts (which was never touched)
@@ -151,7 +152,8 @@ class TestV21Hardening(unittest.TestCase):
             "toolCall": {"name": "run_command", "args": {"CommandLine": "pytest tests/"}},
             "stepIdx": 2,
             "conversationId": conv,
-            "error": None
+            "error": None,
+            "exitCode": 0
         })
 
         payload = {"conversationId": conv}
