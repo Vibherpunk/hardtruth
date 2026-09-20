@@ -7,6 +7,8 @@ Exposes:
 2. Cryptographically tamper-evident, HMAC-SHA256 hash-chained Daemon Ledger:
    - POST /v1/ledger/record
    - GET /v1/ledger/premise
+3. Tier 2 External Deterministic Verification Gate (Outer Loop):
+   - POST /v1/verify/handoff
 """
 
 from __future__ import annotations
@@ -32,10 +34,18 @@ except ImportError:
     except ImportError:
         from hardtruth.ledger import DaemonLedger
 
+try:
+    from tier2_runner import run_independent_verification
+except ImportError:
+    try:
+        from daemon.tier2_runner import run_independent_verification
+    except ImportError:
+        from hardtruth.tier2_runner import run_independent_verification
+
 app = FastAPI(
     title="HardTruth Verification Daemon",
-    description="Sub-15ms Natural Language Inference verification & Tamper-Evident Ledger",
-    version="1.1.0",
+    description="Sub-15ms Natural Language Inference verification, Tamper-Evident Ledger & Tier 2 Gate",
+    version="1.2.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -110,12 +120,26 @@ class GetPremiseResponse(BaseModel):
     source_files_modified: int
     doc_files_modified: int
     modified_files: List[str]
+    modified_file_paths: Optional[List[str]] = []
     verification_commands_executed: int
     unresolved_failures: List[UnresolvedFailureItem]
     records_count: int
     error: Optional[str] = None
     broken_at_index: Optional[int] = None
     detail: Optional[str] = None
+
+class HandoffVerifyRequest(BaseModel):
+    workspace_path: str
+    conversationId: Optional[str] = None
+    test_command: Optional[str] = None
+    timeout_sec: Optional[int] = 60
+
+class HandoffVerifyResponse(BaseModel):
+    status: str
+    success: bool
+    exit_code: int
+    runner: Optional[str]
+    output: str
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -130,7 +154,7 @@ def health_check():
     return {
         "status": "healthy",
         "service": "hardtruth-daemon",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "substrate": "free_local_open_source",
         "models": {
             "nli_deberta": "cross-encoder/nli-deberta-v3-small"
@@ -143,6 +167,7 @@ def health_check():
             "records_count": records_count,
             "chain_msg": chain_msg
         },
+        "tier2_hard_gate": "enabled",
         "docs_url": "http://127.0.0.1:8000/docs"
     }
 
@@ -175,6 +200,21 @@ def get_ledger_premise(conversationId: str = Query(..., description="Conversatio
         return JSONResponse(status_code=400, content=premise_data)
     return premise_data
 
+@app.post("/v1/verify/handoff", response_model=HandoffVerifyResponse)
+def verify_handoff(req: HandoffVerifyRequest):
+    """
+    Tier 2 External Deterministic Verification Gate.
+    Executes the canonical test suite in a clean, out-of-band runner outside the agent's shell.
+    """
+    result = run_independent_verification(
+        workspace_path=req.workspace_path,
+        test_cmd=req.test_command,
+        timeout_sec=req.timeout_sec or 60
+    )
+    if not result.get("success"):
+        return JSONResponse(status_code=406, content=result)
+    return result
+
 @app.post("/v1/verify-claim", response_model=VerifyClaimResponse)
 def verify_claim(req: VerifyClaimRequest):
     """
@@ -199,7 +239,6 @@ def verify_claim(req: VerifyClaimRequest):
         logits = model(**inputs).logits
         probs = torch.softmax(logits, dim=-1)[0].tolist()
 
-    # cross-encoder/nli-deberta-v3-small label order: 0: contradiction, 1: entailment, 2: neutral
     contradiction, entailment, neutral = probs[0], probs[1], probs[2]
     prob_dict = {
         "contradiction": round(contradiction, 4),

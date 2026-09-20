@@ -1,7 +1,7 @@
 """
 HardTruth Daemon Ledger Engine
 Cryptographically tamper-evident, HMAC-SHA256 hash-chained, daemon-owned execution ledger.
-Maintains physical state, verification command tracking, and failure-biased resolution.
+Maintains physical state, verification command tracking, hierarchical suite resolution, and shell-operator defense.
 """
 
 from __future__ import annotations
@@ -17,20 +17,28 @@ from typing import Dict, List, Optional, Tuple, Any
 DEFAULT_LEDGER_PATH = os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl")
 DEFAULT_KEY_PATH = os.path.expanduser("~/.hardtruth/daemon_hmac.key")
 
+# Matches verification commands even with leading env vars like CI=1 or PYTHONPATH=.
 VERIFICATION_CMD_PATTERN = re.compile(
-    r"^(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint)\b",
+    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\w+)?|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint)\b",
+    re.IGNORECASE
+)
+
+# Chained shell operators that mask exit codes
+SHELL_OPERATOR_MASK_PATTERN = re.compile(
+    r"(?:;\s*(?:true|exit\s+0|echo)|\|\|\s*(?:true|exit\s+0|echo)|&&\s*true)",
     re.IGNORECASE
 )
 
 EXPLORATORY_CMD_PATTERN = re.compile(
-    r"^(cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(status|log|diff|branch|show))\b",
+    r"^(?:[A-Z_0-9]+=\S+\s+)*(cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(status|log|diff|branch|show))\b",
     re.IGNORECASE
 )
 
 SOURCE_CODE_EXTENSIONS = {
     ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
     ".cc", ".cxx", ".h", ".hpp", ".java", ".rb", ".sh", ".bash",
-    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig"
+    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig",
+    ".mjs", ".cjs"
 }
 
 DOC_EXTENSIONS = {
@@ -45,6 +53,14 @@ def is_verification_command(cmd: str) -> bool:
     return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
 
 
+def is_tainted_shell_command(cmd: str) -> bool:
+    """Detects verification commands chained with masking operators like ; true or || exit 0."""
+    cmd_clean = (cmd or "").strip()
+    if is_verification_command(cmd_clean):
+        return bool(SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean))
+    return False
+
+
 def is_exploratory_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
     return bool(EXPLORATORY_CMD_PATTERN.search(cmd_clean))
@@ -52,6 +68,10 @@ def is_exploratory_command(cmd: str) -> bool:
 
 def classify_file(filepath: str) -> str:
     """Returns 'source', 'doc', or 'other'."""
+    basename = os.path.basename(filepath or "")
+    if basename in ["Makefile", "Dockerfile", "Containerfile", "build.sh", "deploy.sh"]:
+        return "source"
+
     _, ext = os.path.splitext(filepath or "")
     ext = ext.lower()
     if ext in SOURCE_CODE_EXTENSIONS:
@@ -59,6 +79,47 @@ def classify_file(filepath: str) -> str:
     elif ext in DOC_EXTENSIONS:
         return "doc"
     return "other"
+
+
+def can_suite_resolve_failure(clean_cmd: str, failed_cmd: str) -> bool:
+    """
+    Hierarchical resolution: checks if clean_cmd encompasses failed_cmd.
+    - pytest / pytest tests/ resolves any pytest failure
+    - npm test / npm run test resolves any npm run test:* failure
+    - cargo test resolves any cargo test --* failure
+    - go test ./... resolves any go test failure
+    """
+    clean = clean_cmd.strip()
+    failed = failed_cmd.strip()
+
+    if clean == failed:
+        return True
+
+    # 1. Python pytest hierarchy
+    is_clean_pytest_suite = bool(re.search(r"^pytest(?:\s+tests/?|\s+\.)?$", clean)) or clean == "python3 -m unittest"
+    if is_clean_pytest_suite and (failed.startswith("pytest") or "unittest" in failed):
+        return True
+
+    # 2. Node npm test hierarchy
+    is_clean_npm_suite = clean in ["npm test", "npm run test", "yarn test", "bun test"]
+    if is_clean_npm_suite and ("npm" in failed or "yarn" in failed or "bun" in failed):
+        return True
+
+    # 3. Rust cargo test hierarchy
+    is_clean_cargo_suite = clean in ["cargo test", "cargo test --all"]
+    if is_clean_cargo_suite and failed.startswith("cargo test"):
+        return True
+
+    # 4. Go test hierarchy
+    is_clean_go_suite = clean in ["go test ./...", "go test .", "go test"]
+    if is_clean_go_suite and failed.startswith("go test"):
+        return True
+
+    # 5. Make test hierarchy
+    if clean == "make test" and failed.startswith("make test"):
+        return True
+
+    return False
 
 
 class DaemonLedger:
@@ -144,23 +205,31 @@ class DaemonLedger:
             index = last_record.get("index", 0) + 1
             prev_hash = last_record.get("hash", "0" * 64)
 
+        # Check for shell operator taint
+        is_tainted = False
+        if tool == "run_command" and is_tainted_shell_command(target):
+            is_tainted = True
+            error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
+            harness_status = "tainted_shell_operator"
+
         entry_data = {
             "conversationId": conversation_id,
             "stepIdx": step_idx,
             "tool": tool,
             "target": target,
             "observed_exit_code": observed_exit_code,
-            "harness_status": harness_status or ("no_error" if observed_exit_code == 0 else "error" if observed_exit_code is not None else None),
+            "harness_status": harness_status or ("no_error" if observed_exit_code == 0 and not is_tainted else "error" if observed_exit_code is not None or is_tainted else None),
             "error": error,
             "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
             "diff_stat": diff_stat[:200] if diff_stat else None,
-            "timestamp": timestamp or time.time()
+            "timestamp": timestamp or time.time(),
+            "tainted": is_tainted
         }
 
         canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
         record_hash = self._compute_hash(index, prev_hash, canonical_entry)
 
-        status_compat = "error" if error or (observed_exit_code is not None and observed_exit_code != 0) else "success"
+        status_compat = "error" if error or is_tainted or (observed_exit_code is not None and observed_exit_code != 0) else "success"
 
         record = {
             "index": index,
@@ -193,10 +262,7 @@ class DaemonLedger:
         }
 
     def verify_chain(self) -> Tuple[bool, int, str]:
-        """
-        Validates the entire HMAC hash chain from 0 to N-1.
-        Returns: (is_valid, records_checked, error_msg)
-        """
+        """Validates the entire HMAC hash chain from 0 to N-1."""
         if not os.path.exists(self.ledger_path):
             return True, 0, "EMPTY_LEDGER"
 
@@ -283,28 +349,27 @@ class DaemonLedger:
             exit_code = e.get("observed_exit_code")
             error = e.get("error")
             status = e.get("harness_status")
+            tainted = e.get("tainted", False)
 
             if tool == "run_command":
                 all_commands.append(e)
                 is_verif = is_verification_command(target)
                 if is_verif:
-                    verification_commands_count += 1
-                    failed = (exit_code is not None and exit_code != 0) or (error is not None)
+                    failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None)
                     if failed:
                         unresolved_failures[target] = {
                             "command": target,
                             "observed_exit_code": exit_code,
-                            "error": error,
+                            "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else None),
                             "stdout_tail": e.get("stdout_tail"),
                             "stepIdx": e.get("stepIdx")
                         }
                     else:
-                        if target in unresolved_failures:
-                            del unresolved_failures[target]
-                        base_cmd = target.split()[0]
+                        verification_commands_count += 1
+                        # Hierarchical resolution across test suites
                         resolved_keys = [
-                            k for k in unresolved_failures
-                            if k.startswith(base_cmd) and (target == base_cmd or target == f"{base_cmd} tests/" or target == f"{base_cmd} tests")
+                            k for k in list(unresolved_failures.keys())
+                            if can_suite_resolve_failure(target, k)
                         ]
                         for k in resolved_keys:
                             unresolved_failures.pop(k, None)
@@ -328,6 +393,8 @@ class DaemonLedger:
             for cmd, info in unresolved_failures.items():
                 ec = info.get("observed_exit_code")
                 ec_str = f"exit code {ec}" if ec is not None else "failed"
+                if info.get("error") and "TAINTED" in info.get("error"):
+                    ec_str = "TAINTED_OPERATOR"
                 tail = f" | Output: {info.get('stdout_tail')[:120]}" if info.get("stdout_tail") else ""
                 fails.append(f"FAILED: '{cmd}' ({ec_str}{tail})")
             premise_sections.append(f"UNRESOLVED TEST FAILURES (CRITICAL): {'; '.join(fails)}.")
@@ -340,7 +407,9 @@ class DaemonLedger:
                 ec = c.get("observed_exit_code")
                 st = c.get("harness_status")
                 err = c.get("error")
-                if ec == 0:
+                if c.get("tainted"):
+                    status_desc = "TAINTED (shell operator bypass rejected)"
+                elif ec == 0:
                     status_desc = "SUCCEEDED (exit 0)"
                 elif ec is not None:
                     status_desc = f"FAILED (exit {ec})"

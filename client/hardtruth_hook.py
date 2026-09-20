@@ -2,17 +2,20 @@
 """
 HardTruth: Autonomous Anti-Hallucination & Physical Truth Enforcement Engine
 Lifecycle Hook: PostToolUse & Stop
-Powered by DeBERTa-v3 Cross-Encoder & Cryptographically Chained Execution Ledger (http://127.0.0.1:8000)
+Powered by DeBERTa-v3 Cross-Encoder, Cryptographically Chained Execution Ledger & Tier 2 Hard Gate
 
 Enforces:
 1. Physical Ledger Integrity: HMAC-SHA256 chained, daemon-owned, failure-biased ledger.
-2. Real Exit Codes & Non-Synthesis: Extracts real exit codes from transcript; never synthesizes exit 0.
-3. Inverted Language-Independent Gate:
+2. Universal File Tracking: Runs git status --porcelain to catch all file edits (including sed, echo, patch).
+3. Shell Operator Defense: Rejects exit-code masking operators (; true, || exit 0).
+4. Real Exit Codes & Non-Synthesis: Anchored transcript parsing defeats stdout spoofing; never synthesizes exit 0.
+5. Inverted Language-Independent Gate:
    - AST Anti-Stubbing Linter on modified code -> HALT on stubs.
    - Rule 1: Source code modified without test execution -> HALT.
    - Rule 2: Unresolved test failures remain in ledger -> HALT.
    - Rule 4: Targeted DeBERTa-v3 NLI Claim Adjudication -> HALT if contradiction >= tau*.
-4. Hard Escalation Halt: Never fails open after 3 consecutive halts.
+6. Tier 2 External Hard Gate: Out-of-band test execution in clean environment before final approval.
+7. Hard Escalation Halt: Never fails open after 3 consecutive halts.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List, Tuple, Set
 
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _CURRENT_DIR not in sys.path:
@@ -44,14 +47,23 @@ except ImportError:
         from hardtruth.ast_checker import check_ast_stubs
 
 try:
-    from daemon.ledger import DaemonLedger, is_verification_command, classify_file
+    from daemon.ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
 except ImportError:
     try:
-        from ledger import DaemonLedger, is_verification_command, classify_file
+        from ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
     except ImportError:
         DaemonLedger = None
         is_verification_command = lambda cmd: False
+        is_tainted_shell_command = lambda cmd: False
         classify_file = lambda path: "other"
+
+try:
+    from daemon.tier2_runner import run_independent_verification
+except ImportError:
+    try:
+        from tier2_runner import run_independent_verification
+    except ImportError:
+        run_independent_verification = None
 
 CONTRADICTION_THRESHOLD = 0.70
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
@@ -102,12 +114,73 @@ def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0) -> Optio
         return None
 
 
+def get_workspace_dir(payload: dict) -> Optional[str]:
+    """Extracts first valid workspace path if provided."""
+    ws_paths = payload.get("workspacePaths", [])
+    if ws_paths and os.path.isdir(ws_paths[0]):
+        return ws_paths[0]
+    return None
+
+
+def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str], List[str]]:
+    """
+    Universal File Tracking: Runs git status --porcelain in workspace.
+    Detects ANY working tree modification (M, A, ??, R) regardless of tool used (sed, echo, patch).
+    Returns: (source_files, doc_files, full_file_paths)
+    """
+    source_files = set()
+    doc_files = set()
+    full_paths = []
+
+    if not workspace_dir or not os.path.exists(workspace_dir):
+        return source_files, doc_files, full_paths
+
+    try:
+        res = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=1.0,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                line_clean = line.strip()
+                if len(line_clean) < 3:
+                    continue
+                # Format: XY filename or XY orig -> filename
+                filepath_rel = line_clean[2:].strip()
+                if " -> " in filepath_rel:
+                    filepath_rel = filepath_rel.split(" -> ")[1].strip()
+
+                full_path = os.path.join(workspace_dir, filepath_rel)
+                full_paths.append(full_path)
+                ftype = classify_file(filepath_rel)
+                base = os.path.basename(filepath_rel)
+                if ftype == "source":
+                    source_files.add(base)
+                elif ftype == "doc":
+                    doc_files.add(base)
+    except Exception:
+        pass
+
+    return source_files, doc_files, full_paths
+
+
 def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 300) -> Tuple[Optional[int], Optional[str]]:
     """
     Polls transcript for up to max_wait_ms (50ms intervals) to extract observed exit code and stdout tail.
+    Anchored strictly to system-generated log header to eliminate stdout spoofing.
     """
     if not transcript_path or not os.path.exists(transcript_path):
         return None, None
+
+    # Anchored regex matching system header strictly
+    system_header_regex = re.compile(
+        r"^Created At: [^\n]+\nCompleted At: [^\n]+\n\nThe command exited with code (\d+)",
+        re.MULTILINE
+    )
 
     end_time = time.time() + (max_wait_ms / 1000.0)
     while True:
@@ -128,7 +201,11 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
                 for step in reversed(matching_lines):
                     if target_step_idx is not None and step.get("step_index") == target_step_idx:
                         content = step.get("content", "")
-                        exit_m = re.search(r"The command exited with code (\d+)", content)
+                        exit_m = system_header_regex.search(content)
+                        if not exit_m:
+                            # Fallback to secondary search only if Created At is verified
+                            if "Created At:" in content:
+                                exit_m = re.search(r"The command exited with code (\d+)", content)
                         exit_code = int(exit_m.group(1)) if exit_m else None
                         lines = content.splitlines()
                         tail = "\n".join(lines[-15:])[:1000] if lines else None
@@ -137,7 +214,9 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
                 if matching_lines:
                     last_step = matching_lines[-1]
                     content = last_step.get("content", "")
-                    exit_m = re.search(r"The command exited with code (\d+)", content)
+                    exit_m = system_header_regex.search(content)
+                    if not exit_m and "Created At:" in content:
+                        exit_m = re.search(r"The command exited with code (\d+)", content)
                     if exit_m:
                         exit_code = int(exit_m.group(1))
                         lines = content.splitlines()
@@ -185,8 +264,8 @@ def get_git_diff_stat(filepath: str) -> Optional[str]:
 def handle_post_tool_use(payload: dict) -> dict:
     """
     Records ground-truth tool execution facts with real exit codes and diff stats.
+    Neutralizes shell operator bypasses (; true, || exit 0).
     Non-synthesis rule: NEVER synthesizes 'exit 0' out of thin air.
-    Always records to local ledger file as well as daemon for high-availability & testing.
     """
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "unknown")
@@ -204,22 +283,29 @@ def handle_post_tool_use(payload: dict) -> dict:
 
     if tool_name == "run_command":
         cmd_or_file = tool_args.get("CommandLine", "")
-        ec, tail = poll_transcript_for_step(transcript_path, step_idx)
-        if ec is not None:
-            observed_exit_code = ec
-            stdout_tail = tail
-            harness_status = "no_error" if ec == 0 else f"exit_{ec}"
+
+        # Shell Operator Defense
+        if is_tainted_shell_command(cmd_or_file):
+            observed_exit_code = 1
+            harness_status = "tainted_shell_operator"
+            error_msg = f"TAINTED: Chained shell operators detected: {error_msg or ''}".strip()
         else:
-            if error_msg:
-                m = re.search(r"exit status (\d+)", str(error_msg))
-                if m:
-                    observed_exit_code = int(m.group(1))
-                    harness_status = f"exit_{observed_exit_code}"
-                else:
-                    harness_status = "error"
+            ec, tail = poll_transcript_for_step(transcript_path, step_idx)
+            if ec is not None:
+                observed_exit_code = ec
+                stdout_tail = tail
+                harness_status = "no_error" if ec == 0 else f"exit_{ec}"
             else:
-                observed_exit_code = None
-                harness_status = "no_error"
+                if error_msg:
+                    m = re.search(r"exit status (\d+)", str(error_msg))
+                    if m:
+                        observed_exit_code = int(m.group(1))
+                        harness_status = f"exit_{observed_exit_code}"
+                    else:
+                        harness_status = "error"
+                else:
+                    observed_exit_code = None
+                    harness_status = "no_error"
 
     elif tool_name in ["write_to_file", "replace_file_content"]:
         cmd_or_file = tool_args.get("TargetFile", "")
@@ -242,10 +328,8 @@ def handle_post_tool_use(payload: dict) -> dict:
         "diff_stat": diff_stat
     }
 
-    # Attempt POST to daemon
     call_system_one("v1/ledger/record", record_payload, timeout=2.0)
 
-    # Always ensure local ledger receives the record
     local_ledger = get_local_ledger()
     if local_ledger:
         try:
@@ -297,21 +381,16 @@ imperative_filter = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Stop: Pre-Termination Verification Gate
+# Stop: Pre-Termination Verification Gate (Hybrid Two-Tier)
 # ---------------------------------------------------------------------------
 
 def handle_stop(payload: dict) -> dict:
     """
-    Evaluates physical ledger state and agent claims.
-    Gate Inversion Policy:
-    1. Check Circuit Breaker / Escalation Policy (Never Fail Open).
-    2. AST Anti-Stubbing Linter -> HALT on stubs.
-    3. Rule 1: Source code modified without test execution -> HALT.
-    4. Rule 2: Unresolved test failures remain in ledger -> HALT.
-    5. Rule 4: Targeted DeBERTa-v3 NLI Claim Adjudication.
+    Evaluates physical ledger state, agent claims, and executes Tier 2 Hard Gate.
     """
     conv_id = payload.get("conversationId", "default")
     transcript_path = payload.get("transcriptPath", "")
+    workspace_dir = get_workspace_dir(payload)
 
     counter_file = get_halt_counter_file(conv_id)
     halt_count = 0
@@ -357,7 +436,7 @@ def handle_stop(payload: dict) -> dict:
     if not agent_text:
         return {"decision": "allow"}
 
-    # Fetch Ledger Premise: first check local ledger if isolated path specified, or query daemon
+    # Fetch Ledger Premise
     premise_data = None
     local_ledger = get_local_ledger()
     if os.environ.get("HARDTRUTH_LEDGER_PATH") and local_ledger:
@@ -401,15 +480,19 @@ def handle_stop(payload: dict) -> dict:
             "reason": f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden."
         }
 
-    source_files_modified = premise_data.get("source_files_modified", 0)
+    # Universal File Tracking (Git Porcelain)
+    git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir)
+    ledger_src_count = premise_data.get("source_files_modified", 0)
+    source_files_modified = max(ledger_src_count, len(git_src_files))
     verification_commands_executed = premise_data.get("verification_commands_executed", 0)
     unresolved_failures = premise_data.get("unresolved_failures", [])
     premise_str = premise_data.get("premise", "")
-    modified_files = premise_data.get("modified_files", [])
-    modified_paths = premise_data.get("modified_file_paths", []) or modified_files
+    modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
+    if git_paths:
+        modified_paths = list(set(modified_paths) | set(git_paths))
 
     # -----------------------------------------------------------------------
-    # Rule 3: AST Anti-Stubbing Linter on Modified Source Files (Check First)
+    # Rule 3: AST Anti-Stubbing Linter on Modified Source Files
     # -----------------------------------------------------------------------
     for fpath in modified_paths:
         if fpath.endswith(".py") and os.path.exists(fpath):
@@ -513,6 +596,34 @@ def handle_stop(payload: dict) -> dict:
                     "reason": f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing."
                 }
 
+    # -----------------------------------------------------------------------
+    # Tier 2: External Deterministic Hard Gate Handoff
+    # Only triggered if source files were modified or tests were executed
+    # -----------------------------------------------------------------------
+    if workspace_dir and (source_files_modified > 0 or verification_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+        tier2_result = call_system_one("v1/verify/handoff", {
+            "workspace_path": workspace_dir,
+            "conversationId": conv_id
+        }, timeout=65.0)
+
+        if not tier2_result and run_independent_verification:
+            # Fallback to in-process clean runner if daemon endpoint offline
+            try:
+                tier2_result = run_independent_verification(workspace_dir)
+            except Exception:
+                tier2_result = None
+
+        if tier2_result and not tier2_result.get("success"):
+            runner = tier2_result.get("runner", "external runner")
+            ec = tier2_result.get("exit_code")
+            out_tail = (tier2_result.get("output", "") or "")[:600]
+            record_halt(counter_file, halt_count + 1)
+            return {
+                "decision": "continue",
+                "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
+            }
+
+    # All tiers passed: reset counter file
     if os.path.exists(counter_file):
         try:
             os.remove(counter_file)
