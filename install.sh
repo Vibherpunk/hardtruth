@@ -20,6 +20,8 @@ chmod 700 "$HALTS_DIR"
 cp "$REPO_ROOT/client/ast_checker.py" "$HARDTRUTH_LIB/ast_checker.py"
 cp "$REPO_ROOT/client/hardtruth_client.py" "$HARDTRUTH_LIB/hardtruth_client.py"
 cp "$REPO_ROOT/client/hardtruth_hook.py" "$HARDTRUTH_LIB/hardtruth_hook.py"
+cp "$REPO_ROOT/daemon/ledger.py" "$HARDTRUTH_LIB/ledger.py"
+cp "$REPO_ROOT/daemon/tier2_runner.py" "$HARDTRUTH_LIB/tier2_runner.py"
 touch "$HARDTRUTH_LIB/__init__.py"
 echo "✓ HardTruth client library installed to $HARDTRUTH_LIB"
 
@@ -30,6 +32,8 @@ if [ -d "$HOME/.gemini" ]; then
     mkdir -p "$ANTIGRAVITY_CONFIG_DIR"
     cp "$REPO_ROOT/client/hardtruth_hook.py" "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
     cp "$REPO_ROOT/client/ast_checker.py" "$ANTIGRAVITY_CONFIG_DIR/ast_checker.py"
+    cp "$REPO_ROOT/daemon/ledger.py" "$ANTIGRAVITY_CONFIG_DIR/ledger.py"
+    cp "$REPO_ROOT/daemon/tier2_runner.py" "$ANTIGRAVITY_CONFIG_DIR/tier2_runner.py"
     chmod +x "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"
     
     cat > "$ANTIGRAVITY_CONFIG_DIR/hooks.json" << 'EOF'

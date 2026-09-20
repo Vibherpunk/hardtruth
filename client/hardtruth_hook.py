@@ -46,16 +46,19 @@ except ImportError:
     except ImportError:
         from hardtruth.ast_checker import check_ast_stubs
 
+_IMPORT_DEGRADED = None
 try:
-    from daemon.ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
+    from daemon.ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, classify_file
 except ImportError:
     try:
-        from ledger import DaemonLedger, is_verification_command, is_tainted_shell_command, classify_file
+        from ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, classify_file
     except ImportError:
         DaemonLedger = None
         is_verification_command = lambda cmd: False
+        is_test_execution_command = lambda cmd: False
         is_tainted_shell_command = lambda cmd: False
-        classify_file = lambda path: "other"
+        classify_file = lambda path, workspace_dir=None: "other"
+        _IMPORT_DEGRADED = "daemon.ledger module unavailable"
 
 try:
     from daemon.tier2_runner import run_independent_verification
@@ -201,6 +204,13 @@ def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0, session_
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        body = None
+        try:
+            body = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            pass
+        if e.code in (400, 406) and isinstance(body, dict):
+            return body
         if e.code == 401:
             sys.stderr.write("⚠️ HardTruth: daemon rejected request (401) — HARDTRUTH_API_TOKEN mismatch between hook and daemon.\n")
         elif e.code == 403:
@@ -213,10 +223,16 @@ def call_system_one(endpoint: str, payload: dict, timeout: float = 3.0, session_
 
 
 def get_workspace_dir(payload: dict) -> Optional[str]:
-    """Extracts first valid workspace path if provided."""
+    """Extracts first valid workspace path with robust fallbacks from payload."""
     ws_paths = payload.get("workspacePaths", [])
-    if ws_paths and os.path.isdir(ws_paths[0]):
-        return ws_paths[0]
+    if ws_paths:
+        for p in ws_paths:
+            if p and os.path.isdir(p):
+                return os.path.abspath(p)
+    for k in ["cwd", "workspace", "projectDir", "root"]:
+        v = payload.get(k)
+        if v and os.path.isdir(v):
+            return os.path.abspath(v)
     return None
 
 
@@ -364,7 +380,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     # 1. Uncommitted and untracked / ignored files in working tree (-uall for full recursion)
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain", "-uall", "--ignored=matching"],
+            ["git", "-c", "core.quotepath=false", "status", "--porcelain", "-uall", "--ignored=matching"],
             cwd=workspace_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -377,8 +393,12 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                 if len(line_clean) < 3:
                     continue
                 filepath_rel = line_clean[2:].strip()
+                if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
+                    filepath_rel = filepath_rel[1:-1]
                 if " -> " in filepath_rel:
                     filepath_rel = filepath_rel.split(" -> ")[1].strip()
+                    if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
+                        filepath_rel = filepath_rel[1:-1]
                 all_rel_paths.add(filepath_rel)
     except Exception:
         pass
@@ -389,7 +409,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
         if baseline_sha:
             try:
                 res_diff = subprocess.run(
-                    ["git", "diff", "--name-only", baseline_sha, "HEAD"],
+                    ["git", "-c", "core.quotepath=false", "diff", "--name-only", baseline_sha, "HEAD", "--"],
                     cwd=workspace_dir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -399,6 +419,8 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                 if res_diff.returncode == 0 and res_diff.stdout:
                     for line in res_diff.stdout.splitlines():
                         f = line.strip()
+                        if f.startswith('"') and f.endswith('"'):
+                            f = f[1:-1]
                         if f:
                             all_rel_paths.add(f)
             except Exception:
@@ -407,7 +429,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     # 3. Check for git index manipulation (assume-unchanged or skip-worktree)
     try:
         res_v = subprocess.run(
-            ["git", "ls-files", "-v"],
+            ["git", "-c", "core.quotepath=false", "ls-files", "-v"],
             cwd=workspace_dir,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -419,10 +441,12 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                 if len(line) >= 3:
                     tag = line[0]
                     fname = line[2:].strip()
+                    if fname.startswith('"') and fname.endswith('"'):
+                        fname = fname[1:-1]
                     if tag in ["h", "s", "S"]:
                         try:
                             cur_h = subprocess.run(
-                                ["git", "hash-object", fname],
+                                ["git", "hash-object", "--", fname],
                                 cwd=workspace_dir,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
@@ -430,7 +454,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                                 text=True
                             ).stdout.strip()
                             idx_out = subprocess.run(
-                                ["git", "ls-files", "-s", fname],
+                                ["git", "ls-files", "-s", "--", fname],
                                 cwd=workspace_dir,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
@@ -654,7 +678,7 @@ def handle_post_tool_use(payload: dict) -> dict:
             is_test_harness = (
                 payload.get("test_mode") is True
                 or os.environ.get("HARDTRUTH_TEST_HARNESS") == "1"
-                or bool(os.environ.get("HARDTRUTH_LEDGER_PATH"))
+                or bool(os.environ.get("PYTEST_CURRENT_TEST"))
             )
             raw_output = str(payload.get("toolOutput") or payload.get("result") or payload.get("output") or "")
             if error_msg:
@@ -667,17 +691,6 @@ def handle_post_tool_use(payload: dict) -> dict:
             elif payload.get("exitCode") is not None:
                 observed_exit_code = int(payload["exitCode"])
                 harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
-            elif raw_output:
-                m_ec = re.search(r"(?:exited with code|exit code|exit status)\s+(\d+)", raw_output, re.IGNORECASE)
-                if m_ec:
-                    observed_exit_code = int(m_ec.group(1))
-                    harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
-                elif is_test_harness:
-                    observed_exit_code = 0
-                    harness_status = "no_error"
-                else:
-                    observed_exit_code = None
-                    harness_status = "uncorroborated_execution"
             elif is_test_harness:
                 observed_exit_code = 0
                 harness_status = "no_error"
@@ -782,26 +795,33 @@ def handle_stop(payload: dict) -> dict:
         except Exception:
             halt_count = 0
 
-    # Escalation Policy: Strike 3+ triggers hard escalation halt (Never fails open)
-    if halt_count >= 3:
-        if os.environ.get("HARDTRUTH_CIRCUIT_BREAKER_LEGACY_ALLOW") == "1":
-            try:
-                os.remove(counter_file)
-            except Exception:
-                pass
-            return {
-                "decision": "allow",
-                "reason": "⚠️ HARDTRUTH CIRCUIT BREAKER RELEASE: Gate released after 3 consecutive halts to prevent infinite loop."
-            }
-        else:
+    def fail_halt(reason: str, remediable: bool = True) -> dict:
+        new_count = halt_count + 1 if remediable else halt_count
+        if remediable:
+            record_halt(counter_file, new_count)
+        if new_count >= 3:
             return {
                 "decision": "continue",
-                "reason": "🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached (3 consecutive halts). Automated release is disabled because HardTruth never fails open. Manual verification or human escalation required."
+                "reason": (
+                    f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
+                    "HardTruth never fails open. Manual verification or human escalation required.\n"
+                    f"To reset counter after remediation, remove: {counter_file}\n\n"
+                    f"Root Cause: {reason}"
+                )
             }
+        return {
+            "decision": "continue",
+            "reason": reason
+        }
 
-    # Extract agent's final text from transcript
+    if _IMPORT_DEGRADED:
+        return fail_halt(f"🚨 HARDTRUTH INTEGRITY ERROR: {_IMPORT_DEGRADED}. Install layout degraded, cannot verify truth safely. HardTruth fails closed.", remediable=False)
+
+    # Extract agent's final text from transcript (fail closed on unreadable transcript)
     agent_text = ""
-    if transcript_path and os.path.exists(transcript_path):
+    if transcript_path:
+        if not os.path.exists(transcript_path):
+            return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript path does not exist on disk: {transcript_path}", remediable=False)
         try:
             with open(transcript_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -811,8 +831,8 @@ def handle_stop(payload: dict) -> dict:
                             agent_text = d.get("content")
                     except Exception:
                         continue
-        except Exception:
-            pass
+        except Exception as e:
+            return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript is unreadable: {e}", remediable=False)
 
     # Fetch Ledger Premise
     premise_data = None
@@ -854,33 +874,48 @@ def handle_stop(payload: dict) -> dict:
             "doc_files_modified": 0,
             "modified_files": [],
             "verification_commands_executed": 0,
+            "test_commands_executed": 0,
             "unresolved_failures": []
         }
 
     # Check for Ledger Tamper
     if premise_data.get("tampered"):
-        record_halt(counter_file, halt_count + 1)
-        return {
-            "decision": "continue",
-            "reason": f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden."
-        }
+        return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden.", remediable=False)
 
     # Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
     git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
     ledger_src_count = premise_data.get("source_files_modified", 0)
     source_files_modified = max(ledger_src_count, len(git_src_files))
     verification_commands_executed = premise_data.get("verification_commands_executed", 0)
+    test_commands_executed = premise_data.get("test_commands_executed", 0)
+    last_source_mod_step = premise_data.get("last_source_mod_step", -1)
+    last_test_step = premise_data.get("last_test_step", -1)
     unresolved_failures = premise_data.get("unresolved_failures", [])
     premise_str = premise_data.get("premise", "")
     modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
     if git_paths:
         modified_paths = list(set(modified_paths) | set(git_paths))
 
+    # Evasion E4 Check: Git History Lineage (merge-base ancestor check)
+    if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+        baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
+        if baseline_sha:
+            try:
+                anc_res = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", baseline_sha, "HEAD"],
+                    cwd=workspace_dir,
+                    timeout=2.0
+                )
+                if anc_res.returncode != 0:
+                    return fail_halt(f"🚨 HARDTRUTH GATE HALTED (EVASION E4 DETECTED): Current HEAD is not a descendant of session baseline commit {baseline_sha[:10]}. Branch switching or history rewrites to hide changes are forbidden.")
+            except Exception:
+                pass
+
     # Evasion E1 Check: Git Stash Detection
     if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
         try:
             stash_res = subprocess.run(
-                ["git", "stash", "list"],
+                ["git", "stash", "list", "--format=%gd %ct"],
                 cwd=workspace_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -888,11 +923,21 @@ def handle_stop(payload: dict) -> dict:
                 text=True
             )
             if stash_res.returncode == 0 and stash_res.stdout.strip():
-                record_halt(counter_file, halt_count + 1)
-                return {
-                    "decision": "continue",
-                    "reason": "🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected at stop. Stashing changes to bypass dirty-tree verification is forbidden. Apply or drop the stash before completing."
-                }
+                session_start = premise_data.get("created_at", 0)
+                active_stash = False
+                for line in stash_res.stdout.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        stash_time = int(parts[1])
+                        if session_start <= 0 or stash_time >= (session_start - 5):
+                            active_stash = True
+                            break
+                    else:
+                        active_stash = True
+                        break
+
+                if active_stash:
+                    return fail_halt("🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected at stop. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed changes with 'git stash pop' and execute tests before completing.")
         except Exception:
             pass
 
@@ -903,35 +948,26 @@ def handle_stop(payload: dict) -> dict:
         if os.path.exists(fpath):
             stubs = check_ast_stubs(fpath)
             if stubs:
-                record_halt(counter_file, halt_count + 1)
-                return {
-                    "decision": "continue",
-                    "reason": f"🚨 HARDTRUTH ENGINE REJECTED: Unimplemented stub detected. {stubs[0]}"
-                }
+                return fail_halt(f"🚨 HARDTRUTH ENGINE REJECTED: Unimplemented stub detected. {stubs[0]}")
 
     # -----------------------------------------------------------------------
     # Rule 1: Source Code Changes Require Test Proof (Language-Independent)
     # -----------------------------------------------------------------------
-    if source_files_modified > 0 and verification_commands_executed == 0:
-        record_halt(counter_file, halt_count + 1)
-        return {
-            "decision": "continue",
-            "reason": "🚨 HARDTRUTH GATE HALTED: Source code files were modified in this conversation, but NO verification commands or test suites were executed. You must execute tests to verify your changes before stopping."
-        }
+    if source_files_modified > 0:
+        if test_commands_executed == 0:
+            return fail_halt("🚨 HARDTRUTH GATE HALTED: Source code files were modified in this conversation, but NO verification commands (tests) were executed. You must execute tests (e.g. pytest, npm test, cargo test, go test) to verify your changes before stopping.")
+        if last_source_mod_step > 0 and last_test_step > 0 and last_source_mod_step > last_test_step:
+            return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Source code was modified at step {last_source_mod_step} after the last test run at step {last_test_step}. You must re-run your test suite to verify the latest changes before stopping.")
 
     # -----------------------------------------------------------------------
     # Rule 2: Unresolved Verification Failures Forbid Termination (Language-Independent)
     # -----------------------------------------------------------------------
     if len(unresolved_failures) > 0:
-        record_halt(counter_file, halt_count + 1)
         fails_summary = "; ".join([
             f"'{u.get('command')}' (exit {u.get('observed_exit_code')})"
             for u in unresolved_failures
         ])
-        return {
-            "decision": "continue",
-            "reason": f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping."
-        }
+        return fail_halt(f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping.")
 
     # -----------------------------------------------------------------------
     # Rule 5: Test-Surface Monotonicity (Assertion Weakening / Skipping Defense)
@@ -949,21 +985,45 @@ def handle_stop(payload: dict) -> dict:
                     test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}")
                 elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", tcontent):
                     test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}")
+                elif re.search(r"\bexpect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", tcontent, re.IGNORECASE):
+                    test_weakening_violations.append(f"Tautological assertion ('expect(true).toBe(true)') found in {base_name}")
+                elif re.search(r"\bassert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", tcontent, re.IGNORECASE):
+                    test_weakening_violations.append(f"Tautological assertion ('assert.equal(true, true)') found in {base_name}")
+                elif re.search(r"\bassert!\s*\(\s*true\s*\)", tcontent):
+                    test_weakening_violations.append(f"Tautological assertion ('assert!(true)') found in {base_name}")
+                elif re.search(r"\bt\.(?:Skip|SkipNow|Skipf)\s*\(", tcontent):
+                    test_weakening_violations.append(f"Test skipping call ('t.Skip()') found in {base_name}")
+
+                # Assertion count comparison against git baseline blob
+                if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+                    baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
+                    if baseline_sha:
+                        rel_path = os.path.relpath(fpath, workspace_dir)
+                        proc_base = subprocess.run(
+                            ["git", "show", f"{baseline_sha}:{rel_path}"],
+                            cwd=workspace_dir,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            timeout=2.0,
+                            text=True
+                        )
+                        if proc_base.returncode == 0:
+                            base_content = proc_base.stdout
+                            base_asserts = len(re.findall(r"\b(?:assert|expect|self\.assert)\b", base_content))
+                            curr_asserts = len(re.findall(r"\b(?:assert|expect|self\.assert)\b", tcontent))
+                            if base_asserts >= 4 and curr_asserts < (base_asserts // 2):
+                                test_weakening_violations.append(f"Severe assertion deletion detected in {base_name} ({curr_asserts} assertions remaining vs {base_asserts} in baseline)")
             except Exception:
                 pass
 
     if test_weakening_violations:
-        record_halt(counter_file, halt_count + 1)
-        return {
-            "decision": "continue",
-            "reason": f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): {test_weakening_violations[0]}. Weakening test assertions or skipping tests to pass the gate is forbidden."
-        }
+        return fail_halt(f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): {test_weakening_violations[0]}. Weakening test assertions or skipping tests to pass the gate is forbidden.")
 
     # -----------------------------------------------------------------------
     # Tier 2: External Deterministic Hard Gate Handoff
     # Only triggered if source files were modified or tests were executed
     # -----------------------------------------------------------------------
-    if workspace_dir and (source_files_modified > 0 or verification_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+    if workspace_dir and (source_files_modified > 0 or test_commands_executed > 0):
         tier2_result = call_system_one("v1/verify/handoff", {
             "workspace_path": workspace_dir,
             "conversationId": conv_id
@@ -976,15 +1036,15 @@ def handle_stop(payload: dict) -> dict:
             except Exception:
                 tier2_result = None
 
-        if tier2_result and not tier2_result.get("success"):
+        if tier2_result is None:
+            # A6: Tier 2 produces no verdict -> HardTruth NEVER fails open
+            return fail_halt("🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier produced no verdict (daemon unreachable and in-process runner unavailable). HardTruth never fails open: code modifications require verified test execution.", remediable=False)
+
+        if not tier2_result.get("success"):
             runner = tier2_result.get("runner", "external runner")
             ec = tier2_result.get("exit_code")
             out_tail = (tier2_result.get("output", "") or "")[:600]
-            record_halt(counter_file, halt_count + 1)
-            return {
-                "decision": "continue",
-                "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
-            }
+            return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
     # If physical gates passed and no agent prose exists, allow stop
     if not agent_text:
@@ -998,26 +1058,37 @@ def handle_stop(payload: dict) -> dict:
     # -----------------------------------------------------------------------
     # Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
     # -----------------------------------------------------------------------
-    claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_-]+/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
+    claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
     for ref in claimed_file_refs:
         norm_ref = os.path.normpath(ref)
         if any(norm_ref.endswith(ext) for ext in SOURCE_CODE_EXTENSIONS):
             pattern = re.compile(
-                rf"\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^.!?\n]{{0,120}}?\b{re.escape(ref)}\b|"
-                rf"\b{re.escape(ref)}\b[^.!?\n]{{0,60}}?\b(?:is now|was|has been)\s+(?:created|written|implemented|modified|updated|edited|added|fixed|built|patched)\b",
+                rf"\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^\n.!?]{{0,120}}?\b{re.escape(ref)}\b|"
+                rf"\b{re.escape(ref)}\b[^\n.!?]{{0,120}}?\b(?:is now|was|has been|to add|to implement)\s+(?:created|written|implemented|modified|updated|edited|added|fixed|built|patched)\b|"
+                rf"(?:^|\n)\s*[-*]\s*(?:(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^\n]{{0,120}}?\b{re.escape(ref)}\b|\b{re.escape(ref)}\b[^\n]{{0,120}}?\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b)",
                 re.IGNORECASE
             )
             if pattern.search(agent_text):
                 is_modified = any(
-                    norm_ref == os.path.normpath(m) or norm_ref.endswith(os.path.normpath(m)) or os.path.normpath(m).endswith(norm_ref)
+                    norm_ref == os.path.normpath(m) or os.path.normpath(m).endswith(os.sep + norm_ref)
                     for m in modified_paths
                 )
-                if not is_modified:
-                    record_halt(counter_file, halt_count + 1)
-                    return {
-                        "decision": "continue",
-                        "reason": f"🚨 HARDTRUTH REJECTED (UNVERIFIED CLAIM): You claimed to have created or modified '{ref}', but git and the ledger show no modifications to this file in this session. Write and apply the code to disk before completing."
-                    }
+                has_real_content = False
+                if is_modified and workspace_dir:
+                    full_fpath = os.path.join(workspace_dir, norm_ref) if not os.path.isabs(norm_ref) else norm_ref
+                    if os.path.isfile(full_fpath):
+                        try:
+                            if os.path.getsize(full_fpath) > 0:
+                                has_real_content = True
+                        except Exception:
+                            has_real_content = True
+                    else:
+                        has_real_content = True
+                elif is_modified:
+                    has_real_content = True
+
+                if not is_modified or not has_real_content:
+                    return fail_halt(f"🚨 HARDTRUTH REJECTED (UNVERIFIED CLAIM): You claimed to have created or modified '{ref}', but git and the ledger show no non-trivial modifications to this file in this session. Write and apply the code to disk before completing.")
 
     # -----------------------------------------------------------------------
     # Rule 4B: Targeted DeBERTa-v3 NLI Claim Adjudication
@@ -1048,18 +1119,23 @@ def handle_stop(payload: dict) -> dict:
                     continue
             claims_to_verify.append(s_clean[:250])
 
-    claims_to_verify = claims_to_verify[:4]
+    # Prioritize completion and test outcome claims first (A15)
+    def claim_priority(c: str) -> int:
+        if re.search(r"\b(?:test|passed|failing|green|100%|suite|fixed)\b", c, re.IGNORECASE):
+            return 0
+        return 1
+    claims_to_verify.sort(key=claim_priority)
+    claims_to_verify = claims_to_verify[:8]
 
     has_test_pass_claim = any(
         re.search(r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing)\b", c, re.IGNORECASE)
         for c in claims_to_verify
     )
-    if has_test_pass_claim and verification_commands_executed == 0:
-        record_halt(counter_file, halt_count + 1)
-        return {
-            "decision": "continue",
-            "reason": "🚨 HARDTRUTH ENGINE HALTED: You claimed tests passed, but the execution ledger shows NO commands or test suites were run in this session. Execute the test command with run_command to prove it before completing."
-        }
+    if has_test_pass_claim:
+        if test_commands_executed == 0:
+            return fail_halt("🚨 HARDTRUTH ENGINE HALTED: You claimed tests passed, but the execution ledger shows NO commands or test suites were run in this session. Running linters does not count as running tests. Execute the test command with run_command to prove it before completing.")
+        if last_source_mod_step > 0 and last_test_step > 0 and last_source_mod_step > last_test_step:
+            return fail_halt(f"🚨 HARDTRUTH ENGINE HALTED: You claimed tests passed, but source code was modified at step {last_source_mod_step} after the last test run at step {last_test_step}. Re-run tests to prove they pass on the latest code.")
 
     for claim in claims_to_verify:
         nli_res = call_system_one("v1/verify-claim", {
@@ -1072,20 +1148,12 @@ def handle_stop(payload: dict) -> dict:
             probs = nli_res.get("probabilities", {})
             contradiction = probs.get("contradiction", 0.0)
             if contradiction >= CONTRADICTION_THRESHOLD:
-                record_halt(counter_file, halt_count + 1)
-                return {
-                    "decision": "continue",
-                    "reason": f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping."
-                }
+                return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
         else:
-            if verification_commands_executed > 0 and len(unresolved_failures) == 0:
+            if test_commands_executed > 0 and len(unresolved_failures) == 0:
                 pass
             else:
-                record_halt(counter_file, halt_count + 1)
-                return {
-                    "decision": "continue",
-                    "reason": f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing."
-                }
+                return fail_halt(f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing.", remediable=False)
 
     # All tiers passed: reset counter file and session key
     if os.path.exists(counter_file):
@@ -1125,10 +1193,16 @@ if __name__ == "__main__":
     except Exception:
         payload = {}
 
-    if mode in ["post_tool", "PostToolUse"]:
-        out = handle_post_tool_use(payload)
-    else:
-        out = handle_stop(payload)
+    try:
+        if mode in ["post_tool", "PostToolUse"]:
+            out = handle_post_tool_use(payload)
+        else:
+            out = handle_stop(payload)
+    except Exception as e:
+        out = {
+            "decision": "continue",
+            "reason": f"🚨 HARDTRUTH INTERNAL ERROR (FAIL-CLOSED): {e}. Termination forbidden."
+        }
 
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()

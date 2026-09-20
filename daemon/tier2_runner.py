@@ -13,6 +13,8 @@ import shutil
 import subprocess
 import re
 import hashlib
+import shlex
+import signal
 from typing import Optional, Dict, Any, Tuple, List
 
 
@@ -328,49 +330,48 @@ def run_independent_verification(
 
     # Manifest poisoning defense: reject agent-modified test definitions
     if is_tampered:
-        if "Makefile" in tampered_files:
-            makefile = os.path.join(workspace_path, "Makefile")
-            if os.path.exists(makefile):
-                try:
-                    with open(makefile, "r", errors="ignore") as f:
-                        if "test:" in f.read():
-                            return {
-                                "status": "tampered",
-                                "success": False,
-                                "exit_code": 1,
-                                "runner": "manifest_integrity_guard",
-                                "output": f"🚨 TIER 2 HARD GATE REJECTED: Test manifest 'Makefile' was modified during this session. Tier 2 refuses to execute agent-modified Makefile targets to prevent manifest poisoning.",
-                                "isolation": "manifest_tampering_check"
-                            }
-                except Exception:
-                    pass
+        manifest_list = ", ".join(sorted(list(tampered_files)))
+        return {
+            "status": "tampered",
+            "success": False,
+            "exit_code": 1,
+            "runner": "manifest_integrity_guard",
+            "output": f"🚨 TIER 2 HARD GATE REJECTED: Test manifest or configuration file(s) [{manifest_list}] were modified during this session. Tier 2 refuses to execute tests with agent-modified test configurations to prevent manifest poisoning.",
+            "isolation": "manifest_tampering_check"
+        }
 
-        if "package.json" in tampered_files:
-            package_json = os.path.join(workspace_path, "package.json")
-            if os.path.exists(package_json):
-                try:
-                    with open(package_json, "r", errors="ignore") as f:
-                        data = json.load(f)
-                        if "test" in data.get("scripts", {}):
-                            return {
-                                "status": "tampered",
-                                "success": False,
-                                "exit_code": 1,
-                                "runner": "manifest_integrity_guard",
-                                "output": f"🚨 TIER 2 HARD GATE REJECTED: Test manifest 'package.json' was modified during this session. Tier 2 refuses to execute agent-modified npm test scripts to prevent manifest poisoning.",
-                                "isolation": "manifest_tampering_check"
-                            }
-                except Exception:
-                    pass
-
-        if any("conftest" in f for f in tampered_files):
+    # Validate test_cmd against command injection if supplied externally
+    if test_cmd:
+        cmd_clean = test_cmd.strip()
+        if re.search(r"[;&|`$><\r\n]", cmd_clean):
             return {
-                "status": "tampered",
+                "status": "rejected_unsafe_command",
                 "success": False,
                 "exit_code": 1,
-                "runner": "manifest_integrity_guard",
-                "output": "🚨 TIER 2 HARD GATE REJECTED: Pytest fixture 'conftest.py' was created or modified during this session. Tier 2 refuses to execute agent-modified test fixtures to prevent hijacking.",
-                "isolation": "manifest_tampering_check"
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Disallowed shell metacharacters detected in requested test command: {test_cmd}",
+                "isolation": "input_validation"
+            }
+        parts = shlex.split(cmd_clean)
+        if not parts:
+            return {
+                "status": "rejected_empty_command",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": "🚨 TIER 2 HARD GATE REJECTED: Empty test command specified.",
+                "isolation": "input_validation"
+            }
+        base_bin = os.path.basename(parts[0]).lower()
+        allowed_bins = {"pytest", "python", "python3", "npm", "yarn", "bun", "cargo", "make", "go", "jest", "vitest", "tox", "ctest"}
+        if base_bin not in allowed_bins:
+            return {
+                "status": "rejected_unauthorized_runner",
+                "success": False,
+                "exit_code": 1,
+                "runner": "command_sanitizer",
+                "output": f"🚨 TIER 2 HARD GATE REJECTED: Command binary '{parts[0]}' is not an authorized test runner.",
+                "isolation": "input_validation"
             }
 
     canonical_runner = test_cmd or detect_test_runner(workspace_path, tampered_manifests=tampered_files)
@@ -406,23 +407,28 @@ def run_independent_verification(
     clean_env["CI"] = "true"
     clean_env["HARDTRUTH_TIER2_SANDBOX"] = "1"
 
-    actual_cmd = canonical_runner
-    if actual_cmd.startswith("pytest") and "-o cache_dir" not in actual_cmd:
-        actual_cmd = f"{actual_cmd} -o cache_dir=/tmp/.pytest_cache -p no:cacheprovider"
+    cmd_args = shlex.split(canonical_runner)
+    if cmd_args and cmd_args[0] == "pytest" and "-o" not in cmd_args:
+        cmd_args.extend(["-o", "cache_dir=/tmp/.pytest_cache", "-p", "no:cacheprovider"])
+
+    resolved_bin = shutil.which(cmd_args[0])
+    if resolved_bin:
+        cmd_args[0] = resolved_bin
 
     try:
-        proc = subprocess.run(
-            actual_cmd,
+        proc = subprocess.Popen(
+            cmd_args,
             cwd=workspace_path,
-            shell=True,
+            shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=clean_env,
-            timeout=timeout_sec,
-            text=True
+            text=True,
+            start_new_session=True
         )
+        stdout, _ = proc.communicate(timeout=timeout_sec)
         exit_code = proc.returncode
-        output = (proc.stdout or "").strip()
+        output = (stdout or "").strip()
 
         return {
             "status": "verified" if exit_code == 0 else "failed",
@@ -433,13 +439,18 @@ def run_independent_verification(
             "isolation": "clean_subprocess_sandbox"
         }
 
-    except subprocess.TimeoutExpired as te:
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+        stdout, _ = proc.communicate()
         return {
             "status": "timeout",
             "success": False,
             "exit_code": 124,
             "runner": canonical_runner,
-            "output": f"Tier 2 external test execution timed out after {timeout_sec}s.\n{(te.stdout or '')[:1000]}",
+            "output": f"Tier 2 external test execution timed out after {timeout_sec}s.\n{(stdout or '')[:1000]}",
             "isolation": "clean_subprocess_sandbox"
         }
     except Exception as e:

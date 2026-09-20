@@ -69,21 +69,42 @@ def validate_api_token(token: Optional[str]) -> bool:
     expected = get_daemon_api_token()
     return hmac.compare_digest(str(token), expected)
 
-# Matches verification commands even with leading env vars like CI=1 or PYTHONPATH=.
-VERIFICATION_CMD_PATTERN = re.compile(
-    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\w+)?|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint)\b",
-    re.IGNORECASE
-)
+def strip_shell_prefixes(cmd: str) -> str:
+    """Strips leading cd <dir> && and environment variable assignments."""
+    cmd_clean = (cmd or "").strip()
+    cd_match = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*&&\s*", cmd_clean)
+    if cd_match:
+        cmd_clean = cmd_clean[cd_match.end():].strip()
+    while True:
+        env_match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S+)\s+", cmd_clean)
+        if env_match:
+            cmd_clean = cmd_clean[env_match.end():].strip()
+        else:
+            break
+    return cmd_clean
 
-# Real test suite execution commands (excluding pure static linters)
-TEST_CMD_PATTERN = re.compile(
-    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\w+)?|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest)\b",
+
+# Canonical test runners anchored to command invocation start
+TEST_RUNNER_PREFIX_PATTERN = re.compile(
+    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest)\b",
     re.IGNORECASE
 )
 
 # Static code quality analyzers and linters
-STATIC_CHECK_PATTERN = re.compile(
-    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+STATIC_CHECK_PREFIX_PATTERN = re.compile(
+    r"^(?:ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    re.IGNORECASE
+)
+
+# Legacy aliases for backward compatibility where needed
+TEST_CMD_PATTERN = TEST_RUNNER_PREFIX_PATTERN
+VERIFICATION_CMD_PATTERN = re.compile(
+    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    re.IGNORECASE
+)
+
+VERIFICATION_ANYWHERE_PATTERN = re.compile(
+    r"(?:^|[\s;&|(\r\n])(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
     re.IGNORECASE
 )
 
@@ -94,7 +115,7 @@ SHELL_OPERATOR_MASK_PATTERN = re.compile(
 )
 
 EXPLORATORY_CMD_PATTERN = re.compile(
-    r"^(?:[A-Z_0-9]+=\S+\s+)*(cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(status|log|diff|branch|show))\b",
+    r"^(?:cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(?:status|log|diff|branch|show))\b",
     re.IGNORECASE
 )
 
@@ -113,19 +134,24 @@ DOC_EXTENSIONS = {
 
 
 def is_test_execution_command(cmd: str) -> bool:
-    """Returns True if the command executes a test runner (excluding linters)."""
-    cmd_clean = (cmd or "").strip()
+    """Returns True if the command executes a test runner (excluding linters and non-test commands)."""
+    cmd_clean = strip_shell_prefixes(cmd)
+    if not cmd_clean:
+        return False
     if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
         return False
-    return bool(TEST_CMD_PATTERN.search(cmd_clean))
+    return bool(TEST_RUNNER_PREFIX_PATTERN.search(cmd_clean))
 
 
 def is_verification_command(cmd: str) -> bool:
-    cmd_clean = (cmd or "").strip()
-    # Fake verification commands like pytest --version, pytest --help, pytest --fixtures, cargo test --help are NOT verification runs
+    """Returns True if the command executes tests or static analysis linters."""
+    cmd_clean = strip_shell_prefixes(cmd)
+    if not cmd_clean:
+        return False
+    # Fake verification commands like pytest --version, pytest --help, pytest --fixtures are NOT verification runs
     if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
         return False
-    return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
+    return bool(TEST_RUNNER_PREFIX_PATTERN.search(cmd_clean) or STATIC_CHECK_PREFIX_PATTERN.search(cmd_clean))
 
 
 DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
@@ -135,18 +161,24 @@ DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
 
 
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects verification commands chained with masking operators or dangerous env overrides (PATH=, LD_PRELOAD=)."""
-    cmd_clean = (cmd or "").strip()
-    # Permit exit-preserving leading cd <dir> && <cmd>
-    cd_match = re.match(r"^\s*cd\s+([^\s;&|]+)\s*&&\s*", cmd_clean)
-    if cd_match:
-        cmd_clean = cmd_clean[cd_match.end():].strip()
-
-    if VERIFICATION_CMD_PATTERN.search(cmd_clean):
+    """Detects verification commands chained with masking operators, subshells, conditionals, or dangerous env overrides."""
+    raw_cmd = (cmd or "").strip()
+    if not raw_cmd:
+        return False
+    if not VERIFICATION_ANYWHERE_PATTERN.search(raw_cmd):
+        return False
+    if DANGEROUS_ENV_OVERRIDE_PATTERN.search(raw_cmd):
+        return True
+    if "\n" in raw_cmd or "\r" in raw_cmd:
+        return True
+    if re.search(r"(?:^|[\s;&|])if\b", raw_cmd):
+        return True
+    cmd_clean = strip_shell_prefixes(raw_cmd)
+    if is_verification_command(cmd_clean):
         if SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean):
             return True
-        if DANGEROUS_ENV_OVERRIDE_PATTERN.search(cmd_clean):
-            return True
+    elif SHELL_OPERATOR_MASK_PATTERN.search(raw_cmd):
+        return True
     return False
 
 
@@ -204,6 +236,10 @@ def can_suite_resolve_failure(
     """
     clean = clean_cmd.strip()
     failed = failed_cmd.strip()
+
+    # Clean command MUST be an authentic test execution command (not a linter, echo, or script)
+    if not is_test_execution_command(clean):
+        return False
 
     # CWD check: different working directories cannot resolve each other
     if clean_cwd and failed_cwd:
@@ -727,6 +763,8 @@ class DaemonLedger:
         unresolved_failures: Dict[str, dict] = {}
         verification_commands_count = 0
         test_commands_count = 0
+        last_source_mod_step = -1
+        last_test_step = -1
         modified_source_files = set()
         modified_doc_files = set()
         modified_file_paths = set()
@@ -740,6 +778,7 @@ class DaemonLedger:
             error = e.get("error")
             status = e.get("harness_status")
             tainted = e.get("tainted", False)
+            step_idx = e.get("stepIdx", 0)
 
             if tool == "run_command":
                 all_commands.append(e)
@@ -753,7 +792,7 @@ class DaemonLedger:
                             "observed_exit_code": exit_code,
                             "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else "UNVERIFIED_TIMEOUT" if status == "unverified_timeout" else None),
                             "stdout_tail": e.get("stdout_tail"),
-                            "stepIdx": e.get("stepIdx"),
+                            "stepIdx": step_idx,
                             "cwd": e.get("cwd")
                         }
                     else:
@@ -762,6 +801,7 @@ class DaemonLedger:
                             verification_commands_count += 1
                             if is_test:
                                 test_commands_count += 1
+                                last_test_step = max(last_test_step, step_idx)
                             # Hierarchical resolution across test suites with CWD isolation
                             resolved_keys = [
                                 k for k in list(unresolved_failures.keys())
@@ -781,6 +821,7 @@ class DaemonLedger:
                 modified_file_paths.add(target)
                 if ftype == "source":
                     modified_source_files.add(base)
+                    last_source_mod_step = max(last_source_mod_step, step_idx)
                 elif ftype == "doc":
                     modified_doc_files.add(base)
                 if e.get("diff_stat"):
@@ -848,6 +889,8 @@ class DaemonLedger:
             "modified_file_paths": sorted(list(modified_file_paths)),
             "verification_commands_executed": verification_commands_count,
             "test_commands_executed": test_commands_count,
+            "last_source_mod_step": last_source_mod_step,
+            "last_test_step": last_test_step,
             "unresolved_failures": list(unresolved_failures.values()),
             "records_count": len(conv_records)
         }
