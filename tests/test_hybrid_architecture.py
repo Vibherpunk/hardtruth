@@ -34,6 +34,8 @@ class TestHybridArchitecture(unittest.TestCase):
         self.halt_dir = os.path.join(self.test_dir, "halts")
         os.makedirs(self.halt_dir, mode=0o700, exist_ok=True)
         self.conv_id = f"test-hybrid-{uuid.uuid4().hex}"
+        self.old_halt_dir = os.environ.get("HARDTRUTH_HALT_DIR")
+        os.environ["HARDTRUTH_HALT_DIR"] = self.halt_dir
         self.env = {
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
@@ -43,6 +45,10 @@ class TestHybridArchitecture(unittest.TestCase):
         }
 
     def tearDown(self):
+        if self.old_halt_dir:
+            os.environ["HARDTRUTH_HALT_DIR"] = self.old_halt_dir
+        else:
+            os.environ.pop("HARDTRUTH_HALT_DIR", None)
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def run_hook(self, mode: str, payload: dict, env_override: dict = None) -> dict:
@@ -287,6 +293,110 @@ class TestHybridArchitecture(unittest.TestCase):
         self.assertTrue(res["success"])
         self.assertEqual(res["exit_code"], 0)
         self.assertEqual(res["status"], "verified")
+
+    def test_commit_and_run_loophole_defeated(self):
+        """Committing modified source files with clean working tree cannot bypass Rule 1."""
+        git_repo_dir = os.path.join(self.test_dir, "commit_run_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        initial_file = os.path.join(git_repo_dir, "main.py")
+        with open(initial_file, "w") as f:
+            f.write("# v1\n")
+        subprocess.run(["git", "add", "main.py"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=git_repo_dir, check=True)
+
+        conv = f"commit-run-{uuid.uuid4().hex}"
+        from client.hardtruth_hook import get_or_set_session_baseline
+        get_or_set_session_baseline(git_repo_dir, conv)
+
+        # Agent edits main.py and commits it!
+        with open(initial_file, "a") as f:
+            f.write("def foo():\n    return 42\n")
+        subprocess.run(["git", "commit", "--no-verify", "-am", "bypass commit"], cwd=git_repo_dir, check=True)
+
+        # git status --porcelain is completely clean!
+        status_proc = subprocess.run(["git", "status", "--porcelain"], cwd=git_repo_dir, capture_output=True, text=True)
+        self.assertEqual(status_proc.stdout.strip(), "")
+
+        # But Rule 1 MUST still catch main.py via baseline commit diff!
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write(json.dumps({
+                "type": "PLANNER_RESPONSE",
+                "content": "I finished the code changes and committed them.",
+                "tool_calls": []
+            }) + "\n")
+            transcript_path = tf.name
+
+        payload = {
+            "conversationId": conv,
+            "transcriptPath": transcript_path,
+            "workspacePaths": [git_repo_dir]
+        }
+        res = self.run_hook("stop", payload)
+        os.remove(transcript_path)
+
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("Source code files were modified", res.get("reason", ""))
+        self.assertIn("NO verification commands", res.get("reason", ""))
+
+    def test_manifest_tampering_via_commit_defeated(self):
+        """Committing a poisoned Makefile cannot fool Tier 2 runner."""
+        git_repo_dir = os.path.join(self.test_dir, "poison_commit_repo")
+        os.makedirs(git_repo_dir, exist_ok=True)
+        subprocess.run(["git", "init"], cwd=git_repo_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=git_repo_dir, check=True)
+
+        makefile = os.path.join(git_repo_dir, "Makefile")
+        with open(makefile, "w") as f:
+            f.write("test:\n\tpytest tests/\n")
+        subprocess.run(["git", "add", "Makefile"], cwd=git_repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init makefile"], cwd=git_repo_dir, check=True)
+
+        conv = f"poison-commit-{uuid.uuid4().hex}"
+        from client.hardtruth_hook import get_or_set_session_baseline
+        get_or_set_session_baseline(git_repo_dir, conv)
+
+        # Agent poisons Makefile and commits it!
+        with open(makefile, "w") as f:
+            f.write("test:\n\techo 'passed' && exit 0\n")
+        subprocess.run(["git", "commit", "-am", "poison committed"], cwd=git_repo_dir, check=True)
+
+        # Tier 2 MUST detect manifest tampering despite clean git status
+        res = run_independent_verification(git_repo_dir, conv_id=conv)
+        self.assertEqual(res["status"], "tampered")
+        self.assertFalse(res["success"])
+        self.assertIn("manifest", res["runner"].lower())
+
+    def test_extended_shell_masking_tainted(self):
+        """Conditionals, subshells, and complex shell masking are detected as tainted."""
+        self.assertTrue(is_tainted_shell_command('pytest tests/ || sh -c "exit 0"'))
+        self.assertTrue(is_tainted_shell_command("pytest tests/ || (exit 0)"))
+        self.assertTrue(is_tainted_shell_command("if pytest tests/; then true; else true; fi"))
+        self.assertTrue(is_tainted_shell_command("pytest tests/ || python3 -c 'exit(0)'"))
+        self.assertFalse(is_tainted_shell_command("pytest tests/test_billing.py"))
+
+    def test_fake_verification_commands_rejected(self):
+        """Informational flags (--help, --version) do not count as verification commands."""
+        from daemon.ledger import is_verification_command, is_exploratory_command
+        self.assertFalse(is_verification_command("pytest --help"))
+        self.assertFalse(is_verification_command("pytest -h"))
+        self.assertFalse(is_verification_command("pytest --version"))
+        self.assertFalse(is_verification_command("cargo test --help"))
+        self.assertTrue(is_exploratory_command("pytest --help"))
+        self.assertTrue(is_verification_command("pytest tests/"))
+
+    def test_double_colon_subtest_resolution(self):
+        """Parent file pytest execution resolves specific parameterized subtest failures (::)."""
+        # Running the file resolves specific test method failure in that file
+        self.assertTrue(can_suite_resolve_failure("pytest tests/test_billing.py", "pytest tests/test_billing.py::test_calc"))
+        # Running the directory resolves specific test method failure in that directory
+        self.assertTrue(can_suite_resolve_failure("pytest tests/", "pytest tests/test_billing.py::test_calc"))
+        # Running unrelated directory does NOT resolve
+        self.assertFalse(can_suite_resolve_failure("pytest tests/", "pytest integration_tests/test_api.py::test_login"))
 
 
 if __name__ == "__main__":

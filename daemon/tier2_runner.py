@@ -11,20 +11,25 @@ import sys
 import json
 import shutil
 import subprocess
-from typing import Optional, Dict, Any
+import re
+import hashlib
+from typing import Optional, Dict, Any, Tuple, List
 
 
 MANIFEST_FILES = ["Makefile", "package.json", "pyproject.toml", "Cargo.toml", "setup.py", "pytest.ini"]
 
 
-def check_manifest_tampering(workspace_path: str) -> Tuple[bool, List[str]]:
+def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None) -> Tuple[bool, List[str]]:
     """
-    Detects if build/test manifests have uncommitted modifications or new untracked additions.
-    Prevents an agent from editing Makefile (e.g. test: exit 0) or package.json scripts to spoof Tier 2.
+    Detects if build/test manifests have uncommitted modifications OR were modified in commits during this session.
+    Prevents an agent from editing Makefile (e.g. test: exit 0) or package.json scripts and committing them to spoof Tier 2.
     """
     if not workspace_path or not os.path.exists(os.path.join(workspace_path, ".git")):
         return False, []
 
+    modified = set()
+
+    # 1. Check working tree for uncommitted manifest edits
     try:
         proc = subprocess.run(
             ["git", "status", "--porcelain", "--"] + MANIFEST_FILES,
@@ -35,18 +40,50 @@ def check_manifest_tampering(workspace_path: str) -> Tuple[bool, List[str]]:
             text=True
         )
         if proc.returncode == 0 and proc.stdout.strip():
-            modified = []
             for line in proc.stdout.splitlines():
                 line_s = line.strip()
                 if line_s:
                     fname = line_s[2:].strip()
                     if " -> " in fname:
                         fname = fname.split(" -> ")[1].strip()
-                    modified.append(fname)
-            if modified:
-                return True, modified
+                    modified.add(fname)
     except Exception:
         pass
+
+    # 2. Check committed modifications against session baseline commit
+    if conv_id:
+        halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
+        safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+        conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+        baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+        baseline_sha = None
+        if os.path.exists(baseline_file):
+            try:
+                with open(baseline_file, "r") as f:
+                    baseline_sha = json.load(f).get("baseline_sha")
+            except Exception:
+                pass
+
+        if baseline_sha:
+            try:
+                proc_diff = subprocess.run(
+                    ["git", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_FILES,
+                    cwd=workspace_path,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2.0,
+                    text=True
+                )
+                if proc_diff.returncode == 0 and proc_diff.stdout.strip():
+                    for line in proc_diff.stdout.splitlines():
+                        fname = line.strip()
+                        if fname:
+                            modified.add(fname)
+            except Exception:
+                pass
+
+    if modified:
+        return True, sorted(list(modified))
     return False, []
 
 
@@ -195,7 +232,8 @@ def run_container_verification(
 def run_independent_verification(
     workspace_path: str,
     test_cmd: Optional[str] = None,
-    timeout_sec: int = 60
+    timeout_sec: int = 60,
+    conv_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Executes the canonical test suite outside the agent context.
@@ -211,7 +249,7 @@ def run_independent_verification(
             "output": f"Workspace path does not exist: {workspace_path}"
         }
 
-    is_tampered, tampered_files = check_manifest_tampering(workspace_path)
+    is_tampered, tampered_files = check_manifest_tampering(workspace_path, conv_id=conv_id)
 
     # Manifest poisoning defense: reject agent-modified test definitions
     if is_tampered:

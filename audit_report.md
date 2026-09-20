@@ -98,10 +98,35 @@ An independent adversarial audit conducted by Opus subagent `f7b3bca5` on commit
 
 ---
 
-## 7. Verification Status
-All 39 tests passing cleanly in `tests/` across 4 test suites:
-- `tests/test_hybrid_architecture.py` (10 tests)
+---
+
+## 8. Independent Adversarial Audit (Round 3 — Commit `9e707c2`)
+
+An independent adversarial audit conducted by Opus subagent `a54bc490` on commit `9e707c2` identified 5 additional bypasses and edge cases:
+
+1. **The "Commit & Run" Loophole (CRITICAL):**
+   - *Vulnerability:* `git status --porcelain` only tracks uncommitted working tree modifications. An agent could modify source files via `run_command` (`sed`, `echo`, `patch`) and immediately run `git commit`, resetting `git status` to clean and bypassing Rule 1 and Rule 3.
+   - *Mitigation:* Added session baseline commit tracking (`get_or_set_session_baseline`). `get_git_modified_source_files` now inspects both `git status --porcelain` and `git diff --name-only <baseline_sha> HEAD` across the entire session lifecycle.
+2. **Manifest Poisoning via Commit (CRITICAL):**
+   - *Vulnerability:* `check_manifest_tampering` only checked `git status --porcelain`. An agent could commit a tampered `Makefile` or `package.json` (`test: exit 0`) before Tier 2 handoff to execute a poisoned test suite.
+   - *Mitigation:* `check_manifest_tampering` now also checks `git diff --name-only <baseline_sha> HEAD` against the session baseline. Any manifest modified in uncommitted or committed states triggers `status: "tampered"`.
+3. **Shell Masking Operator Blindspots (HIGH):**
+   - *Vulnerability:* Subshell execution (`pytest || (exit 0)`), background execution (`pytest &`), conditionals (`if pytest; then true; fi`), and `eval`/`exec` escaped the simple shell regex.
+   - *Mitigation:* Implemented comprehensive regex `(?:\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))` to taint any verification command containing compound shell constructs, backgrounding, or subshells.
+4. **Fake Informational Verification Commands (HIGH):**
+   - *Vulnerability:* Informational commands like `pytest --help`, `pytest --version`, and `cargo test --help` exit 0 without executing any tests, satisfying Rule 1 without validating modified source code.
+   - *Mitigation:* Added negative flag checks using non-word-boundary whitespace matching `(?:^|\s)(?:--help|-h|--version|-V|--collect-only)(?:\s|$)` in `is_verification_command` to reject informational flag invocations from verification classification.
+5. **`::` Subtest Specification Resolution Bug (MEDIUM):**
+   - *Vulnerability:* Targeted test specifications (`pytest tests/test_billing.py::test_calc`) failed hierarchical suite resolution when the parent file (`pytest tests/test_billing.py`) or folder (`pytest tests/`) was executed, due to directory normalization appending slashes to subtest selectors.
+   - *Mitigation:* Stripped `::` test function selectors (`raw.split("::")[0]`) prior to path normalization in `can_suite_resolve_failure`.
+
+---
+
+## 9. Verification Status
+All 44 tests passing cleanly in `tests/` across 4 test suites:
+- `tests/test_hybrid_architecture.py` (15 tests)
 - `tests/test_inverted_gate.py` (6 tests)
 - `tests/test_daemon_ledger.py` (7 tests)
 - `tests/test_live.py` (16 tests)
+
 

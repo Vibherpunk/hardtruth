@@ -212,7 +212,8 @@ def verify_handoff(req: HandoffVerifyRequest):
     result = run_independent_verification(
         workspace_path=req.workspace_path,
         test_cmd=req.test_command,
-        timeout_sec=req.timeout_sec or 60
+        timeout_sec=req.timeout_sec or 60,
+        conv_id=req.conversationId
     )
     if not result.get("success"):
         return JSONResponse(status_code=406, content=result)

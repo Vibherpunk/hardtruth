@@ -23,9 +23,9 @@ VERIFICATION_CMD_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Chained shell operators that mask exit codes (; true, || exit 0, or pipes like | cat, | tee)
+# Chained shell operators, pipes, subshells, or conditionals that mask exit codes
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
-    r"(?:;\s*(?:true|exit\b|echo\b|:)|\|\|\s*(?:true|exit\b|echo\b|:)|&&\s*(?:true|exit\s+0|:)|\|(?!=)\s*[a-zA-Z0-9_.-]+)",
+    r"(?:\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))",
     re.IGNORECASE
 )
 
@@ -50,19 +50,24 @@ DOC_EXTENSIONS = {
 
 def is_verification_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
+    # Fake verification commands like pytest --version, pytest --help, cargo test --help are NOT verification runs
+    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only)(?:\s|$)", cmd_clean):
+        return False
     return bool(VERIFICATION_CMD_PATTERN.search(cmd_clean))
 
 
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects verification commands chained with masking operators like ; true, || exit 0, or | cat."""
+    """Detects verification commands chained with masking operators or conditionals (||, ;, &&, |, if, subshells)."""
     cmd_clean = (cmd or "").strip()
-    if is_verification_command(cmd_clean):
+    if VERIFICATION_CMD_PATTERN.search(cmd_clean):
         return bool(SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean))
     return False
 
 
 def is_exploratory_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
+    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only)(?:\s|$)", cmd_clean):
+        return True
     return bool(EXPLORATORY_CMD_PATTERN.search(cmd_clean))
 
 
@@ -109,6 +114,7 @@ def can_suite_resolve_failure(
     Guarantees:
     - Same working directory (CWD-aware)
     - Strict path encompassment (tests/ does NOT resolve integration_tests/)
+    - Subtest/parameterized resolution (tests/test_foo.py resolves tests/test_foo.py::test_bar)
     """
     clean = clean_cmd.strip()
     failed = failed_cmd.strip()
@@ -127,14 +133,25 @@ def can_suite_resolve_failure(
         if failed.startswith("pytest") or "unittest" in failed:
             return True
 
-    # Check scoped pytest e.g. pytest tests/ vs pytest integration_tests/
+    # Check scoped pytest e.g. pytest tests/ vs pytest integration_tests/, or pytest tests/test_billing.py::test_calc
     m_clean = re.match(r"^pytest\s+([^\s\-]+)", clean)
     m_failed = re.match(r"^pytest\s+([^\s\-]+)", failed)
     if m_clean and m_failed:
-        clean_target = os.path.normpath(m_clean.group(1).rstrip("/"))
-        failed_target = os.path.normpath(m_failed.group(1).rstrip("/"))
-        # Clean target must be an ancestor directory or exact match of failed target
-        if failed_target == clean_target or failed_target.startswith(clean_target + os.sep):
+        raw_clean_target = m_clean.group(1).rstrip("/")
+        raw_failed_target = m_failed.group(1).rstrip("/")
+
+        # Strip :: test function specifiers (e.g. tests/test_billing.py::test_calc -> tests/test_billing.py)
+        clean_file = raw_clean_target.split("::")[0]
+        failed_file = raw_failed_target.split("::")[0]
+
+        clean_norm = os.path.normpath(clean_file)
+        failed_norm = os.path.normpath(failed_file)
+
+        # 1. Exact match or same test file
+        if failed_norm == clean_norm:
+            return True
+        # 2. Parent directory encompassment
+        if failed_norm.startswith(clean_norm + os.sep):
             return True
         return False
     elif m_clean and not m_failed:

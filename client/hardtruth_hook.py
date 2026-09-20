@@ -125,19 +125,64 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
 IGNORED_BUILD_DIRS = {".git", ".pytest_cache", "__pycache__", "node_modules", "target", ".venv", "venv", ".tox", ".mypy_cache"}
 
 
-def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str], List[str]]:
+def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
     """
-    Universal File Tracking: Runs git status --porcelain --ignored=matching in workspace.
-    Detects ANY working tree modification (M, A, ??, R, !!) regardless of tool used (sed, echo, patch).
+    Records and returns the git commit SHA at the start of the session.
+    Enables universal file tracking across git commits (defeating the 'commit & run' loophole).
+    """
+    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+        return None
+
+    halt_dir = get_halt_counter_dir()
+    os.makedirs(halt_dir, mode=0o700, exist_ok=True)
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+
+    if os.path.exists(baseline_file):
+        try:
+            with open(baseline_file, "r") as f:
+                data = json.load(f)
+                return data.get("baseline_sha")
+        except Exception:
+            pass
+
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=2.0,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            sha = res.stdout.strip()
+            with open(baseline_file, "w") as f:
+                json.dump({"baseline_sha": sha, "created_at": time.time()}, f)
+            return sha
+    except Exception:
+        pass
+
+    return None
+
+
+def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = None) -> Tuple[Set[str], Set[str], List[str]]:
+    """
+    Universal File Tracking:
+    1. Checks working tree modifications (M, A, ??, R, !!) via git status --porcelain --ignored=matching.
+    2. Checks committed modifications made during this session via git diff --name-only <baseline_sha> HEAD.
+    Defeats the 'commit & run' evasion loophole completely.
     Returns: (source_files, doc_files, full_file_paths)
     """
     source_files = set()
     doc_files = set()
-    full_paths = []
+    all_rel_paths = set()
 
     if not workspace_dir or not os.path.exists(workspace_dir):
-        return source_files, doc_files, full_paths
+        return source_files, doc_files, []
 
+    # 1. Uncommitted and untracked / ignored files in working tree
     try:
         res = subprocess.run(
             ["git", "status", "--porcelain", "--ignored=matching"],
@@ -152,26 +197,49 @@ def get_git_modified_source_files(workspace_dir: str) -> Tuple[Set[str], Set[str
                 line_clean = line.strip()
                 if len(line_clean) < 3:
                     continue
-                # Format: XY filename or XY orig -> filename
                 filepath_rel = line_clean[2:].strip()
                 if " -> " in filepath_rel:
                     filepath_rel = filepath_rel.split(" -> ")[1].strip()
-
-                # Filter out internal cache/build directories
-                parts = set(os.path.normpath(filepath_rel).split(os.sep))
-                if parts & IGNORED_BUILD_DIRS:
-                    continue
-
-                full_path = os.path.join(workspace_dir, filepath_rel)
-                full_paths.append(full_path)
-                ftype = classify_file(filepath_rel, workspace_dir=workspace_dir)
-                base = os.path.basename(filepath_rel)
-                if ftype == "source":
-                    source_files.add(base)
-                elif ftype == "doc":
-                    doc_files.add(base)
+                all_rel_paths.add(filepath_rel)
     except Exception:
         pass
+
+    # 2. Committed files since session baseline
+    if conv_id:
+        baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
+        if baseline_sha:
+            try:
+                res_diff = subprocess.run(
+                    ["git", "diff", "--name-only", baseline_sha, "HEAD"],
+                    cwd=workspace_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2.0,
+                    text=True
+                )
+                if res_diff.returncode == 0 and res_diff.stdout:
+                    for line in res_diff.stdout.splitlines():
+                        f = line.strip()
+                        if f:
+                            all_rel_paths.add(f)
+            except Exception:
+                pass
+
+    # Classify all discovered files
+    full_paths = []
+    for filepath_rel in all_rel_paths:
+        parts = set(os.path.normpath(filepath_rel).split(os.sep))
+        if parts & IGNORED_BUILD_DIRS:
+            continue
+
+        full_path = os.path.join(workspace_dir, filepath_rel)
+        full_paths.append(full_path)
+        ftype = classify_file(filepath_rel, workspace_dir=workspace_dir)
+        base = os.path.basename(filepath_rel)
+        if ftype == "source":
+            source_files.add(base)
+        elif ftype == "doc":
+            doc_files.add(base)
 
     return source_files, doc_files, full_paths
 
@@ -283,6 +351,8 @@ def handle_post_tool_use(payload: dict) -> dict:
     diff_stat = None
     harness_status = None
     tool_cwd = tool_args.get("Cwd") or os.getcwd()
+    if tool_cwd and conv_id != "unknown":
+        get_or_set_session_baseline(tool_cwd, conv_id)
 
     if tool_name == "run_command":
         cmd_or_file = tool_args.get("CommandLine", "")
@@ -500,8 +570,8 @@ def handle_stop(payload: dict) -> dict:
             "reason": f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden."
         }
 
-    # Universal File Tracking (Git Porcelain)
-    git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir)
+    # Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
+    git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
     ledger_src_count = premise_data.get("source_files_modified", 0)
     source_files_modified = max(ledger_src_count, len(git_src_files))
     verification_commands_executed = premise_data.get("verification_commands_executed", 0)
@@ -629,7 +699,7 @@ def handle_stop(payload: dict) -> dict:
         if not tier2_result and run_independent_verification:
             # Fallback to in-process clean runner if daemon endpoint offline
             try:
-                tier2_result = run_independent_verification(workspace_dir)
+                tier2_result = run_independent_verification(workspace_dir, conv_id=conv_id)
             except Exception:
                 tier2_result = None
 
