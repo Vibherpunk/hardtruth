@@ -1,14 +1,17 @@
 """
-HardTruth AST Stub Detection Engine
-Deterministic analysis of Python ASTs to detect vacuous stubs (pass, NotImplementedError, dummy returns),
-while suppressing false positives on abstract methods, protocols, and overloads.
+HardTruth Polyglot Anti-Stubbing Engine (Rule 3)
+Deterministic analysis of source code to detect vacuous stubs (pass, NotImplementedError, dummy returns, TODOs),
+while suppressing false positives on abstract methods, protocols, overloads, and exception class bodies.
+Supports Python (.py), TypeScript/JavaScript (.ts, .tsx, .js, .jsx), Rust (.rs), and Go (.go).
 """
 
+from __future__ import annotations
 import ast
 import os
-from typing import List
+import re
+from typing import List, Optional, Set
 
-class StubVisitor(ast.NodeVisitor):
+class PythonStubVisitor(ast.NodeVisitor):
     def __init__(self, filename: str):
         self.filename = os.path.basename(filename)
         self.violations: List[str] = []
@@ -24,7 +27,6 @@ class StubVisitor(ast.NodeVisitor):
             return False
         cls = self._class_stack[-1]
         for base in cls.bases:
-            # Check Protocol or typing.Protocol or Protocol[T]
             if isinstance(base, ast.Name) and base.id == "Protocol":
                 return True
             elif isinstance(base, ast.Attribute) and base.attr == "Protocol":
@@ -35,6 +37,17 @@ class StubVisitor(ast.NodeVisitor):
                     return True
                 elif isinstance(val, ast.Attribute) and val.attr == "Protocol":
                     return True
+        return False
+
+    def _is_enclosing_class_exception(self) -> bool:
+        if not self._class_stack:
+            return False
+        cls = self._class_stack[-1]
+        for base in cls.bases:
+            if isinstance(base, ast.Name) and ("Error" in base.id or "Exception" in base.id):
+                return True
+            elif isinstance(base, ast.Attribute) and ("Error" in base.attr or "Exception" in base.attr):
+                return True
         return False
 
     def _is_exempt_decorator(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -87,8 +100,10 @@ class StubVisitor(ast.NodeVisitor):
 
         # 1. pass
         if isinstance(stmt, ast.Pass):
-            is_stub = True
-            stub_type = "pass"
+            # Exempt pass if inside an Exception class
+            if not self._is_enclosing_class_exception():
+                is_stub = True
+                stub_type = "pass"
 
         # 2. raise NotImplementedError / raise NotImplementedError(...)
         elif isinstance(stmt, ast.Raise):
@@ -133,19 +148,85 @@ class StubVisitor(ast.NodeVisitor):
                 f"Function '{node.name}' in {self.filename} is an empty stub ({stub_type}). Write actual working implementation before completing."
             )
 
-def check_ast_stubs(filepath: str) -> List[str]:
+
+def check_ast_stubs(filepath: str, modified_lines: Optional[Set[int]] = None) -> List[str]:
     """
-    Deterministic AST check: rejects empty stubs (pass, NotImplementedError, Ellipsis, return True/None).
-    Suppresses legitimate stubs in Protocol classes, @abstractmethod, and @overload.
+    Polyglot stub detector:
+    - Python: Rejects empty stubs (pass, NotImplementedError, Ellipsis, return True/None).
+              Surfaces syntax errors rather than silently swallowing them.
+    - TypeScript/JavaScript: Rejects 'throw new Error("Not implemented")', TODO markers in empty functions.
+    - Rust: Rejects todo!(), unimplemented!(), panic!("not implemented").
+    - Go: Rejects panic("not implemented"), panic("TODO").
     """
-    if not os.path.exists(filepath) or not filepath.endswith(".py"):
+    if not os.path.exists(filepath):
         return []
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        tree = ast.parse(content, filename=filepath)
-        visitor = StubVisitor(filepath)
-        visitor.visit(tree)
-        return visitor.violations
-    except Exception:
-        return []
+
+    ext = os.path.splitext(filepath)[1].lower()
+    base = os.path.basename(filepath)
+
+    # 1. Python analysis
+    if ext == ".py":
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            tree = ast.parse(content, filename=filepath)
+            visitor = PythonStubVisitor(filepath)
+            visitor.visit(tree)
+            return visitor.violations
+        except SyntaxError as se:
+            return [f"Syntax error in {base} line {se.lineno}: {se.msg}. Fix syntax errors before completing."]
+        except Exception:
+            return []
+
+    # 2. TypeScript / JavaScript analysis (.ts, .tsx, .js, .jsx)
+    elif ext in [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]:
+        violations = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for idx, line in enumerate(lines, 1):
+                if modified_lines and idx not in modified_lines:
+                    continue
+                # Check for explicit unimplemented throws
+                if re.search(r"throw\s+new\s+Error\s*\(\s*['\"](?:not implemented|todo|unimplemented)['\"]", line, re.IGNORECASE):
+                    violations.append(f"Unimplemented throw detected in {base} line {idx}. Write actual implementation before completing.")
+                # Check for TODO stubs in functions
+                elif re.search(r"//\s*TODO:?\s*(?:implement|add logic|fill in|stub)", line, re.IGNORECASE):
+                    violations.append(f"Unimplemented TODO stub detected in {base} line {idx}. Complete implementation before stopping.")
+            return violations
+        except Exception:
+            return []
+
+    # 3. Rust analysis (.rs)
+    elif ext == ".rs":
+        violations = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for idx, line in enumerate(lines, 1):
+                if modified_lines and idx not in modified_lines:
+                    continue
+                if re.search(r"\b(todo!|unimplemented!)\s*\(", line):
+                    violations.append(f"Rust macro '{re.search(r'(todo!|unimplemented!)', line).group(1)}' detected in {base} line {idx}. Implement real logic before completing.")
+                elif re.search(r'panic!\s*\(\s*["\'](?:not implemented|todo)["\']', line, re.IGNORECASE):
+                    violations.append(f"Unimplemented panic detected in {base} line {idx}. Implement real logic before completing.")
+            return violations
+        except Exception:
+            return []
+
+    # 4. Go analysis (.go)
+    elif ext == ".go":
+        violations = []
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for idx, line in enumerate(lines, 1):
+                if modified_lines and idx not in modified_lines:
+                    continue
+                if re.search(r'panic\s*\(\s*["\'](?:not implemented|TODO)["\']', line, re.IGNORECASE):
+                    violations.append(f"Unimplemented Go panic detected in {base} line {idx}. Implement real logic before completing.")
+            return violations
+        except Exception:
+            return []
+
+    return []

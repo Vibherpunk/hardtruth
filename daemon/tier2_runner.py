@@ -250,6 +250,10 @@ def run_container_verification(
     docker_args = [
         docker_bin, "run", "--rm",
         "--network", "none",
+        "--security-opt", "no-new-privileges",
+        "--cap-drop", "ALL",
+        "--pids-limit", "256",
+        "--memory", "1024m",
         "-v", f"{os.path.abspath(workspace_path)}:/workspace:ro",
         "-w", "/workspace",
         "--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
@@ -387,11 +391,17 @@ def run_independent_verification(
             return container_res
 
     # 2. Clean Subprocess Sandbox Execution (Clean Environment Boundary)
-    clean_env = os.environ.copy()
-    clean_env.pop("HARDTRUTH_LEDGER_PATH", None)
-    clean_env.pop("HARDTRUTH_DAEMON_LEDGER", None)
-    clean_env.pop("HARDTRUTH_HALT_DIR", None)
-    clean_env.pop("HARDTRUTH_CIRCUIT_BREAKER_LEGACY_ALLOW", None)
+    # Construct clean_env from an explicit allowlist to prevent leaking daemon HMAC keys, API tokens, or ledger paths
+    allowed_env_keys = {
+        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TERM", "USER", "SHELL", "PWD",
+        "VIRTUAL_ENV", "CONDA_PREFIX", "NODE_PATH", "PYTHONPATH", "CARGO_HOME", "RUSTUP_HOME",
+        "GOPATH", "GOROOT", "JAVA_HOME"
+    }
+    clean_env = {k: v for k, v in os.environ.items() if k in allowed_env_keys}
+    # Explicitly ensure NO HARDTRUTH variables or daemon keys leak into test subprocess
+    for k in list(clean_env.keys()):
+        if k.startswith("HARDTRUTH_"):
+            clean_env.pop(k, None)
     clean_env["PYTHONUNBUFFERED"] = "1"
     clean_env["CI"] = "true"
     clean_env["HARDTRUTH_TIER2_SANDBOX"] = "1"

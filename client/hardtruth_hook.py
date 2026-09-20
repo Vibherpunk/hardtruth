@@ -68,6 +68,13 @@ except ImportError:
 CONTRADICTION_THRESHOLD = 0.70
 SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
 
+SOURCE_CODE_EXTENSIONS = {
+    ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
+    ".cc", ".cxx", ".h", ".hpp", ".java", ".rb", ".sh", ".bash",
+    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig",
+    ".mjs", ".cjs"
+}
+
 
 def get_api_token() -> Optional[str]:
     """Returns the shared HardTruth API token: HARDTRUTH_API_TOKEN env, then key file."""
@@ -643,7 +650,13 @@ def handle_post_tool_use(payload: dict) -> dict:
                     observed_exit_code = None
                     harness_status = "unverified_timeout"
         else:
-            # Fallback when transcript path not attached (e.g. test harnesses / unit tests)
+            # Fallback when transcript path not attached (e.g. test harnesses / unit tests / direct payloads)
+            is_test_harness = (
+                payload.get("test_mode") is True
+                or os.environ.get("HARDTRUTH_TEST_HARNESS") == "1"
+                or bool(os.environ.get("HARDTRUTH_LEDGER_PATH"))
+            )
+            raw_output = str(payload.get("toolOutput") or payload.get("result") or payload.get("output") or "")
             if error_msg:
                 m = re.search(r"exit status (\d+)", str(error_msg))
                 if m:
@@ -651,9 +664,26 @@ def handle_post_tool_use(payload: dict) -> dict:
                     harness_status = f"exit_{observed_exit_code}"
                 else:
                     harness_status = "error"
-            else:
+            elif payload.get("exitCode") is not None:
+                observed_exit_code = int(payload["exitCode"])
+                harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
+            elif raw_output:
+                m_ec = re.search(r"(?:exited with code|exit code|exit status)\s+(\d+)", raw_output, re.IGNORECASE)
+                if m_ec:
+                    observed_exit_code = int(m_ec.group(1))
+                    harness_status = "no_error" if observed_exit_code == 0 else f"exit_{observed_exit_code}"
+                elif is_test_harness:
+                    observed_exit_code = 0
+                    harness_status = "no_error"
+                else:
+                    observed_exit_code = None
+                    harness_status = "uncorroborated_execution"
+            elif is_test_harness:
                 observed_exit_code = 0
                 harness_status = "no_error"
+            else:
+                observed_exit_code = None
+                harness_status = "uncorroborated_execution"
 
     elif tool_name in ["write_to_file", "replace_file_content"]:
         cmd_or_file = tool_args.get("TargetFile", "")
@@ -784,9 +814,6 @@ def handle_stop(payload: dict) -> dict:
         except Exception:
             pass
 
-    if not agent_text:
-        return {"decision": "allow"}
-
     # Fetch Ledger Premise
     premise_data = None
     session_secret = get_or_create_session_secret(conv_id, workspace_dir)
@@ -849,11 +876,31 @@ def handle_stop(payload: dict) -> dict:
     if git_paths:
         modified_paths = list(set(modified_paths) | set(git_paths))
 
+    # Evasion E1 Check: Git Stash Detection
+    if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+        try:
+            stash_res = subprocess.run(
+                ["git", "stash", "list"],
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2.0,
+                text=True
+            )
+            if stash_res.returncode == 0 and stash_res.stdout.strip():
+                record_halt(counter_file, halt_count + 1)
+                return {
+                    "decision": "continue",
+                    "reason": "🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected at stop. Stashing changes to bypass dirty-tree verification is forbidden. Apply or drop the stash before completing."
+                }
+        except Exception:
+            pass
+
     # -----------------------------------------------------------------------
-    # Rule 3: AST Anti-Stubbing Linter on Modified Source Files
+    # Rule 3: Polyglot Anti-Stubbing Linter on Modified Source Files
     # -----------------------------------------------------------------------
     for fpath in modified_paths:
-        if fpath.endswith(".py") and os.path.exists(fpath):
+        if os.path.exists(fpath):
             stubs = check_ast_stubs(fpath)
             if stubs:
                 record_halt(counter_file, halt_count + 1)
@@ -887,7 +934,93 @@ def handle_stop(payload: dict) -> dict:
         }
 
     # -----------------------------------------------------------------------
-    # Rule 4: Targeted DeBERTa-v3 NLI Claim Adjudication
+    # Rule 5: Test-Surface Monotonicity (Assertion Weakening / Skipping Defense)
+    # -----------------------------------------------------------------------
+    test_weakening_violations = []
+    for fpath in modified_paths:
+        base_name = os.path.basename(fpath).lower()
+        if ("test" in base_name or "spec" in base_name) and os.path.isfile(fpath):
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as tf:
+                    tcontent = tf.read()
+                if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", tcontent):
+                    test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}")
+                elif re.search(r"@pytest\.mark\.(?:skip|xfail)\b", tcontent):
+                    test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}")
+                elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", tcontent):
+                    test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}")
+            except Exception:
+                pass
+
+    if test_weakening_violations:
+        record_halt(counter_file, halt_count + 1)
+        return {
+            "decision": "continue",
+            "reason": f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): {test_weakening_violations[0]}. Weakening test assertions or skipping tests to pass the gate is forbidden."
+        }
+
+    # -----------------------------------------------------------------------
+    # Tier 2: External Deterministic Hard Gate Handoff
+    # Only triggered if source files were modified or tests were executed
+    # -----------------------------------------------------------------------
+    if workspace_dir and (source_files_modified > 0 or verification_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+        tier2_result = call_system_one("v1/verify/handoff", {
+            "workspace_path": workspace_dir,
+            "conversationId": conv_id
+        }, timeout=65.0)
+
+        if not tier2_result and run_independent_verification:
+            # Fallback to in-process clean runner if daemon endpoint offline
+            try:
+                tier2_result = run_independent_verification(workspace_dir, conv_id=conv_id)
+            except Exception:
+                tier2_result = None
+
+        if tier2_result and not tier2_result.get("success"):
+            runner = tier2_result.get("runner", "external runner")
+            ec = tier2_result.get("exit_code")
+            out_tail = (tier2_result.get("output", "") or "")[:600]
+            record_halt(counter_file, halt_count + 1)
+            return {
+                "decision": "continue",
+                "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
+            }
+
+    # If physical gates passed and no agent prose exists, allow stop
+    if not agent_text:
+        if os.path.exists(counter_file):
+            try:
+                os.remove(counter_file)
+            except Exception:
+                pass
+        return {"decision": "allow"}
+
+    # -----------------------------------------------------------------------
+    # Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
+    # -----------------------------------------------------------------------
+    claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_-]+/)+[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
+    for ref in claimed_file_refs:
+        norm_ref = os.path.normpath(ref)
+        if any(norm_ref.endswith(ext) for ext in SOURCE_CODE_EXTENSIONS):
+            pattern = re.compile(
+                rf"\b(?:created|wrote|implemented|modified|updated|edited|added|fixed|built|patched)\b[^.!?\n]{{0,120}}?\b{re.escape(ref)}\b|"
+                rf"\b{re.escape(ref)}\b[^.!?\n]{{0,60}}?\b(?:is now|was|has been)\s+(?:created|written|implemented|modified|updated|edited|added|fixed|built|patched)\b",
+                re.IGNORECASE
+            )
+            if pattern.search(agent_text):
+                is_modified = any(
+                    norm_ref == os.path.normpath(m) or norm_ref.endswith(os.path.normpath(m)) or os.path.normpath(m).endswith(norm_ref)
+                    for m in modified_paths
+                )
+                if not is_modified:
+                    record_halt(counter_file, halt_count + 1)
+                    return {
+                        "decision": "continue",
+                        "reason": f"🚨 HARDTRUTH REJECTED (UNVERIFIED CLAIM): You claimed to have created or modified '{ref}', but git and the ledger show no modifications to this file in this session. Write and apply the code to disk before completing."
+                    }
+
+    # -----------------------------------------------------------------------
+    # Rule 4B: Targeted DeBERTa-v3 NLI Claim Adjudication
     # -----------------------------------------------------------------------
     text_without_fences = re.sub(r"```[\s\S]*?```", "", agent_text)
     text_clean = text_without_fences.replace("`", "")
@@ -953,33 +1086,6 @@ def handle_stop(payload: dict) -> dict:
                     "decision": "continue",
                     "reason": f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing."
                 }
-
-    # -----------------------------------------------------------------------
-    # Tier 2: External Deterministic Hard Gate Handoff
-    # Only triggered if source files were modified or tests were executed
-    # -----------------------------------------------------------------------
-    if workspace_dir and (source_files_modified > 0 or verification_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
-        tier2_result = call_system_one("v1/verify/handoff", {
-            "workspace_path": workspace_dir,
-            "conversationId": conv_id
-        }, timeout=65.0)
-
-        if not tier2_result and run_independent_verification:
-            # Fallback to in-process clean runner if daemon endpoint offline
-            try:
-                tier2_result = run_independent_verification(workspace_dir, conv_id=conv_id)
-            except Exception:
-                tier2_result = None
-
-        if tier2_result and not tier2_result.get("success"):
-            runner = tier2_result.get("runner", "external runner")
-            ec = tier2_result.get("exit_code")
-            out_tail = (tier2_result.get("output", "") or "")[:600]
-            record_halt(counter_file, halt_count + 1)
-            return {
-                "decision": "continue",
-                "reason": f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}"
-            }
 
     # All tiers passed: reset counter file and session key
     if os.path.exists(counter_file):

@@ -12,6 +12,8 @@ import time
 import hmac
 import hashlib
 import secrets
+import fcntl
+import threading
 from typing import Dict, List, Optional, Tuple, Any
 
 DEFAULT_LEDGER_PATH = os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl")
@@ -73,6 +75,18 @@ VERIFICATION_CMD_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Real test suite execution commands (excluding pure static linters)
+TEST_CMD_PATTERN = re.compile(
+    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(pytest|python3?\s+-m\s+(unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\w+)?|yarn\s+test|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|jest|vitest|tox|ctest)\b",
+    re.IGNORECASE
+)
+
+# Static code quality analyzers and linters
+STATIC_CHECK_PATTERN = re.compile(
+    r"(?:^|[\s;\|\&])(?:[A-Z_0-9]+=\S+\s+)*(ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    re.IGNORECASE
+)
+
 # Chained shell operators, pipes, subshells, newlines, or conditionals that mask exit codes
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
     r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|\beval\b|\bexec\b|\(|\))",
@@ -98,6 +112,14 @@ DOC_EXTENSIONS = {
 }
 
 
+def is_test_execution_command(cmd: str) -> bool:
+    """Returns True if the command executes a test runner (excluding linters)."""
+    cmd_clean = (cmd or "").strip()
+    if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
+        return False
+    return bool(TEST_CMD_PATTERN.search(cmd_clean))
+
+
 def is_verification_command(cmd: str) -> bool:
     cmd_clean = (cmd or "").strip()
     # Fake verification commands like pytest --version, pytest --help, pytest --fixtures, cargo test --help are NOT verification runs
@@ -115,6 +137,11 @@ DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
 def is_tainted_shell_command(cmd: str) -> bool:
     """Detects verification commands chained with masking operators or dangerous env overrides (PATH=, LD_PRELOAD=)."""
     cmd_clean = (cmd or "").strip()
+    # Permit exit-preserving leading cd <dir> && <cmd>
+    cd_match = re.match(r"^\s*cd\s+([^\s;&|]+)\s*&&\s*", cmd_clean)
+    if cd_match:
+        cmd_clean = cmd_clean[cd_match.end():].strip()
+
     if VERIFICATION_CMD_PATTERN.search(cmd_clean):
         if SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean):
             return True
@@ -282,6 +309,7 @@ class DaemonLedger:
         self._session_baselines: Dict[Tuple[str, str], str] = {}
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._step_counters: Dict[str, int] = {}
+        self._write_lock = threading.Lock()
 
     def start_session(self, conversation_id: str, workspace_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """
@@ -369,91 +397,108 @@ class DaemonLedger:
         """
         Appends an entry to the HMAC-SHA256 hash-chained daemon ledger.
         """
-        ledger_dir = os.path.dirname(os.path.abspath(self.ledger_path))
-        os.makedirs(ledger_dir, mode=0o700, exist_ok=True)
-        try:
-            os.chmod(ledger_dir, 0o700)
-        except Exception:
-            pass
-
-        last_record = self.get_last_record()
-        if last_record is None:
-            index = 0
-            prev_hash = "0" * 64
-        else:
-            index = last_record.get("index", 0) + 1
-            prev_hash = last_record.get("hash", "0" * 64)
-
-        # Check for shell operator taint
-        is_tainted = False
-        if tool == "run_command" and is_tainted_shell_command(target):
-            is_tainted = True
-            error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
-            harness_status = "tainted_shell_operator"
-
-        # Open Item #2: Monotonic Step Index Enforcement
-        conv_str = str(conversation_id)
-        if hasattr(self, "_sessions") and conv_str in self._sessions:
-            last_step = self._sessions[conv_str].get("last_step_idx", -1)
-            if step_idx < last_step:
-                raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
-            self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
-        elif hasattr(self, "_step_counters"):
-            last_step = self._step_counters.get(conv_str, -1)
-            if step_idx < last_step:
-                raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
-            self._step_counters[conv_str] = max(last_step, step_idx)
-
-        entry_data = {
-            "conversationId": conversation_id,
-            "stepIdx": step_idx,
-            "tool": tool,
-            "target": target,
-            "observed_exit_code": observed_exit_code,
-            "harness_status": harness_status or ("no_error" if observed_exit_code == 0 and not is_tainted else "error" if observed_exit_code is not None or is_tainted else None),
-            "error": error,
-            "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
-            "diff_stat": diff_stat[:200] if diff_stat else None,
-            "timestamp": timestamp or time.time(),
-            "tainted": is_tainted,
-            "cwd": cwd
-        }
-
-        canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
-        record_hash = self._compute_hash(index, prev_hash, canonical_entry)
-
-        status_compat = "error" if error or is_tainted or (observed_exit_code is not None and observed_exit_code != 0) else "success"
-
-        record = {
-            "index": index,
-            "prev_hash": prev_hash,
-            "entry": entry_data,
-            "hash": record_hash,
-            # Top-level backwards compatibility fields
-            "target": target,
-            "status": status_compat,
-            "tool": tool,
-            "conversationId": conversation_id,
-            "stepIdx": step_idx,
-            "error": error,
-            "cwd": cwd
-        }
-
-        file_exists = os.path.exists(self.ledger_path)
-        with open(self.ledger_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-        if not file_exists:
+        with self._write_lock:
+            ledger_dir = os.path.dirname(os.path.abspath(self.ledger_path))
+            os.makedirs(ledger_dir, mode=0o700, exist_ok=True)
             try:
-                os.chmod(self.ledger_path, 0o600)
+                os.chmod(ledger_dir, 0o700)
             except Exception:
                 pass
 
-        return {
-            "status": "recorded",
-            "index": index,
-            "hash": record_hash
-        }
+            file_exists = os.path.exists(self.ledger_path)
+            with open(self.ledger_path, "a+", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.seek(0)
+                    last_line = None
+                    for line in f:
+                        line_s = line.strip()
+                        if line_s:
+                            last_line = line_s
+                    if last_line:
+                        try:
+                            last_record = json.loads(last_line)
+                            index = last_record.get("index", 0) + 1
+                            prev_hash = last_record.get("hash", "0" * 64)
+                        except Exception:
+                            index = 0
+                            prev_hash = "0" * 64
+                    else:
+                        index = 0
+                        prev_hash = "0" * 64
+
+                    # Check for shell operator taint
+                    is_tainted = False
+                    if tool == "run_command" and is_tainted_shell_command(target):
+                        is_tainted = True
+                        error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
+                        harness_status = "tainted_shell_operator"
+
+                    # Open Item #2: Monotonic Step Index Enforcement
+                    conv_str = str(conversation_id)
+                    if hasattr(self, "_sessions") and conv_str in self._sessions:
+                        last_step = self._sessions[conv_str].get("last_step_idx", -1)
+                        if step_idx < last_step:
+                            raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+                        self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
+                    elif hasattr(self, "_step_counters"):
+                        last_step = self._step_counters.get(conv_str, -1)
+                        if step_idx < last_step:
+                            raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+                        self._step_counters[conv_str] = max(last_step, step_idx)
+
+                    entry_data = {
+                        "conversationId": conversation_id,
+                        "stepIdx": step_idx,
+                        "tool": tool,
+                        "target": target,
+                        "observed_exit_code": observed_exit_code,
+                        "harness_status": harness_status or ("no_error" if observed_exit_code == 0 and not is_tainted else "error" if observed_exit_code is not None or is_tainted else None),
+                        "error": error,
+                        "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
+                        "diff_stat": diff_stat[:200] if diff_stat else None,
+                        "timestamp": timestamp or time.time(),
+                        "tainted": is_tainted,
+                        "cwd": cwd
+                    }
+
+                    canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
+                    record_hash = self._compute_hash(index, prev_hash, canonical_entry)
+
+                    status_compat = "error" if error or is_tainted or (observed_exit_code is not None and observed_exit_code != 0) else "success"
+
+                    record = {
+                        "index": index,
+                        "prev_hash": prev_hash,
+                        "entry": entry_data,
+                        "hash": record_hash,
+                        # Top-level backwards compatibility fields
+                        "target": target,
+                        "status": status_compat,
+                        "tool": tool,
+                        "conversationId": conversation_id,
+                        "stepIdx": step_idx,
+                        "error": error,
+                        "cwd": cwd
+                    }
+
+                    f.seek(0, os.SEEK_END)
+                    f.write(json.dumps(record) + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            if not file_exists:
+                try:
+                    os.chmod(self.ledger_path, 0o600)
+                except Exception:
+                    pass
+
+            return {
+                "status": "recorded",
+                "index": index,
+                "hash": record_hash
+            }
 
     def set_session_baseline(self, conversation_id: str, workspace_path: str, baseline_sha: str) -> str:
         """
@@ -681,6 +726,7 @@ class DaemonLedger:
 
         unresolved_failures: Dict[str, dict] = {}
         verification_commands_count = 0
+        test_commands_count = 0
         modified_source_files = set()
         modified_doc_files = set()
         modified_file_paths = set()
@@ -698,6 +744,7 @@ class DaemonLedger:
             if tool == "run_command":
                 all_commands.append(e)
                 is_verif = is_verification_command(target)
+                is_test = is_test_execution_command(target)
                 if is_verif:
                     failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None) or (status == "unverified_timeout")
                     if failed:
@@ -713,6 +760,8 @@ class DaemonLedger:
                         # Only confirmed success with exit_code == 0 or no_error can increment or resolve
                         if status != "unverified_timeout" and (exit_code == 0 or status == "no_error"):
                             verification_commands_count += 1
+                            if is_test:
+                                test_commands_count += 1
                             # Hierarchical resolution across test suites with CWD isolation
                             resolved_keys = [
                                 k for k in list(unresolved_failures.keys())
@@ -798,6 +847,7 @@ class DaemonLedger:
             "modified_files": sorted(list(modified_source_files | modified_doc_files)),
             "modified_file_paths": sorted(list(modified_file_paths)),
             "verification_commands_executed": verification_commands_count,
+            "test_commands_executed": test_commands_count,
             "unresolved_failures": list(unresolved_failures.values()),
             "records_count": len(conv_records)
         }
