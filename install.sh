@@ -56,13 +56,18 @@ except Exception:
 data['hardtruth'] = {
     'enabled': True,
     'PostToolUse': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'python3 ~/.gemini/config/hardtruth_hook.py post_tool', 'timeout': 20}]}],
-    'Stop': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'python3 ~/.gemini/config/hardtruth_hook.py stop', 'timeout': 90}]}]
+    # NB: Stop must be FLAT (no matcher wrapper) and 300s: 90s gets SIGKILLed
+    # under load (stophooks.go:62), silently skipping the end-of-turn gate.
+    'Stop': [{'type': 'command', 'command': 'python3 ~/.gemini/config/hardtruth_hook.py stop', 'timeout': 300}]
 }
 with open(p, 'w') as f:
     json.dump(data, f, indent=2)
 "
     echo "✓ Antigravity configured with HardTruth Stop and PostToolUse hooks."
 fi
+
+# 2b. Goose plugin (auto-detected; no-op when goose is absent)
+bash "$REPO_ROOT/install_goose_plugin.sh"
 
 # 3. Global Git Hooks Configuration
 cat > "$GLOBAL_HOOKS_DIR/pre-commit" << 'EOF'

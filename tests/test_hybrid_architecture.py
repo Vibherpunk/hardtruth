@@ -296,11 +296,19 @@ class TestHybridArchitecture(unittest.TestCase):
         self.assertIsNotNone(runner)
         self.assertIn("pytest", runner)
 
-        # Run Tier 2 independent verification on this repo
-        res = run_independent_verification(REPO_ROOT, test_cmd="pytest tests/test_daemon_ledger.py", timeout_sec=15)
-        self.assertTrue(res["success"])
-        self.assertEqual(res["exit_code"], 0)
-        self.assertEqual(res["status"], "verified")
+        # Run Tier 2 independent verification on this repo with subprocess permission
+        old_sub = os.environ.get("HARDTRUTH_TIER2_ALLOW_SUBPROCESS")
+        try:
+            os.environ["HARDTRUTH_TIER2_ALLOW_SUBPROCESS"] = "1"
+            res = run_independent_verification(REPO_ROOT, test_cmd="pytest tests/test_daemon_ledger.py", timeout_sec=15)
+            self.assertTrue(res["success"])
+            self.assertEqual(res["exit_code"], 0)
+            self.assertEqual(res["status"], "verified")
+        finally:
+            if old_sub is not None:
+                os.environ["HARDTRUTH_TIER2_ALLOW_SUBPROCESS"] = old_sub
+            else:
+                os.environ.pop("HARDTRUTH_TIER2_ALLOW_SUBPROCESS", None)
 
     def test_commit_and_run_loophole_defeated(self):
         """Committing modified source files with clean working tree cannot bypass Rule 1."""
