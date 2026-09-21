@@ -1643,6 +1643,8 @@ def handle_stop(payload: dict) -> dict:
         if len(s_clean) > 15 and action_triggers.search(s_clean):
             if imperative_filter.search(s_clean):
                 continue
+            if re.search(r"\b(?:was\s+not|is\s+not|were\s+not|not\s+to\s+be|did\s+not|has\s+not|have\s+not)\s+(?:added|installed|created|modified|deleted|run|executed|built)\b", s_clean, re.IGNORECASE):
+                continue
             if re.search(r"\b(?:documentation|docs|readme|changelog)\b", s_clean, re.IGNORECASE) and not re.search(r"\b(?:test|tests|passed|suite|feature|pipeline|integration|bug)\b", s_clean, re.IGNORECASE):
                 continue
             if descriptive_filter.search(s_clean):
