@@ -1240,6 +1240,8 @@ def handle_stop(payload: dict) -> dict:
 
             command_successes = set()
             command_step_map = {}
+            task_cmd_map = {}
+
             with open(transcript_path, "r", encoding="utf-8") as tf:
                 pending_cmd = None
                 pending_step = -1
@@ -1255,15 +1257,37 @@ def handle_stop(payload: dict) -> dict:
                             for tc in tcalls:
                                 if tc.get("name") == "run_command":
                                     cargs = tc.get("args", {})
-                                    pending_cmd = cargs.get("CommandLine", "").strip()
+                                    raw_c = str(cargs.get("CommandLine", "")).strip()
+                                    while (raw_c.startswith('"') and raw_c.endswith('"')) or (raw_c.startswith("'") and raw_c.endswith("'")):
+                                        raw_c = raw_c[1:-1].strip()
+                                    pending_cmd = raw_c
                                     pending_step = td.get("step_index", -1)
-                        elif ttype == "GENERIC" and pending_cmd:
+                        elif ttype == "GENERIC":
                             tcontent = td.get("content", "")
                             m_exit = re.search(r"\bThe command exited with code 0\b", tcontent)
-                            if m_exit:
+                            if m_exit and pending_cmd:
                                 command_successes.add(pending_cmd)
                                 command_step_map[pending_cmd] = td.get("step_index", pending_step)
+                            m_bg = re.search(r"[Tt]ask id:?\s*[\"']?([a-zA-Z0-9_/-]+)", tcontent)
+                            if m_bg:
+                                t_id_found = m_bg.group(1).strip()
+                                cmd_found = pending_cmd
+                                m_desc = re.search(r"Task Description:\s*(.*)", tcontent)
+                                if m_desc and not cmd_found:
+                                    cmd_found = m_desc.group(1).strip()
+                                if cmd_found:
+                                    task_cmd_map[t_id_found] = (cmd_found, pending_step)
                             pending_cmd = None
+                        elif ttype in ("USER_INPUT", "GENERIC", "SYSTEM_MESSAGE"):
+                            tcontent = str(td.get("content", ""))
+                            m_fin = re.search(r'Task id\s+"?([a-zA-Z0-9_/-]+)"?\s+finished with result:.*?[Tt]he command exited with code (\d+)', tcontent, re.DOTALL)
+                            if m_fin:
+                                t_id = m_fin.group(1).strip()
+                                t_ec = int(m_fin.group(2))
+                                if t_ec == 0 and t_id in task_cmd_map:
+                                    bg_cmd, bg_step = task_cmd_map[t_id]
+                                    command_successes.add(bg_cmd)
+                                    command_step_map[bg_cmd] = td.get("step_index", bg_step)
                     except Exception:
                         continue
 
@@ -1271,12 +1295,29 @@ def handle_stop(payload: dict) -> dict:
                 cmd_target = fail.get("command", "").strip()
                 err = fail.get("error")
                 status = fail.get("status")
-                if (err == "UNVERIFIED_TIMEOUT" or status == "unverified_timeout" or fail.get("observed_exit_code") is None) and cmd_target in command_successes:
+
+                is_resolved = False
+                resolving_step = -1
+                for succ in command_successes:
+                    if succ == cmd_target:
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
+                    # Suite encompassment: if succ is pytest tests/ and failed was pytest
+                    if cmd_target == "pytest" and succ.startswith("pytest"):
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
+                    if cmd_target == "pytest tests/" and (succ == "pytest tests/" or succ == "pytest"):
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
+
+                if is_resolved:
                     additional_verif += 1
                     if is_test_execution_command(cmd_target):
                         additional_test += 1
-                        s_step = command_step_map.get(cmd_target, -1)
-                        reconciled_test_step = max(reconciled_test_step, s_step)
+                        reconciled_test_step = max(reconciled_test_step, resolving_step)
                 else:
                     reconciled_fails.append(fail)
 
