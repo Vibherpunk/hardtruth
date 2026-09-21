@@ -1606,7 +1606,10 @@ def handle_stop(payload: dict) -> dict:
             )
             if any(pattern.search(clause) for clause in clauses):
                 is_modified = any(
-                    norm_ref == os.path.normpath(m) or os.path.normpath(m).endswith(os.sep + norm_ref)
+                    norm_ref == os.path.normpath(m)
+                    or os.path.normpath(m).endswith(os.sep + norm_ref)
+                    or norm_ref.endswith(os.sep + os.path.normpath(m))
+                    or os.path.basename(norm_ref) == os.path.basename(m)
                     for m in modified_paths
                 )
                 has_real_content = False
