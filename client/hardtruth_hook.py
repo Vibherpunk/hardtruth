@@ -476,7 +476,12 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
     if ws_paths:
         for p in ws_paths:
             if isinstance(p, str) and os.path.isdir(p):
-                return os.path.abspath(p)
+                p_abs = os.path.abspath(p)
+                if p_abs == os.path.expanduser("~") or p_abs == "/":
+                    cwd = os.getcwd()
+                    if os.path.isdir(os.path.join(cwd, ".git")):
+                        return os.path.abspath(cwd)
+                return p_abs
     for k in ["cwd", "workspace", "workspace_dir", "workspaceDir", "projectDir", "project_dir", "root"]:
         v = payload.get(k)
         if isinstance(v, dict):
@@ -895,14 +900,18 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
 
     # 4. Fallback if .git is missing (e.g. rm -rf .git)
     if not os.path.exists(os.path.join(workspace_dir, ".git")):
-        try:
-            for root, dirs, files in os.walk(workspace_dir):
-                dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
-                for fname in files:
-                    rel_p = os.path.relpath(os.path.join(root, fname), workspace_dir)
-                    all_rel_paths.add(rel_p)
-        except Exception:
+        home_dir = os.path.expanduser("~")
+        if os.path.abspath(workspace_dir) in [home_dir, "/", "/Users"]:
             pass
+        else:
+            try:
+                for root, dirs, files in os.walk(workspace_dir):
+                    dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
+                    for fname in files:
+                        rel_p = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                        all_rel_paths.add(rel_p)
+            except Exception:
+                pass
 
     # 5. Filter out ignored build directories before expanding paths
     filtered_rel_paths = set()
@@ -1215,7 +1224,7 @@ action_triggers = re.compile(
     r"\bsuccessfully\s+(?:verified|passed|tested|built(?!-in)|implemented)\b|"
     r"\ball\s+checks?\s+passed\b|"
     r"\b(?:feature|pipeline|integration|logic)\s+is\s+(?:now\s+)?(?:wired|working|active|complete|finished)\b|"
-    r"\b(?:zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test)\b)",
+    r"\b(?:zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test|all\s+suites?\s+green|test\s+pass\s+verified|zero\s+regressions|everything\s+passing|all\s+tests?\s+green|test\s+verification\s+passed)\b)",
     re.IGNORECASE
 )
 
@@ -1642,7 +1651,10 @@ def handle_stop(payload: dict) -> dict:
     if not unresolved_failures:
         premise_str = re.sub(r"UNRESOLVED TEST FAILURES \(CRITICAL\):.*?(?=(?:RECENT EXECUTIONS|MODIFIED FILES|$))", "", premise_str).strip()
     else:
-        fails_summary = "; ".join([f"FAILED: '{f.get('command')}' ({f.get('error', 'failed')})" for f in unresolved_failures])
+        fails_summary = "; ".join([
+            f"'{u.get('command')}' ({u.get('error') or 'exit ' + str(u.get('observed_exit_code'))})"
+            for u in unresolved_failures
+        ])
         premise_str = re.sub(r"UNRESOLVED TEST FAILURES \(CRITICAL\):.*?(?=(?:RECENT EXECUTIONS|MODIFIED FILES|$))", f"UNRESOLVED TEST FAILURES (CRITICAL): {fails_summary}. ", premise_str).strip()
 
     modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
@@ -1742,10 +1754,14 @@ def handle_stop(payload: dict) -> dict:
             return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Source code was modified at step {last_source_mod_step} after the last test run at step {last_test_step}. You must re-run your test suite to verify the latest changes before stopping.")
 
     if len(unresolved_failures) > 0:
-        fails_summary = "; ".join([
-            f"'{u.get('command')}' (exit {u.get('observed_exit_code')})"
-            for u in unresolved_failures
-        ])
+        fails_summary_list = []
+        for u in unresolved_failures:
+            cmd = u.get("command")
+            err = u.get("error")
+            ec = u.get("observed_exit_code")
+            desc = err if err else f"exit {ec}"
+            fails_summary_list.append(f"'{cmd}' ({desc})")
+        fails_summary = "; ".join(fails_summary_list)
         return fail_halt(f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping.")
     _log_phase(conv_id, "phase7_rule1_rule2_checks", time.perf_counter() - p7_wall, time.process_time() - p7_cpu)
 
@@ -1990,7 +2006,11 @@ def handle_stop(payload: dict) -> dict:
     claims_to_verify = claims_to_verify[:8]
 
     has_test_pass_claim = any(
-        re.search(r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing)\b", c, re.IGNORECASE)
+        re.search(
+            r"\b((all|all \d+|\d+)?\s*(unit\s+)?tests?(\s+[\w/]+){0,3}\s+passed|tests?\s+(have\s+)?passed|unit\s+tests?\s+passed|tests?\s+succeeded|test\s+suite\s+passed|tests?\s+are\s+passing|all\s+suites?\s+green|test\s+pass\s+verified|zero\s+regressions|everything\s+passing|all\s+tests?\s+green|test\s+verification\s+passed)\b",
+            c,
+            re.IGNORECASE
+        )
         for c in claims_to_verify
     )
     if has_test_pass_claim:
@@ -2014,9 +2034,8 @@ def handle_stop(payload: dict) -> dict:
         # Attempt batched verification first (1 HTTP roundtrip + vectorized DeBERTa pass)
         b_wall = time.perf_counter()
         b_cpu = time.process_time()
-        batched_res = call_system_one("v1/verify-claims", {
-            "premise": premise_str,
-            "hypotheses": claims_to_verify,
+        batched_res = call_system_one("v1/verify-claims-batch", {
+            "pairs": [{"claim": c, "premise": premise_str} for c in claims_to_verify],
             "threshold": CONTRADICTION_THRESHOLD
         }, timeout=15.0)
         if batched_res is not None and "results" in batched_res:

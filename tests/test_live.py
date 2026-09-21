@@ -523,8 +523,13 @@ class TestSystemOneSentinel(unittest.TestCase):
         req = urllib.request.Request(
             daemon_base + "/v1/verify/handoff", data=payload,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {tok}"})
-        with urllib.request.urlopen(req, timeout=130) as resp:
-            body = json.loads(resp.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=130) as resp:
+                body = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            body = json.loads(e.read().decode())
+            print("HANDOFF FAILED:", json.dumps(body, indent=2))
+            self.fail(f"Handoff failed: {body.get('output')[:500]}")
         self.assertTrue(body.get("success"), f"Tier 2 handoff failed: {body.get('output','')[:300]}")
 
     def test_19_ledger_premise_requires_api_token(self):

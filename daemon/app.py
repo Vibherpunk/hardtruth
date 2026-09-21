@@ -144,6 +144,18 @@ class VerifyClaimResponse(BaseModel):
     probabilities: Dict[str, float]
     latency_ms: float
 
+class ClaimPremisePair(BaseModel):
+    claim: str = Field(..., max_length=1000)
+    premise: str = Field(..., max_length=65536)
+
+class VerifyClaimsBatchRequest(BaseModel):
+    pairs: List[ClaimPremisePair] = Field(..., max_length=128)
+    threshold: Optional[float] = 0.70
+
+class VerifyClaimsBatchResponse(BaseModel):
+    results: List[SingleClaimResult]
+    latency_ms: float
+
 class VerifyClaimsRequest(BaseModel):
     premise: str = Field(..., max_length=65536)
     hypotheses: List[str] = Field(..., max_length=64)
@@ -501,6 +513,64 @@ def verify_claims(req: VerifyClaimsRequest):
 
     latency = (time.perf_counter() - t0) * 1000.0
     return VerifyClaimsResponse(
+        results=results,
+        latency_ms=round(latency, 2)
+    )
+
+@app.post("/v1/verify-claims-batch", response_model=VerifyClaimsBatchResponse, dependencies=[Depends(require_daemon_auth)])
+def verify_claims_batch(req: VerifyClaimsBatchRequest):
+    """
+    Batched NLI verification across multiple (premise, hypothesis) pairs in a single forward pass (B5).
+    """
+    t0 = time.perf_counter()
+    import torch
+
+    if not req.pairs:
+        return VerifyClaimsBatchResponse(results=[], latency_ms=0.0)
+
+    tok, model = get_nli_direct()
+    device = next(model.parameters()).device
+
+    input_pairs = [(pair.premise, pair.claim) for pair in req.pairs]
+    inputs = tok(
+        input_pairs,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1).tolist()
+
+    threshold = req.threshold or 0.70
+    results = []
+    for pair, p in zip(req.pairs, probs):
+        contradiction, entailment, neutral = p[0], p[1], p[2]
+        prob_dict = {
+            "contradiction": round(contradiction, 4),
+            "entailment": round(entailment, 4),
+            "neutral": round(neutral, 4)
+        }
+        if contradiction >= threshold:
+            verdict = "CONTRADICTION"
+            conf = contradiction
+        elif entailment >= 0.50:
+            verdict = "ENTAILED"
+            conf = entailment
+        else:
+            verdict = "NEUTRAL"
+            conf = neutral
+        results.append(SingleClaimResult(
+            hypothesis=pair.claim,
+            status=verdict,
+            confidence=round(conf, 4),
+            probabilities=prob_dict
+        ))
+
+    latency = (time.perf_counter() - t0) * 1000.0
+    return VerifyClaimsBatchResponse(
         results=results,
         latency_ms=round(latency, 2)
     )

@@ -174,11 +174,9 @@ DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
 
 
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects verification commands chained with masking operators, subshells, conditionals, or dangerous env overrides."""
+    """Detects any command chained with masking operators, subshells, conditionals, or dangerous env overrides (B1/B2 hardened)."""
     raw_cmd = (cmd or "").strip()
     if not raw_cmd:
-        return False
-    if not VERIFICATION_ANYWHERE_PATTERN.search(raw_cmd):
         return False
     if DANGEROUS_ENV_OVERRIDE_PATTERN.search(raw_cmd):
         return True
@@ -186,11 +184,14 @@ def is_tainted_shell_command(cmd: str) -> bool:
         return True
     if re.search(r"(?:^|[\s;&|])if\b", raw_cmd):
         return True
-    cmd_clean = strip_shell_prefixes(raw_cmd)
-    if is_verification_command(cmd_clean):
-        if SHELL_OPERATOR_MASK_PATTERN.search(cmd_clean):
-            return True
-    elif SHELL_OPERATOR_MASK_PATTERN.search(raw_cmd):
+    check_cmd = raw_cmd
+    while True:
+        cd_m = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*(?:&&|;)\s*", check_cmd)
+        if cd_m:
+            check_cmd = check_cmd[cd_m.end():].strip()
+            continue
+        break
+    if SHELL_OPERATOR_MASK_PATTERN.search(check_cmd):
         return True
     return False
 
@@ -362,6 +363,7 @@ class DaemonLedger:
         self._active_gates: Dict[str, Dict[str, Any]] = {}
         self._step_counters: Dict[str, int] = {}
         self._write_lock = threading.Lock()
+        self._chain_cache: Optional[Tuple[int, int, Tuple[bool, int, str]]] = None
 
     def start_session(self, conversation_id: str, workspace_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """
@@ -506,15 +508,38 @@ class DaemonLedger:
         msg = f"{index}:{prev_hash}:{canonical_entry}".encode("utf-8")
         return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
 
+    def _read_last_line_fast(self, f) -> Optional[str]:
+        """Reads the last non-empty line of an open file via reverse seek in O(1) time."""
+        try:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size == 0:
+                return None
+            buffer_size = min(8192, size)
+            f.seek(size - buffer_size)
+            chunk = f.read()
+            lines = chunk.splitlines()
+            for line in reversed(lines):
+                s = line.strip()
+                if s:
+                    return s
+            if buffer_size < size:
+                f.seek(0)
+                last_line = None
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        last_line = s
+                return last_line
+        except Exception:
+            pass
+        return None
+
     def get_last_record(self) -> Optional[dict]:
         if not os.path.exists(self.ledger_path):
             return None
-        last_line = None
         with open(self.ledger_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line_s = line.strip()
-                if line_s:
-                    last_line = line_s
+            last_line = self._read_last_line_fast(f)
         if last_line:
             try:
                 return json.loads(last_line)
@@ -539,6 +564,8 @@ class DaemonLedger:
         """
         Appends an entry to the HMAC-SHA256 hash-chained daemon ledger.
         """
+        now = time.time()
+        self._sweep_expired_gates(now)
         with self._write_lock:
             ledger_dir = os.path.dirname(os.path.abspath(self.ledger_path))
             os.makedirs(ledger_dir, mode=0o700, exist_ok=True)
@@ -551,12 +578,7 @@ class DaemonLedger:
             with open(self.ledger_path, "a+", encoding="utf-8") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
-                    f.seek(0)
-                    last_line = None
-                    for line in f:
-                        line_s = line.strip()
-                        if line_s:
-                            last_line = line_s
+                    last_line = self._read_last_line_fast(f)
                     if last_line:
                         try:
                             last_record = json.loads(last_line)
@@ -636,6 +658,8 @@ class DaemonLedger:
                 except Exception:
                     pass
 
+            self._chain_cache = None
+
             return {
                 "status": "recorded",
                 "index": index,
@@ -701,6 +725,14 @@ class DaemonLedger:
         if not os.path.exists(self.ledger_path):
             return True, 0, "EMPTY_LEDGER"
 
+        st = None
+        try:
+            st = os.stat(self.ledger_path)
+            if self._chain_cache and self._chain_cache[0] == st.st_mtime_ns and self._chain_cache[1] == st.st_size:
+                return self._chain_cache[2]
+        except Exception:
+            st = None
+
         expected_prev_hash = "0" * 64
         expected_index = 0
 
@@ -733,7 +765,10 @@ class DaemonLedger:
                 expected_prev_hash = rec_h
                 expected_index += 1
 
-        return True, expected_index, "VALID"
+        result = (True, expected_index, "VALID")
+        if st is not None:
+            self._chain_cache = (st.st_mtime_ns, st.st_size, result)
+        return result
 
     def count_records_by_prefix(self, prefixes) -> dict:
         """Round 8 (#6): counts records whose conversationId starts with any prefix.
@@ -823,6 +858,7 @@ class DaemonLedger:
         if not rebuilt_valid:
             raise ValueError(f"Purge rebuild failed chain verification: {rebuilt_msg}")
         os.replace(tmp_path, self.ledger_path)
+        self._chain_cache = None
 
         # Drop in-memory baselines that belong to purged test conversations.
         for (conv, _ws), _sha in list(self._session_baselines.items()):
@@ -888,8 +924,8 @@ class DaemonLedger:
 
             if tool == "run_command":
                 all_commands.append(e)
-                is_verif = is_verification_command(target)
-                is_test = is_test_execution_command(target)
+                is_verif = is_verification_command(target) or tainted
+                is_test = is_test_execution_command(target) or tainted
                 if is_verif:
                     failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None) or (status == "unverified_timeout")
                     if failed:
