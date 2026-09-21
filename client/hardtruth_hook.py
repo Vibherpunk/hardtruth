@@ -1319,6 +1319,18 @@ def handle_stop(payload: dict) -> dict:
                         is_resolved = True
                         resolving_step = command_step_map.get(succ, -1)
                         break
+                    if ("pytest tests" in succ or succ == "pytest") and cmd_target.startswith("pytest"):
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
+                    if "unittest discover" in succ and "unittest" in cmd_target:
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
+                    if cmd_target in succ:
+                        is_resolved = True
+                        resolving_step = command_step_map.get(succ, -1)
+                        break
 
                 if is_resolved:
                     additional_verif += 1
