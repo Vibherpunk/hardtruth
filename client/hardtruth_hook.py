@@ -1364,6 +1364,12 @@ def handle_stop(payload: dict) -> dict:
         except Exception:
             pass
     premise_str = premise_data.get("premise", "")
+    if not unresolved_failures:
+        premise_str = re.sub(r"UNRESOLVED TEST FAILURES \(CRITICAL\):.*?(?=(?:RECENT EXECUTIONS|MODIFIED FILES|$))", "", premise_str).strip()
+    else:
+        fails_summary = "; ".join([f"FAILED: '{f.get('command')}' ({f.get('error', 'failed')})" for f in unresolved_failures])
+        premise_str = re.sub(r"UNRESOLVED TEST FAILURES \(CRITICAL\):.*?(?=(?:RECENT EXECUTIONS|MODIFIED FILES|$))", f"UNRESOLVED TEST FAILURES (CRITICAL): {fails_summary}. ", premise_str).strip()
+
     modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
     if git_paths:
         modified_paths = list(set(modified_paths) | set(git_paths))
