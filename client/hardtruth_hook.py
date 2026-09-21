@@ -134,6 +134,17 @@ IGNORED_BUILD_DIRS = {
     "site-packages", ".gradle", "Pods", ".terraform"
 }
 
+def get_file_repo_root(fpath: str) -> Optional[str]:
+    curr = os.path.dirname(os.path.abspath(fpath))
+    while curr and curr != "/":
+        if os.path.isdir(os.path.join(curr, ".git")):
+            return curr
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+    return None
+
 def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Optional[str] = None) -> Optional[Set[int]]:
     """
     Returns set of line numbers in fpath modified since baseline commit (or unstaged working tree changes).
@@ -141,8 +152,13 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
     If file is untracked (newly added by agent), returns all line numbers in file.
     If file is tracked and has no changes, returns set() (0 modified lines).
     """
-    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
-        return None
+    fpath_abs = os.path.abspath(fpath)
+    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")) or not fpath_abs.startswith(os.path.abspath(workspace_dir)):
+        repo = get_file_repo_root(fpath)
+        if repo:
+            workspace_dir = repo
+        else:
+            return None
     rel_path = os.path.relpath(fpath, workspace_dir)
     ws_abs = os.path.abspath(workspace_dir)
 
@@ -1458,7 +1474,26 @@ def handle_stop(payload: dict) -> dict:
 
                 changed_lines = get_changed_lines(workspace_dir, fpath, baseline_sha)
                 lines = tcontent.splitlines()
+                in_docstring = False
+                docstring_delim = None
                 for ln_idx, line_str in enumerate(lines, start=1):
+                    stripped = line_str.strip()
+                    if not in_docstring:
+                        if stripped.startswith('"""') or stripped.startswith("'''"):
+                            delim = stripped[:3]
+                            if stripped.count(delim) == 1:
+                                in_docstring = True
+                                docstring_delim = delim
+                            continue
+                    else:
+                        if docstring_delim and docstring_delim in stripped:
+                            in_docstring = False
+                            docstring_delim = None
+                        continue
+
+                    if stripped.startswith("#") or stripped.startswith("//") or stripped.startswith("*") or stripped.startswith("/*"):
+                        continue
+
                     if changed_lines is not None and ln_idx not in changed_lines:
                         continue
                     if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", line_str):
