@@ -337,11 +337,18 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
     ws_paths = payload.get("workspacePaths", [])
     if ws_paths:
         for p in ws_paths:
-            if p and os.path.isdir(p):
+            if isinstance(p, str) and os.path.isdir(p):
                 return os.path.abspath(p)
     for k in ["cwd", "workspace", "workspace_dir", "workspaceDir", "projectDir", "project_dir", "root"]:
         v = payload.get(k)
-        if v and os.path.isdir(v):
+        if isinstance(v, dict):
+            candidate = v.get("path") or v.get("uri")
+            if isinstance(candidate, str):
+                if candidate.startswith("file://"):
+                    candidate = candidate[7:]
+                if os.path.isdir(candidate):
+                    return os.path.abspath(candidate)
+        elif isinstance(v, str) and os.path.isdir(v):
             return os.path.abspath(v)
     return None
 
