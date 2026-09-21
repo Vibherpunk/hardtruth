@@ -1496,25 +1496,25 @@ def handle_stop(payload: dict) -> dict:
 
                     if changed_lines is not None and ln_idx not in changed_lines:
                         continue
-                    if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", line_str):
+                    if re.search(r"^\s*assert\s+(?:True|1\s*==\s*1)\b", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\b(?:self\.)?assertTrue\s*\(\s*(?:True|1)\s*\)", line_str):
+                    elif re.search(r"^\s*(?:self\.)?assertTrue\s*\(\s*(?:True|1)\s*\)", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assertTrue(True)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\b(?:self\.)?assertEqual\s*\(\s*(?:True|1)\s*,\s*(?:True|1)\s*\)", line_str):
+                    elif re.search(r"^\s*(?:self\.)?assertEqual\s*\(\s*(?:True|1)\s*,\s*(?:True|1)\s*\)", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assertEqual(True, True)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\b(?:self\.)?assertFalse\s*\(\s*(?:False|0)\s*\)", line_str):
+                    elif re.search(r"^\s*(?:self\.)?assertFalse\s*\(\s*(?:False|0)\s*\)", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assertFalse(False)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"@pytest\.mark\.(?:skip|xfail)\b", line_str):
+                    elif re.search(r"^\s*@pytest\.mark\.(?:skip|xfail)\b", line_str):
                         test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", line_str):
+                    elif re.search(r"^\s*(?:test\.skip|it\.skip|xit\()\b", line_str):
                         test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\bexpect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+                    elif re.search(r"^\s*expect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
                         test_weakening_violations.append(f"Tautological assertion ('expect(true).toBe(true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\bassert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+                    elif re.search(r"^\s*assert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
                         test_weakening_violations.append(f"Tautological assertion ('assert.equal(true, true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\bassert!\s*\(\s*true\s*\)", line_str):
+                    elif re.search(r"^\s*assert!\s*\(\s*true\s*\)", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assert!(true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"\bt\.(?:Skip|SkipNow|Skipf)\s*\(", line_str):
+                    elif re.search(r"^\s*t\.(?:Skip|SkipNow|Skipf)\s*\(", line_str):
                         test_weakening_violations.append(f"Test skipping call ('t.Skip()') found in {base_name}:{ln_idx}")
 
                 # Assertion count comparison against git baseline blob
