@@ -64,6 +64,19 @@ with open(p, 'w') as f:
     json.dump(data, f, indent=2)
 "
     echo "✓ Antigravity configured with HardTruth Stop and PostToolUse hooks."
+
+    # B6: Hash-verify all hook copies against canonical repo source
+    CANONICAL_HASH=$(shasum -a 256 "$REPO_ROOT/client/hardtruth_hook.py" | awk '{print $1}')
+    for target in "$HARDTRUTH_LIB/hardtruth_hook.py" "$HARDTRUTH_DIR/lib/hardtruth_hook.py" "$ANTIGRAVITY_CONFIG_DIR/hardtruth_hook.py"; do
+        if [ -f "$target" ]; then
+            TARGET_HASH=$(shasum -a 256 "$target" | awk '{print $1}')
+            if [ "$CANONICAL_HASH" != "$TARGET_HASH" ]; then
+                echo "❌ ERROR: Hash mismatch on $target! Expected $CANONICAL_HASH, got $TARGET_HASH"
+                exit 1
+            fi
+        fi
+    done
+    echo "✓ All hook copies hash-verified with SHA-256: ${CANONICAL_HASH:0:16}..."
 fi
 
 # 2b. Goose plugin (auto-detected; no-op when goose is absent)

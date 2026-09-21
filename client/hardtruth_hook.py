@@ -26,6 +26,8 @@ import time
 import re
 import hashlib
 import subprocess
+import signal
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -60,7 +62,43 @@ except ImportError:
         classify_file = lambda path, workspace_dir=None: "other"
         _IMPORT_DEGRADED = "daemon.ledger module unavailable"
 
+def get_canonical_hook_path() -> Optional[str]:
+    env_path = os.environ.get("HARDTRUTH_CANONICAL_HOOK")
+    if env_path and os.path.exists(env_path):
+        return env_path
+    mac_path = "/Users/ai/dev/hardtruth-fix/client/hardtruth_hook.py"
+    if os.path.exists(mac_path):
+        return mac_path
+    container_path = "/workspace/client/hardtruth_hook.py"
+    if os.path.exists(container_path):
+        return container_path
+    return None
 
+CANONICAL_HOOK_PATH = "/Users/ai/dev/hardtruth-fix/client/hardtruth_hook.py"
+
+def check_hook_integrity() -> Optional[str]:
+    """
+    B6 Integrity Self-Check: Compares SHA-256 hash of currently executing file
+    against the canonical repo source at /Users/ai/dev/hardtruth-fix/client/hardtruth_hook.py.
+    Emits stderr warning if diverged.
+    """
+    try:
+        curr_file = os.path.abspath(__file__)
+        canonical = get_canonical_hook_path()
+        if not canonical:
+            return None
+        if curr_file == canonical:
+            return None
+        with open(curr_file, "rb") as f1, open(canonical, "rb") as f2:
+            h1 = hashlib.sha256(f1.read()).hexdigest()
+            h2 = hashlib.sha256(f2.read()).hexdigest()
+            if h1 != h2:
+                msg = f"⚠️ HARDTRUTH HOOK DIVERGENCE: Running hook ({curr_file} - {h1[:8]}) differs from canonical ({canonical} - {h2[:8]}). Run install.sh to re-sync."
+                sys.stderr.write(msg + "\n")
+                return msg
+    except Exception:
+        pass
+    return None
 
 HARNESS = os.environ.get("HARDTRUTH_HARNESS", "antigravity").lower()
 
@@ -145,6 +183,74 @@ def get_file_repo_root(fpath: str) -> Optional[str]:
         curr = parent
     return None
 
+_WORKSPACE_DIFF_CACHE: Dict[Tuple[str, Optional[str]], Tuple[Dict[str, Set[int]], Set[str]]] = {}
+
+
+def get_workspace_diff_cache(workspace_dir: str, baseline_sha: Optional[str] = None) -> Tuple[Dict[str, Set[int]], Set[str]]:
+    """
+    Computes entire workspace diff and untracked files in two git commands instead of 2 per file.
+    Returns: (diff_map: {rel_path: set(changed_lines)}, untracked_files: set(rel_path))
+    """
+    ws_abs = os.path.abspath(workspace_dir)
+    key = (ws_abs, baseline_sha)
+    if key in _WORKSPACE_DIFF_CACHE:
+        return _WORKSPACE_DIFF_CACHE[key]
+
+    git_safe_flags = [
+        "-c", f"safe.directory={ws_abs}",
+        "-c", "core.fsmonitor=",
+        "-c", "core.hooksPath=/dev/null"
+    ]
+    diff_map: Dict[str, Set[int]] = {}
+    untracked_files: Set[str] = set()
+
+    # 1. Get untracked files
+    try:
+        res_untracked = subprocess.run(
+            ["git"] + git_safe_flags + ["ls-files", "--others", "--exclude-standard"],
+            cwd=workspace_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3.0
+        )
+        if res_untracked.returncode == 0 and res_untracked.stdout:
+            for l in res_untracked.stdout.splitlines():
+                clean_l = l.strip()
+                if clean_l:
+                    if clean_l.startswith('"') and clean_l.endswith('"'):
+                        clean_l = clean_l[1:-1]
+                    untracked_files.add(os.path.normpath(clean_l))
+    except Exception:
+        pass
+
+    # 2. Get whole workspace diff
+    diff_args = ["git"] + git_safe_flags + ["diff", "-U0"]
+    if baseline_sha:
+        diff_args.append(baseline_sha)
+    diff_args.append("--")
+    try:
+        proc = subprocess.run(diff_args, cwd=workspace_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0)
+        if proc.returncode == 0 and proc.stdout:
+            curr_file = None
+            for line in proc.stdout.splitlines():
+                if line.startswith("+++ b/"):
+                    clean_f = line[6:].strip()
+                    if clean_f.startswith('"') and clean_f.endswith('"'):
+                        clean_f = clean_f[1:-1]
+                    curr_file = os.path.normpath(clean_f)
+                    if curr_file not in diff_map:
+                        diff_map[curr_file] = set()
+                elif line.startswith("@@") and curr_file is not None:
+                    m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                    if m:
+                        start = int(m.group(1))
+                        count = int(m.group(2)) if m.group(2) is not None else 1
+                        for ln in range(start, start + max(count, 1)):
+                            diff_map[curr_file].add(ln)
+    except Exception:
+        pass
+
+    _WORKSPACE_DIFF_CACHE[key] = (diff_map, untracked_files)
+    return diff_map, untracked_files
+
+
 def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Optional[str] = None) -> Optional[Set[int]]:
     """
     Returns set of line numbers in fpath modified since baseline commit (or unstaged working tree changes).
@@ -159,10 +265,26 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
             workspace_dir = repo
         else:
             return None
-    rel_path = os.path.relpath(fpath, workspace_dir)
+    rel_path = os.path.normpath(os.path.relpath(fpath, workspace_dir))
     ws_abs = os.path.abspath(workspace_dir)
 
-    # Check if untracked in git (brand new file created by agent)
+    # Fast path: use workspace diff cache if available
+    try:
+        diff_map, untracked_files = get_workspace_diff_cache(workspace_dir, baseline_sha)
+        if rel_path in untracked_files:
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    cnt = sum(1 for _ in f)
+                return set(range(1, max(cnt, 1) + 1))
+            except Exception:
+                return None
+        if rel_path in diff_map:
+            return diff_map[rel_path]
+        return set()
+    except Exception:
+        pass
+
+    # Fallback to per-file subprocess if cache failed
     try:
         unmatch_check = subprocess.run(
             ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
@@ -941,6 +1063,7 @@ def handle_post_tool_use(payload: dict) -> dict:
     Neutralizes shell operator bypasses (; true, || exit 0).
     Non-synthesis rule: NEVER synthesizes 'exit 0' out of thin air.
     """
+    check_hook_integrity()
     payload = normalize_payload(payload)
     tool_call = payload.get("toolCall", {})
     tool_name = tool_call.get("name", "unknown")
@@ -1080,17 +1203,19 @@ def handle_post_tool_use(payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 action_triggers = re.compile(
-    r"\b((?:i(?:'ve| have)?\s+)?(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built|refactored|completed|finished|wired up)|"
-    r"ran\s+(?:unit\s+)?tests?|"
-    r"(?:all|all \d+|\d+)?\s*(?:unit\s+)?tests?(?:\s+[\w/]+){0,3}\s+passed|"
-    r"tests?\s+(?:have\s+)?passed|"
-    r"tests?\s+are\s+passing|"
-    r"test\s+suite\s+passed|"
-    r"tests?\s+succeeded|"
-    r"successfully\s+(?:verified|passed|tested|built|implemented)|"
-    r"all\s+checks?\s+passed|"
-    r"(?:feature|pipeline|integration|logic)\s+is\s+(?:now\s+)?(?:wired|working|active|complete|finished)|"
-    r"zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test)\b",
+    r"(?:\b(?:i(?:'ve| have)?|we(?:'ve| have)?|agent(?: has)?)\s+(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored|completed|finished|wired up)\b|"
+    r"(?:^|\n)\s*(?:[-*•]|\d+\.)\s*(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored|completed|finished)\b|"
+    r"\b(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored)\s+(?:the\s+)?(?:test|tests|suite|code|file|files|function|class|method|module|endpoint|feature|bug|patch|pipeline)\b|"
+    r"\bran\s+(?:unit\s+)?tests?\b|"
+    r"\b(?:all|all \d+|\d+)?\s*(?:unit\s+)?tests?(?:\s+[\w/]+){0,3}\s+passed\b|"
+    r"\btests?\s+(?:have\s+)?passed\b|"
+    r"\btests?\s+are\s+passing\b|"
+    r"\btest\s+suite\s+passed\b|"
+    r"\btests?\s+succeeded\b|"
+    r"\bsuccessfully\s+(?:verified|passed|tested|built(?!-in)|implemented)\b|"
+    r"\ball\s+checks?\s+passed\b|"
+    r"\b(?:feature|pipeline|integration|logic)\s+is\s+(?:now\s+)?(?:wired|working|active|complete|finished)\b|"
+    r"\b(?:zero\s+failures|10/10\s+green|suite\s+is\s+green|clean\s+test)\b)",
     re.IGNORECASE
 )
 
@@ -1109,14 +1234,104 @@ imperative_filter = re.compile(
 # Stop: Pre-Termination Verification Gate (Hybrid Two-Tier)
 # ---------------------------------------------------------------------------
 
+_PHASE_LOG_PATH = os.environ.get("HARDTRUTH_PHASE_LOG", "/tmp/hardtruth_stop_phases.log")
+
+
+def _log_phase(conv_id: str, phase: str, wall_sec: float, cpu_sec: float, extra: Optional[dict] = None):
+    try:
+        now_str = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime()) + f".{int(time.time()*1000)%1000:03d}Z"
+        rec = {
+            "timestamp": now_str,
+            "pid": os.getpid(),
+            "conversationId": conv_id,
+            "phase": phase,
+            "wall_sec": round(wall_sec, 4),
+            "cpu_sec": round(cpu_sec, 4),
+        }
+        if extra:
+            rec.update(extra)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(_PHASE_LOG_PATH, flags, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
 def handle_stop(payload: dict) -> dict:
     """
     Evaluates physical ledger state, agent claims, and executes Tier 2 Hard Gate.
     """
+    check_hook_integrity()
+    stop_start_wall = time.perf_counter()
+    stop_start_cpu = time.process_time()
     payload = normalize_payload(payload)
     conv_id = payload.get("conversationId", "default")
     transcript_path = payload.get("transcriptPath", "")
     workspace_dir = get_workspace_dir(payload)
+
+    # -----------------------------------------------------------------------
+    # In-Hook 45-Second Deadline Belt (B4)
+    # Fails closed if wall clock exceeds 45s, well before CLI kills at 300-345s
+    # -----------------------------------------------------------------------
+    alarm_armed = False
+    old_alarm_handler = None
+
+    def _alarm_timeout_handler(signum, frame):
+        elapsed_w = time.perf_counter() - stop_start_wall
+        elapsed_c = time.process_time() - stop_start_cpu
+        _log_phase(conv_id, "stop_timeout_halt", elapsed_w, elapsed_c, {
+            "decision": "halt",
+            "reason": "🚨 HARDTRUTH DEADLINE EXCEEDED (45s): The verification gate timed out under load. HardTruth fails closed. Re-run or provide manual proof."
+        })
+        try:
+            call_system_one("v1/gate/verdict", {
+                "conversationId": conv_id,
+                "verdict": "TIMEOUT_HALT",
+                "reason": "In-hook 45s deadline belt exceeded",
+                "latency_ms": round(elapsed_w * 1000, 2)
+            }, timeout=1.0)
+        except Exception:
+            pass
+        halt_payload = _halt("🚨 HARDTRUTH DEADLINE EXCEEDED (45s): The verification gate timed out under load. HardTruth fails closed. Re-run or provide manual proof.")
+        sys.stdout.write(json.dumps(halt_payload))
+        sys.stdout.flush()
+        os._exit(0)
+
+    if hasattr(signal, "SIGALRM") and threading.current_thread() is threading.main_thread():
+        try:
+            old_alarm_handler = signal.signal(signal.SIGALRM, _alarm_timeout_handler)
+            signal.alarm(45)
+            alarm_armed = True
+        except Exception:
+            pass
+
+    def _disarm_alarm():
+        nonlocal alarm_armed
+        if alarm_armed:
+            try:
+                signal.alarm(0)
+                if old_alarm_handler is not None:
+                    signal.signal(signal.SIGALRM, old_alarm_handler)
+                alarm_armed = False
+            except Exception:
+                pass
+
+    _log_phase(conv_id, "stop_start", 0.0, 0.0, {
+        "transcriptPath": transcript_path,
+        "workspace_dir": workspace_dir
+    })
+
+    # B2: Open Gate Supervision Session with Daemon
+    try:
+        call_system_one("v1/gate/start", {
+            "conversationId": conv_id,
+            "transcriptPath": transcript_path,
+            "workspace_dir": workspace_dir
+        }, timeout=1.0)
+    except Exception:
+        pass
 
     counter_file = get_halt_counter_file(conv_id)
     halt_count = 0
@@ -1128,6 +1343,23 @@ def handle_stop(payload: dict) -> dict:
             halt_count = 0
 
     def fail_halt(reason: str, remediable: bool = True) -> dict:
+        _disarm_alarm()
+        elapsed_w = time.perf_counter() - stop_start_wall
+        elapsed_c = time.process_time() - stop_start_cpu
+        _log_phase(conv_id, "stop_exit_halt", elapsed_w, elapsed_c, {
+            "decision": "halt",
+            "reason": str(reason)[:300],
+            "remediable": remediable
+        })
+        try:
+            call_system_one("v1/gate/verdict", {
+                "conversationId": conv_id,
+                "verdict": "HALT",
+                "reason": str(reason)[:300],
+                "latency_ms": round(elapsed_w * 1000, 2)
+            }, timeout=1.0)
+        except Exception:
+            pass
         new_count = halt_count + 1 if remediable else halt_count
         if remediable:
             record_halt(counter_file, new_count)
@@ -1147,15 +1379,21 @@ def handle_stop(payload: dict) -> dict:
     if _IMPORT_DEGRADED:
         return fail_halt(f"🚨 HARDTRUTH INTEGRITY ERROR: {_IMPORT_DEGRADED}. Install layout degraded, cannot verify truth safely. HardTruth fails closed.", remediable=False)
 
-    # Extract agent's final text from transcript (fail closed on unreadable or empty transcript)
+    # Phase 1: Extract agent's final text from transcript (fail closed on unreadable or empty transcript)
+    p1_wall = time.perf_counter()
+    p1_cpu = time.process_time()
     agent_text = ""
+    t_lines = 0
+    t_bytes = 0
     if transcript_path:
         if not os.path.exists(transcript_path):
             return fail_halt(f"🚨 HARDTRUTH REJECTED: Attached transcript path does not exist on disk: {transcript_path}", remediable=False)
         has_agent_response = False
         try:
+            t_bytes = os.path.getsize(transcript_path)
             with open(transcript_path, "r", encoding="utf-8") as f:
                 for line in f:
+                    t_lines += 1
                     try:
                         d = json.loads(line)
                         # Antigravity schema: type == "PLANNER_RESPONSE"
@@ -1191,13 +1429,24 @@ def handle_stop(payload: dict) -> dict:
         if not has_agent_response:
             return fail_halt("🚨 HARDTRUTH REJECTED: Attached transcript contains no valid agent responses. Emptying or stripping transcripts to bypass gates is forbidden.", remediable=False)
 
-    # Fetch Ledger Premise
+    _log_phase(conv_id, "phase1_transcript_read", time.perf_counter() - p1_wall, time.process_time() - p1_cpu, {
+        "transcript_lines": t_lines,
+        "transcript_bytes": t_bytes,
+        "agent_text_len": len(agent_text)
+    })
+
+    # Phase 2: Fetch Ledger Premise
+    p2_wall = time.perf_counter()
+    p2_cpu = time.process_time()
     premise_data = None
+    premise_source = "none"
     session_secret = get_or_create_session_secret(conv_id, workspace_dir)
     local_ledger = get_local_ledger()
     if os.environ.get("HARDTRUTH_LEDGER_PATH") and local_ledger:
         try:
             premise_data = local_ledger.get_premise(conv_id)
+            if premise_data:
+                premise_source = "env_ledger"
         except Exception:
             pass
 
@@ -1213,12 +1462,16 @@ def handle_stop(payload: dict) -> dict:
             req = urllib.request.Request(url, headers=premise_headers)
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 premise_data = json.loads(resp.read().decode("utf-8"))
+                if premise_data:
+                    premise_source = "daemon_api"
         except Exception:
             pass
 
     if not premise_data and local_ledger:
         try:
             premise_data = local_ledger.get_premise(conv_id)
+            if premise_data:
+                premise_source = "fallback_ledger"
         except Exception:
             pass
 
@@ -1234,12 +1487,22 @@ def handle_stop(payload: dict) -> dict:
             "test_commands_executed": 0,
             "unresolved_failures": []
         }
+        premise_source = "default_empty"
+
+    _log_phase(conv_id, "phase2_premise_fetch", time.perf_counter() - p2_wall, time.process_time() - p2_cpu, {
+        "premise_source": premise_source,
+        "tampered": premise_data.get("tampered", False),
+        "source_files_modified_ledger": premise_data.get("source_files_modified", 0),
+        "unresolved_failures_count": len(premise_data.get("unresolved_failures", []))
+    })
 
     # Check for Ledger Tamper
     if premise_data.get("tampered"):
         return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Cryptographic ledger tamper detected: {premise_data.get('detail', 'chain mismatch')}. Termination forbidden.", remediable=False)
 
-    # Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
+    # Phase 3: Universal File Tracking (Git Porcelain + Session Baseline Commit Diff)
+    p3_wall = time.perf_counter()
+    p3_cpu = time.process_time()
     try:
         git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
     except Exception as e:
@@ -1253,7 +1516,16 @@ def handle_stop(payload: dict) -> dict:
     last_test_step = premise_data.get("last_test_step", -1)
     unresolved_failures = premise_data.get("unresolved_failures", [])
 
-    # Reconcile unverified timeouts against completed transcript
+    _log_phase(conv_id, "phase3_git_file_tracking", time.perf_counter() - p3_wall, time.process_time() - p3_cpu, {
+        "git_src_files_count": len(git_src_files),
+        "source_files_modified": source_files_modified,
+        "verification_commands_executed": verification_commands_executed,
+        "test_commands_executed": test_commands_executed,
+    })
+
+    # Phase 4: Reconcile unverified timeouts against completed transcript
+    p4_wall = time.perf_counter()
+    p4_cpu = time.process_time()
     if transcript_path and os.path.exists(transcript_path) and unresolved_failures:
         try:
             reconciled_fails = []
@@ -1383,6 +1655,15 @@ def handle_stop(payload: dict) -> dict:
             elif "MODIFIED FILES:" not in premise_str:
                 premise_str += f" MODIFIED FILES: {', '.join(all_mod_names)}."
 
+    _log_phase(conv_id, "phase4_transcript_reconcile", time.perf_counter() - p4_wall, time.process_time() - p4_cpu, {
+        "unresolved_failures_remaining": len(unresolved_failures),
+        "modified_paths_count": len(modified_paths),
+        "premise_len": len(premise_str)
+    })
+
+    # Phase 5: Git Lineage & Stash Detection (Evasion E4 & E1)
+    p5_wall = time.perf_counter()
+    p5_cpu = time.process_time()
     # Evasion E4 Check: Git History Lineage (merge-base ancestor check)
     if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
         ws_abs = os.path.abspath(workspace_dir)
@@ -1432,10 +1713,11 @@ def handle_stop(payload: dict) -> dict:
                     return fail_halt(f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash detected ('{stash_ref}') created during this session. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed changes with 'git stash pop' and execute tests before completing.")
         except Exception:
             pass
+    _log_phase(conv_id, "phase5_git_lineage_and_stash", time.perf_counter() - p5_wall, time.process_time() - p5_cpu)
 
-    # -----------------------------------------------------------------------
-    # Rule 3: Polyglot Anti-Stubbing Linter on Modified Source Files
-    # -----------------------------------------------------------------------
+    # Phase 6: Rule 3: Polyglot Anti-Stubbing Linter on Modified Source Files
+    p6_wall = time.perf_counter()
+    p6_cpu = time.process_time()
     baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id) if workspace_dir else None
     for fpath in modified_paths:
         if os.path.exists(fpath):
@@ -1443,29 +1725,32 @@ def handle_stop(payload: dict) -> dict:
             stubs = check_ast_stubs(fpath, modified_lines=mod_lines)
             if stubs:
                 return fail_halt(f"🚨 HARDTRUTH ENGINE REJECTED: Unimplemented stub detected. {stubs[0]}")
+    _log_phase(conv_id, "phase6_rule3_ast_stubs", time.perf_counter() - p6_wall, time.process_time() - p6_cpu, {
+        "modified_paths_checked": len(modified_paths)
+    })
 
-    # -----------------------------------------------------------------------
-    # Rule 1: Source Code Changes Require Test Proof (Language-Independent)
-    # -----------------------------------------------------------------------
+    # Phase 7: Rule 1: Source Code Changes Require Test Proof & Rule 2: Unresolved Failures
+    p7_wall = time.perf_counter()
+    p7_cpu = time.process_time()
     if source_files_modified > 0:
         if test_commands_executed == 0:
             return fail_halt("🚨 HARDTRUTH GATE HALTED: Source code files were modified in this conversation, but NO verification commands (tests) were executed. You must execute tests (e.g. pytest, npm test, cargo test, go test) to verify your changes before stopping.")
         if last_source_mod_step > 0 and last_test_step > 0 and last_source_mod_step > last_test_step:
             return fail_halt(f"🚨 HARDTRUTH GATE HALTED: Source code was modified at step {last_source_mod_step} after the last test run at step {last_test_step}. You must re-run your test suite to verify the latest changes before stopping.")
 
-    # -----------------------------------------------------------------------
-    # Rule 2: Unresolved Verification Failures Forbid Termination (Language-Independent)
-    # -----------------------------------------------------------------------
     if len(unresolved_failures) > 0:
         fails_summary = "; ".join([
             f"'{u.get('command')}' (exit {u.get('observed_exit_code')})"
             for u in unresolved_failures
         ])
         return fail_halt(f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping.")
+    _log_phase(conv_id, "phase7_rule1_rule2_checks", time.perf_counter() - p7_wall, time.process_time() - p7_cpu)
 
     # -----------------------------------------------------------------------
-    # Rule 5: Test-Surface Monotonicity (Assertion Weakening / Skipping Defense)
+    # Phase 8: Rule 5: Test-Surface Monotonicity (Assertion Weakening / Skipping Defense)
     # -----------------------------------------------------------------------
+    p8_wall = time.perf_counter()
+    p8_cpu = time.process_time()
     test_weakening_violations = []
     baseline_sha = None
     if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
@@ -1546,12 +1831,17 @@ def handle_stop(payload: dict) -> dict:
 
     if test_weakening_violations:
         return fail_halt(f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): {test_weakening_violations[0]}. Weakening test assertions or skipping tests to pass the gate is forbidden.")
+    _log_phase(conv_id, "phase8_rule5_test_weakening", time.perf_counter() - p8_wall, time.process_time() - p8_cpu)
 
     # -----------------------------------------------------------------------
-    # Tier 2: External Deterministic Hard Gate Handoff
+    # Phase 9: Tier 2: External Deterministic Hard Gate Handoff
     # Only triggered if source files were modified or tests were executed
     # -----------------------------------------------------------------------
+    p9_wall = time.perf_counter()
+    p9_cpu = time.process_time()
+    tier2_ran = False
     if (source_files_modified > 0 or test_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1" and HARNESS != "antigravity":
+        tier2_ran = True
         if not workspace_dir:
             return fail_halt(
                 "🚨 HARDTRUTH UNDETERMINED: No workspace path was resolvable, so the Tier 2 "
@@ -1579,6 +1869,10 @@ def handle_stop(payload: dict) -> dict:
                 out_tail = (tier2_result.get("output", "") or "")[:600]
                 return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
+    _log_phase(conv_id, "phase9_tier2_gate", time.perf_counter() - p9_wall, time.process_time() - p9_cpu, {
+        "tier2_ran": tier2_ran
+    })
+
     # If physical gates passed and no agent prose exists, check transcript requirement
     if not agent_text:
         if not transcript_path and (source_files_modified > 0 or verification_commands_executed > 0):
@@ -1588,11 +1882,26 @@ def handle_stop(payload: dict) -> dict:
                 os.remove(counter_file)
             except Exception:
                 pass
+        _disarm_alarm()
+        try:
+            call_system_one("v1/gate/verdict", {
+                "conversationId": conv_id,
+                "verdict": "ALLOW",
+                "latency_ms": round((time.perf_counter() - stop_start_wall) * 1000, 2)
+            }, timeout=1.0)
+        except Exception:
+            pass
+        _log_phase(conv_id, "stop_exit_allow", time.perf_counter() - stop_start_wall, time.process_time() - stop_start_cpu, {
+            "decision": "allow",
+            "reason": "no_agent_text_early_allow"
+        })
         return _allow()
 
     # -----------------------------------------------------------------------
-    # Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
+    # Phase 10: Rule 4A: Deterministic Claim-to-Action Grounding (Unstripped Prose)
     # -----------------------------------------------------------------------
+    p10_wall = time.perf_counter()
+    p10_cpu = time.process_time()
     claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
     clauses = re.split(r"(?<=[.!?])\s+|\n+|[,;]\s*(?:which|that|whereas|although|because|since)\b", agent_text, flags=re.IGNORECASE)
     for ref in claimed_file_refs:
@@ -1629,9 +1938,16 @@ def handle_stop(payload: dict) -> dict:
                 if not is_modified or not has_real_content:
                     return fail_halt(f"🚨 HARDTRUTH REJECTED (UNVERIFIED CLAIM): You claimed to have created or modified '{ref}', but git and the ledger show no non-trivial modifications to this file in this session. Write and apply the code to disk before completing.")
 
+    _log_phase(conv_id, "phase10_rule4a_grounding", time.perf_counter() - p10_wall, time.process_time() - p10_cpu, {
+        "claimed_file_refs_count": len(claimed_file_refs),
+        "clauses_count": len(clauses)
+    })
+
     # -----------------------------------------------------------------------
-    # Rule 4B: Targeted DeBERTa-v3 NLI Claim Adjudication
+    # Phase 11: Rule 4B: Targeted DeBERTa-v3 NLI Claim Extraction & Prioritization
     # -----------------------------------------------------------------------
+    p11_wall = time.perf_counter()
+    p11_cpu = time.process_time()
     text_without_fences = re.sub(r"```[\s\S]*?```", "", agent_text)
     text_clean = text_without_fences.replace("`", "")
     text_clean = re.sub(r"^\s*>\s*", "", text_clean, flags=re.MULTILINE)
@@ -1680,23 +1996,80 @@ def handle_stop(payload: dict) -> dict:
         if last_source_mod_step > 0 and last_test_step > 0 and last_source_mod_step > last_test_step:
             return fail_halt(f"🚨 HARDTRUTH ENGINE HALTED: You claimed tests passed, but source code was modified at step {last_source_mod_step} after the last test run at step {last_test_step}. Re-run tests to prove they pass on the latest code.")
 
-    for claim in claims_to_verify:
-        nli_res = call_system_one("v1/verify-claim", {
-            "premise": premise_str,
-            "hypothesis": claim,
-            "threshold": CONTRADICTION_THRESHOLD
-        })
+    _log_phase(conv_id, "phase11_rule4b_extraction", time.perf_counter() - p11_wall, time.process_time() - p11_cpu, {
+        "sentences_count": len(sentences),
+        "claims_to_verify_count": len(claims_to_verify),
+        "has_test_pass_claim": has_test_pass_claim
+    })
 
-        if nli_res is not None:
-            probs = nli_res.get("probabilities", {})
-            contradiction = probs.get("contradiction", 0.0)
-            if contradiction >= CONTRADICTION_THRESHOLD:
-                return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
-        else:
-            if test_commands_executed > 0 and len(unresolved_failures) == 0:
-                pass
+    # Phase 12: Rule 4B: NLI Claim Verification Loop (Batched with Serialized Fallback)
+    p12_wall = time.perf_counter()
+    p12_cpu = time.process_time()
+    batch_handled = False
+
+    if claims_to_verify:
+        # Attempt batched verification first (1 HTTP roundtrip + vectorized DeBERTa pass)
+        b_wall = time.perf_counter()
+        b_cpu = time.process_time()
+        batched_res = call_system_one("v1/verify-claims", {
+            "premise": premise_str,
+            "hypotheses": claims_to_verify,
+            "threshold": CONTRADICTION_THRESHOLD
+        }, timeout=15.0)
+        if batched_res is not None and "results" in batched_res:
+            batch_handled = True
+            b_wall_sec = time.perf_counter() - b_wall
+            b_cpu_sec = time.process_time() - b_cpu
+            _log_phase(conv_id, "verify_claims_batched", b_wall_sec, b_cpu_sec, {
+                "claims_count": len(claims_to_verify),
+                "daemon_connected": True,
+                "latency_ms": round(b_wall_sec * 1000, 2)
+            })
+            for item in batched_res["results"]:
+                hyp = item.get("hypothesis", "")
+                probs = item.get("probabilities", {})
+                contradiction = probs.get("contradiction", 0.0)
+                if contradiction >= CONTRADICTION_THRESHOLD:
+                    return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{hyp}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
+
+    if not batch_handled:
+        for idx, claim in enumerate(claims_to_verify):
+            c_wall = time.perf_counter()
+            c_cpu = time.process_time()
+            nli_res = call_system_one("v1/verify-claim", {
+                "premise": premise_str,
+                "hypothesis": claim,
+                "threshold": CONTRADICTION_THRESHOLD
+            })
+            c_wall_sec = time.perf_counter() - c_wall
+            c_cpu_sec = time.process_time() - c_cpu
+
+            contradiction = 0.0
+            if nli_res is not None:
+                probs = nli_res.get("probabilities", {})
+                contradiction = probs.get("contradiction", 0.0)
+
+            _log_phase(conv_id, "verify_single_claim", c_wall_sec, c_cpu_sec, {
+                "claim_index": idx,
+                "claim": claim[:100],
+                "contradiction": round(contradiction, 4),
+                "daemon_connected": nli_res is not None,
+                "latency_ms": round(c_wall_sec * 1000, 2)
+            })
+
+            if nli_res is not None:
+                if contradiction >= CONTRADICTION_THRESHOLD:
+                    return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
             else:
-                return fail_halt(f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing.", remediable=False)
+                if test_commands_executed > 0 and len(unresolved_failures) == 0:
+                    pass
+                else:
+                    return fail_halt(f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing.", remediable=False)
+
+    _log_phase(conv_id, "phase12_nli_loop_total", time.perf_counter() - p12_wall, time.process_time() - p12_cpu, {
+        "claims_verified_count": len(claims_to_verify),
+        "batch_used": batch_handled
+    })
 
     # All tiers passed: reset counter file and session key
     if os.path.exists(counter_file):
@@ -1712,6 +2085,19 @@ def handle_stop(payload: dict) -> dict:
         except Exception:
             pass
 
+    _disarm_alarm()
+    try:
+        call_system_one("v1/gate/verdict", {
+            "conversationId": conv_id,
+            "verdict": "ALLOW",
+            "latency_ms": round((time.perf_counter() - stop_start_wall) * 1000, 2)
+        }, timeout=1.0)
+    except Exception:
+        pass
+
+    _log_phase(conv_id, "stop_exit_allow", time.perf_counter() - stop_start_wall, time.process_time() - stop_start_cpu, {
+        "decision": "allow"
+    })
     return _allow()
 
 

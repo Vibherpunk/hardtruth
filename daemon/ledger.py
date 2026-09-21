@@ -359,6 +359,7 @@ class DaemonLedger:
         self._key = self._load_or_create_key()
         self._session_baselines: Dict[Tuple[str, str], str] = {}
         self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._active_gates: Dict[str, Dict[str, Any]] = {}
         self._step_counters: Dict[str, int] = {}
         self._write_lock = threading.Lock()
 
@@ -384,6 +385,96 @@ class DaemonLedger:
 
     def get_session(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         return self._sessions.get(str(conversation_id))
+
+    def start_gate(self, conversation_id: str, transcript_path: Optional[str] = None, workspace_dir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        B2: Opens a gate supervision session for conversation_id.
+        Sweeps any previous expired gates for this conversation or globally,
+        marking them UNVERIFIED in the HMAC ledger chain.
+        """
+        conv_str = str(conversation_id)
+        now = time.time()
+        self._sweep_expired_gates(now)
+
+        gate_id = secrets.token_hex(16)
+        self._active_gates[conv_str] = {
+            "gate_id": gate_id,
+            "conversation_id": conv_str,
+            "opened_at": now,
+            "transcript_path": transcript_path,
+            "workspace_dir": workspace_dir,
+            "status": "OPEN"
+        }
+        return {
+            "conversationId": conv_str,
+            "gate_id": gate_id,
+            "opened_at": now,
+            "status": "OPEN"
+        }
+
+    def record_gate_verdict(self, conversation_id: str, verdict: str, reason: Optional[str] = None, latency_ms: Optional[float] = None) -> Dict[str, Any]:
+        """
+        B2/B3: Records terminal gate verdict (ALLOW, HALT, TIMEOUT_HALT).
+        Appends verdict to HMAC ledger chain and marks the gate closed.
+        """
+        conv_str = str(conversation_id)
+        now = time.time()
+        gate = self._active_gates.pop(conv_str, None)
+        status = (verdict or "UNKNOWN").upper()
+
+        conv_session = self._sessions.get(conv_str)
+        step_idx = (conv_session.get("last_step_idx", 0) + 1) if conv_session else 0
+
+        res = self.record_entry(
+            conversation_id=conv_str,
+            step_idx=step_idx,
+            tool="hardtruth_gate",
+            target=status,
+            observed_exit_code=0 if status == "ALLOW" else 1,
+            harness_status=status,
+            error=reason,
+            stdout_tail=f"latency_ms={latency_ms}" if latency_ms is not None else None,
+            diff_stat=None,
+            timestamp=now,
+            cwd=gate.get("workspace_dir") if gate else None
+        )
+
+        return {
+            "conversationId": conv_str,
+            "verdict": status,
+            "recorded": True,
+            "ledger_index": res.get("index")
+        }
+
+    def _sweep_expired_gates(self, now: float, timeout_sec: float = 60.0):
+        """
+        Marks any open gates older than timeout_sec as UNVERIFIED in the HMAC ledger.
+        """
+        expired_convs = [
+            cid for cid, g in self._active_gates.items()
+            if (now - g.get("opened_at", 0)) > timeout_sec
+        ]
+        for cid in expired_convs:
+            gate = self._active_gates.pop(cid, None)
+            if gate:
+                conv_session = self._sessions.get(cid)
+                step_idx = (conv_session.get("last_step_idx", 0) + 1) if conv_session else 0
+                try:
+                    self.record_entry(
+                        conversation_id=cid,
+                        step_idx=step_idx,
+                        tool="hardtruth_gate",
+                        target="UNVERIFIED",
+                        observed_exit_code=1,
+                        harness_status="UNVERIFIED_ABORT",
+                        error="Stop gate timed out or hook died before reporting verdict (daemon supervision)",
+                        stdout_tail=f"opened_at={gate.get('opened_at')}",
+                        diff_stat=None,
+                        timestamp=now,
+                        cwd=gate.get("workspace_dir")
+                    )
+                except Exception:
+                    pass
 
     def _load_or_create_key(self) -> bytes:
         key_dir = os.path.dirname(os.path.abspath(self.key_path))

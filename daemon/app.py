@@ -144,6 +144,44 @@ class VerifyClaimResponse(BaseModel):
     probabilities: Dict[str, float]
     latency_ms: float
 
+class VerifyClaimsRequest(BaseModel):
+    premise: str = Field(..., max_length=65536)
+    hypotheses: List[str] = Field(..., max_length=64)
+    threshold: Optional[float] = 0.70
+
+class SingleClaimResult(BaseModel):
+    hypothesis: str
+    status: str  # ENTAILED | CONTRADICTION | NEUTRAL
+    confidence: float
+    probabilities: Dict[str, float]
+
+class VerifyClaimsResponse(BaseModel):
+    results: List[SingleClaimResult]
+    latency_ms: float
+
+class GateStartRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    transcriptPath: Optional[str] = Field(None, max_length=1024)
+    workspace_dir: Optional[str] = Field(None, max_length=1024)
+
+class GateStartResponse(BaseModel):
+    conversationId: str
+    status: str
+    gate_id: str
+    opened_at: float
+
+class GateVerdictRequest(BaseModel):
+    conversationId: str = Field(..., max_length=128)
+    verdict: str = Field(..., max_length=32)
+    reason: Optional[str] = Field(None, max_length=16384)
+    latency_ms: Optional[float] = None
+
+class GateVerdictResponse(BaseModel):
+    conversationId: str
+    verdict: str
+    recorded: bool
+    ledger_index: Optional[int] = None
+
 class RecordLedgerRequest(BaseModel):
     conversationId: str = Field(..., max_length=128)
     stepIdx: int = 0
@@ -407,6 +445,86 @@ def verify_claim(req: VerifyClaimRequest):
         probabilities=prob_dict,
         latency_ms=round(latency, 2)
     )
+
+@app.post("/v1/verify-claims", response_model=VerifyClaimsResponse, dependencies=[Depends(require_daemon_auth)])
+def verify_claims(req: VerifyClaimsRequest):
+    """
+    Batched NLI verification across multiple claims in a single forward pass.
+    Evaluates premise vs list of hypotheses using DeBERTa-v3 cross-encoder directly.
+    """
+    t0 = time.perf_counter()
+    import torch
+
+    if not req.hypotheses:
+        return VerifyClaimsResponse(results=[], latency_ms=0.0)
+
+    tok, model = get_nli_direct()
+    device = next(model.parameters()).device
+
+    pairs = [(req.premise, hyp) for hyp in req.hypotheses]
+    inputs = tok(
+        pairs,
+        padding=True,
+        truncation=True,
+        max_length=512,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1).tolist()
+
+    threshold = req.threshold or 0.70
+    results = []
+    for hyp, p in zip(req.hypotheses, probs):
+        contradiction, entailment, neutral = p[0], p[1], p[2]
+        prob_dict = {
+            "contradiction": round(contradiction, 4),
+            "entailment": round(entailment, 4),
+            "neutral": round(neutral, 4)
+        }
+        if contradiction >= threshold:
+            verdict = "CONTRADICTION"
+            conf = contradiction
+        elif entailment >= 0.50:
+            verdict = "ENTAILED"
+            conf = entailment
+        else:
+            verdict = "NEUTRAL"
+            conf = neutral
+        results.append(SingleClaimResult(
+            hypothesis=hyp,
+            status=verdict,
+            confidence=round(conf, 4),
+            probabilities=prob_dict
+        ))
+
+    latency = (time.perf_counter() - t0) * 1000.0
+    return VerifyClaimsResponse(
+        results=results,
+        latency_ms=round(latency, 2)
+    )
+
+@app.post("/v1/gate/start", response_model=GateStartResponse, dependencies=[Depends(require_daemon_auth)])
+def gate_start(req: GateStartRequest):
+    """
+    B2: Opens a gate supervision session. Daemon tracks gate lifetime and sweeps expired gates.
+    """
+    res = _ledger.start_gate(req.conversationId, req.transcriptPath, req.workspace_dir)
+    return GateStartResponse(**res)
+
+@app.post("/v1/gate/verdict", response_model=GateVerdictResponse, dependencies=[Depends(require_daemon_auth)])
+def gate_verdict(req: GateVerdictRequest):
+    """
+    B2/B3: Records terminal gate verdict (ALLOW, HALT, TIMEOUT_HALT) and appends to ledger.
+    """
+    res = _ledger.record_gate_verdict(
+        conversation_id=req.conversationId,
+        verdict=req.verdict,
+        reason=req.reason,
+        latency_ms=req.latency_ms
+    )
+    return GateVerdictResponse(**res)
 
 if __name__ == "__main__":
     import uvicorn

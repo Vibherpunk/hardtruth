@@ -13,6 +13,7 @@ Unit and Adversarial Tests for HardTruth v2.1 Hardened Invariants:
 import os
 import sys
 import json
+import time
 import uuid
 import shutil
 import tempfile
@@ -405,6 +406,81 @@ class TestV21Hardening(unittest.TestCase):
                 os.environ["HARDTRUTH_TIER2_CONTAINER"] = old_cont
             else:
                 os.environ.pop("HARDTRUTH_TIER2_CONTAINER", None)
+
+    def test_14_b6_integrity_check(self):
+        """B6: check_hook_integrity detects divergence against canonical repo source."""
+        import client.hardtruth_hook as hook_mod
+        # Running against canonical returns None (in sync)
+        self.assertIsNone(hook_mod.check_hook_integrity())
+
+        # Test with a modified temp copy
+        temp_hook = os.path.join(self.test_dir, "diverged_hook.py")
+        with open(HOOK_SCRIPT, "r") as f_in, open(temp_hook, "w") as f_out:
+            f_out.write(f_in.read() + "\n# Extra divergence line\n")
+
+        # Temporarily point __file__ to diverged copy
+        orig_file = hook_mod.__file__
+        try:
+            hook_mod.__file__ = temp_hook
+            res = hook_mod.check_hook_integrity()
+            self.assertIsNotNone(res)
+            self.assertIn("HARDTRUTH HOOK DIVERGENCE", res)
+        finally:
+            hook_mod.__file__ = orig_file
+
+    def test_15_daemon_gate_supervision_lifecycle(self):
+        """B2: Daemon tracks gate sessions and appends verdicts to HMAC ledger chain."""
+        from daemon.ledger import DaemonLedger
+        ledger = DaemonLedger(
+            ledger_path=os.path.join(self.test_dir, "gate_test_ledger.jsonl"),
+            key_path=os.path.join(self.test_dir, "gate_test_key.key")
+        )
+        conv = "test-gate-conv"
+        start_res = ledger.start_gate(conv, transcript_path="/tmp/test.jsonl", workspace_dir="/tmp")
+        self.assertEqual(start_res["status"], "OPEN")
+        self.assertIn(conv, ledger._active_gates)
+
+        # Record ALLOW verdict
+        verdict_res = ledger.record_gate_verdict(conv, "ALLOW", latency_ms=45.2)
+        self.assertEqual(verdict_res["verdict"], "ALLOW")
+        self.assertTrue(verdict_res["recorded"])
+        self.assertNotIn(conv, ledger._active_gates)
+
+        # Verify chain integrity
+        valid, count, msg = ledger.verify_chain()
+        self.assertTrue(valid)
+        self.assertEqual(count, 1)
+
+        last_rec = ledger.get_last_record()
+        self.assertEqual(last_rec["entry"]["tool"], "hardtruth_gate")
+        self.assertEqual(last_rec["entry"]["target"], "ALLOW")
+        self.assertEqual(last_rec["entry"]["harness_status"], "ALLOW")
+
+    def test_16_daemon_gate_expired_sweeper(self):
+        """B2/B3: Daemon sweeper marks abandoned/expired gates as UNVERIFIED in ledger chain."""
+        from daemon.ledger import DaemonLedger
+        ledger = DaemonLedger(
+            ledger_path=os.path.join(self.test_dir, "gate_sweep_ledger.jsonl"),
+            key_path=os.path.join(self.test_dir, "gate_sweep_key.key")
+        )
+        conv = "test-abandoned-conv"
+        # Start a gate with opened_at 120s in the past
+        ledger.start_gate(conv, transcript_path="/tmp/t.jsonl", workspace_dir="/tmp")
+        ledger._active_gates[conv]["opened_at"] = time.time() - 120.0
+
+        # Run sweeper with 60s timeout
+        ledger._sweep_expired_gates(time.time(), timeout_sec=60.0)
+        self.assertNotIn(conv, ledger._active_gates)
+
+        # Verify UNVERIFIED entry was recorded
+        valid, count, msg = ledger.verify_chain()
+        self.assertTrue(valid)
+        self.assertEqual(count, 1)
+
+        last_rec = ledger.get_last_record()
+        self.assertEqual(last_rec["entry"]["tool"], "hardtruth_gate")
+        self.assertEqual(last_rec["entry"]["target"], "UNVERIFIED")
+        self.assertEqual(last_rec["entry"]["harness_status"], "UNVERIFIED_ABORT")
 
 
 if __name__ == "__main__":
