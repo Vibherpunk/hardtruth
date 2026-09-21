@@ -1633,6 +1633,9 @@ def handle_stop(payload: dict) -> dict:
             test_commands_executed += additional_test
             if reconciled_test_step > last_test_step:
                 last_test_step = reconciled_test_step
+            for succ_cmd, succ_step in command_step_map.items():
+                if is_test_execution_command(succ_cmd) and succ_step > last_test_step:
+                    last_test_step = succ_step
         except Exception:
             pass
     premise_str = premise_data.get("premise", "")
