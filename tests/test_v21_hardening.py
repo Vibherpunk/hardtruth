@@ -164,6 +164,67 @@ class TestV21Hardening(unittest.TestCase):
         self.assertEqual(res.get("decision"), "continue")
         self.assertIn("TEST WEAKENING DETECTED", res.get("reason", ""))
 
+    def test_4b_unittest_tautology_halted_rule_5(self):
+        """Rule 5: Unittest tautological assertions ('self.assertTrue(True)') HALT."""
+        conv = f"weak-unittest-{uuid.uuid4().hex}"
+        with tempfile.NamedTemporaryFile("w", suffix="_test.py", delete=False) as tf:
+            tf.write("import unittest\nclass Sanity(unittest.TestCase):\n    def test_s(self):\n        self.assertTrue(True)\n")
+            test_file = tf.name
+
+        self.run_hook("post_tool", {
+            "toolCall": {"name": "write_to_file", "args": {"TargetFile": test_file}},
+            "stepIdx": 1,
+            "conversationId": conv
+        })
+        self.run_hook("post_tool", {
+            "toolCall": {"name": "run_command", "args": {"CommandLine": "python -m unittest"}},
+            "stepIdx": 2,
+            "conversationId": conv,
+            "error": None,
+            "exitCode": 0
+        })
+
+        payload = {"conversationId": conv}
+        res = self.run_hook("stop", payload)
+        os.remove(test_file)
+
+        self.assertEqual(res.get("decision"), "continue")
+        self.assertIn("TEST WEAKENING DETECTED", res.get("reason", ""))
+        self.assertIn("assertTrue(True)", res.get("reason", ""))
+
+    def test_clean_session_not_penalized_by_pre_existing_dirty_files(self):
+        """A session that modified 0 files is NOT halted by pre-existing dirty files in git repo."""
+        repo_dir = tempfile.mkdtemp(prefix="dirty-repo-")
+        subprocess.run(["git", "init"], cwd=repo_dir, check=True, stdout=subprocess.PIPE)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo_dir, check=True)
+        init_file = os.path.join(repo_dir, "init.py")
+        with open(init_file, "w") as f:
+            f.write("x = 1\n")
+        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True)
+
+        # Pre-existing dirty file in the repo before the session baseline
+        dirty_file = os.path.join(repo_dir, "dirty.py")
+        with open(dirty_file, "w") as f:
+            f.write("dirty = True\n")
+
+        conv = f"clean-session-{uuid.uuid4().hex}"
+        # Start session baseline (recording baseline dirty files)
+        self.run_hook("post_tool", {
+            "toolCall": {"name": "view_file", "args": {"AbsolutePath": init_file}},
+            "stepIdx": 1,
+            "conversationId": conv,
+            "cwd": repo_dir
+        })
+
+        # Session stops without modifying any source files or running tests
+        payload = {"conversationId": conv, "workspacePaths": [repo_dir]}
+        res = self.run_hook("stop", payload)
+        shutil.rmtree(repo_dir, ignore_errors=True)
+
+        self.assertEqual(res.get("decision"), "allow")
+
     def test_5_cd_prefix_command_not_tainted(self):
         """cd dir && pytest is exit-preserving and MUST NOT be tainted."""
         self.assertFalse(is_tainted_shell_command("cd /workspace/foo && pytest tests/"))

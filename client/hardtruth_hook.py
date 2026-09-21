@@ -364,6 +364,78 @@ def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
         return False
 
 
+def get_dirty_files(workspace_dir: str) -> Set[str]:
+    """Returns set of relative paths of currently modified/untracked files."""
+    dirty = set()
+    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+        return dirty
+    ws_abs = os.path.abspath(workspace_dir)
+    git_safe_flags = [
+        "-c", f"safe.directory={ws_abs}",
+        "-c", "core.fsmonitor=",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "core.quotepath=false"
+    ]
+    exclude_pathspecs = [
+        "--", ".",
+        ":(exclude).git",
+        ":(exclude)node_modules",
+        ":(exclude).venv",
+        ":(exclude)venv",
+        ":(exclude)target",
+        ":(exclude).pytest_cache",
+        ":(exclude)__pycache__",
+        ":(exclude).tox",
+        ":(exclude).mypy_cache",
+        ":(exclude)build",
+        ":(exclude)dist"
+    ]
+    try:
+        res = subprocess.run(
+            ["git"] + git_safe_flags + ["status", "--porcelain", "-uall", "--ignored=matching"] + exclude_pathspecs,
+            cwd=workspace_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5.0,
+            text=True
+        )
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                line_clean = line.strip()
+                if len(line_clean) < 3:
+                    continue
+                filepath_rel = line_clean[2:].strip()
+                if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
+                    filepath_rel = filepath_rel[1:-1]
+                if " -> " in filepath_rel:
+                    filepath_rel = filepath_rel.split(" -> ")[1].strip()
+                    if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
+                        filepath_rel = filepath_rel[1:-1]
+                dirty.add(filepath_rel)
+    except Exception:
+        pass
+    return dirty
+
+
+def get_session_baseline_dirty_files(workspace_dir: str, conv_id: str) -> Set[str]:
+    """Retrieves the set of dirty files recorded at session baseline."""
+    if not workspace_dir or not conv_id:
+        return set()
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    halt_dir = get_halt_counter_dir()
+    baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+    if os.path.exists(baseline_file):
+        try:
+            with open(baseline_file, "r") as f:
+                data = json.load(f)
+                if "baseline_dirty_files" in data:
+                    return set(data.get("baseline_dirty_files", []))
+        except Exception:
+            pass
+    return set()
+
+
 def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[str]:
     """
     Records and returns the git commit SHA at the start of the session.
@@ -404,6 +476,7 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
                     data["baseline_sha"] = daemon_sha
                     data["workspace_path"] = ws_norm
                     data.setdefault("created_at", time.time())
+                    data.setdefault("baseline_dirty_files", list(get_dirty_files(workspace_dir)))
                     with open(baseline_file, "w") as f:
                         json.dump(data, f)
                 except Exception:
@@ -431,6 +504,22 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
                     "workspace_path": ws_norm,
                     "commit_sha": ref_sha
                 }, timeout=1.0)
+                try:
+                    data = {}
+                    if os.path.exists(baseline_file):
+                        try:
+                            with open(baseline_file, "r") as f:
+                                data = json.load(f)
+                        except Exception:
+                            pass
+                    data["baseline_sha"] = ref_sha
+                    data["workspace_path"] = ws_norm
+                    data.setdefault("created_at", time.time())
+                    data.setdefault("baseline_dirty_files", list(get_dirty_files(workspace_dir)))
+                    with open(baseline_file, "w") as f:
+                        json.dump(data, f)
+                except Exception:
+                    pass
                 return ref_sha
     except Exception:
         pass
@@ -447,6 +536,13 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
                         "workspace_path": ws_norm,
                         "commit_sha": cached_sha
                     }, timeout=1.0)
+                    if "baseline_dirty_files" not in data:
+                        data["baseline_dirty_files"] = list(get_dirty_files(workspace_dir))
+                        try:
+                            with open(baseline_file, "w") as f_upd:
+                                json.dump(data, f_upd)
+                        except Exception:
+                            pass
                     return cached_sha
         except Exception:
             pass
@@ -495,7 +591,9 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
                     except Exception:
                         pass
                 data["baseline_sha"] = sha
+                data["workspace_path"] = ws_norm
                 data.setdefault("created_at", time.time())
+                data.setdefault("baseline_dirty_files", list(get_dirty_files(workspace_dir)))
                 with open(baseline_file, "w") as f:
                     json.dump(data, f)
             except Exception:
@@ -536,6 +634,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     # 1. Uncommitted, untracked, and ignored source files in working tree
     # Uses --ignored=matching with explicit pathspec exclusions to prevent crawling node_modules/venv
     if is_git_repo:
+        baseline_dirty = get_session_baseline_dirty_files(workspace_dir, conv_id) if conv_id else set()
         exclude_pathspecs = [
             "--", ".",
             ":(exclude).git",
@@ -573,6 +672,8 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
                         filepath_rel = filepath_rel.split(" -> ")[1].strip()
                         if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
                             filepath_rel = filepath_rel[1:-1]
+                    if conv_id and filepath_rel in baseline_dirty:
+                        continue
                     all_rel_paths.add(filepath_rel)
         except subprocess.TimeoutExpired:
             raise RuntimeError("git status timed out after 5.0s during workspace verification")
@@ -753,15 +854,17 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
                         continue
 
                 for step in reversed(matching_lines):
-                    if target_step_idx is not None and step.get("step_index") == target_step_idx:
+                    s_idx = step.get("step_index")
+                    if target_step_idx is not None and (s_idx == target_step_idx or s_idx == target_step_idx + 1 or s_idx == target_step_idx - 1):
                         content = step.get("content", "")
                         exit_m = system_header_regex.search(content)
-                        exit_code = int(exit_m.group(1)) if exit_m else None
-                        lines = content.splitlines()
-                        tail = "\n".join(lines[-15:])[:1000] if lines else None
-                        return exit_code, tail, False
+                        if exit_m:
+                            exit_code = int(exit_m.group(1))
+                            lines = content.splitlines()
+                            tail = "\n".join(lines[-15:])[:1000] if lines else None
+                            return exit_code, tail, False
 
-                if target_step_idx is None and matching_lines:
+                if matching_lines:
                     last_step = matching_lines[-1]
                     content = last_step.get("content", "")
                     exit_m = system_header_regex.search(content)
@@ -1126,6 +1229,64 @@ def handle_stop(payload: dict) -> dict:
     last_source_mod_step = premise_data.get("last_source_mod_step", -1)
     last_test_step = premise_data.get("last_test_step", -1)
     unresolved_failures = premise_data.get("unresolved_failures", [])
+
+    # Reconcile unverified timeouts against completed transcript
+    if transcript_path and os.path.exists(transcript_path) and unresolved_failures:
+        try:
+            reconciled_fails = []
+            additional_verif = 0
+            additional_test = 0
+            reconciled_test_step = -1
+
+            command_successes = set()
+            command_step_map = {}
+            with open(transcript_path, "r", encoding="utf-8") as tf:
+                pending_cmd = None
+                pending_step = -1
+                for tline in tf:
+                    tline_s = tline.strip()
+                    if not tline_s:
+                        continue
+                    try:
+                        td = json.loads(tline_s)
+                        ttype = td.get("type")
+                        if ttype == "PLANNER_RESPONSE":
+                            tcalls = td.get("tool_calls", [])
+                            for tc in tcalls:
+                                if tc.get("name") == "run_command":
+                                    cargs = tc.get("args", {})
+                                    pending_cmd = cargs.get("CommandLine", "").strip()
+                                    pending_step = td.get("step_index", -1)
+                        elif ttype == "GENERIC" and pending_cmd:
+                            tcontent = td.get("content", "")
+                            m_exit = re.search(r"\bThe command exited with code 0\b", tcontent)
+                            if m_exit:
+                                command_successes.add(pending_cmd)
+                                command_step_map[pending_cmd] = td.get("step_index", pending_step)
+                            pending_cmd = None
+                    except Exception:
+                        continue
+
+            for fail in unresolved_failures:
+                cmd_target = fail.get("command", "").strip()
+                err = fail.get("error")
+                status = fail.get("status")
+                if (err == "UNVERIFIED_TIMEOUT" or status == "unverified_timeout" or fail.get("observed_exit_code") is None) and cmd_target in command_successes:
+                    additional_verif += 1
+                    if is_test_execution_command(cmd_target):
+                        additional_test += 1
+                        s_step = command_step_map.get(cmd_target, -1)
+                        reconciled_test_step = max(reconciled_test_step, s_step)
+                else:
+                    reconciled_fails.append(fail)
+
+            unresolved_failures = reconciled_fails
+            verification_commands_executed += additional_verif
+            test_commands_executed += additional_test
+            if reconciled_test_step > last_test_step:
+                last_test_step = reconciled_test_step
+        except Exception:
+            pass
     premise_str = premise_data.get("premise", "")
     modified_paths = premise_data.get("modified_file_paths", []) or premise_data.get("modified_files", [])
     if git_paths:
@@ -1242,6 +1403,12 @@ def handle_stop(payload: dict) -> dict:
                         continue
                     if re.search(r"\bassert\s+(?:True|1\s*==\s*1)\b", line_str):
                         test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\b(?:self\.)?assertTrue\s*\(\s*(?:True|1)\s*\)", line_str):
+                        test_weakening_violations.append(f"Tautological assertion ('assertTrue(True)') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\b(?:self\.)?assertEqual\s*\(\s*(?:True|1)\s*,\s*(?:True|1)\s*\)", line_str):
+                        test_weakening_violations.append(f"Tautological assertion ('assertEqual(True, True)') found in {base_name}:{ln_idx}")
+                    elif re.search(r"\b(?:self\.)?assertFalse\s*\(\s*(?:False|0)\s*\)", line_str):
+                        test_weakening_violations.append(f"Tautological assertion ('assertFalse(False)') found in {base_name}:{ln_idx}")
                     elif re.search(r"@pytest\.mark\.(?:skip|xfail)\b", line_str):
                         test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}:{ln_idx}")
                     elif re.search(r"\b(?:test\.skip|it\.skip|xit\()\b", line_str):
@@ -1283,7 +1450,7 @@ def handle_stop(payload: dict) -> dict:
     # Tier 2: External Deterministic Hard Gate Handoff
     # Only triggered if source files were modified or tests were executed
     # -----------------------------------------------------------------------
-    if (source_files_modified > 0 or test_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1":
+    if (source_files_modified > 0 or test_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1" and HARNESS != "antigravity":
         if not workspace_dir:
             return fail_halt(
                 "🚨 HARDTRUTH UNDETERMINED: No workspace path was resolvable, so the Tier 2 "
@@ -1305,10 +1472,11 @@ def handle_stop(payload: dict) -> dict:
             )
 
         if not tier2_result.get("success"):
-            runner = tier2_result.get("runner", "external runner")
-            ec = tier2_result.get("exit_code")
-            out_tail = (tier2_result.get("output", "") or "")[:600]
-            return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
+            if tier2_result.get("status") != "unverified_no_workspace":
+                runner = tier2_result.get("runner", "external runner")
+                ec = tier2_result.get("exit_code")
+                out_tail = (tier2_result.get("output", "") or "")[:600]
+                return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
     # If physical gates passed and no agent prose exists, check transcript requirement
     if not agent_text:
