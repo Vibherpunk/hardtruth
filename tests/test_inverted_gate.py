@@ -40,7 +40,7 @@ class TestInvertedGate(unittest.TestCase):
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
-            "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
+            "SYSTEM_ONE_URL": os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281"),
             # Round 8 (#6): run hook subprocesses token-less so test suites never
             # write records into the physical daemon ledger (daemon rejects with 401;
             # the hook degrades gracefully to its local temp ledger).

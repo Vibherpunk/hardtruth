@@ -157,7 +157,7 @@ def normalize_payload(p: dict) -> dict:
     return out
 
 CONTRADICTION_THRESHOLD = 0.70
-SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281")
 
 SOURCE_CODE_EXTENSIONS = {
     ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
@@ -977,7 +977,7 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     return source_files, doc_files, full_paths
 
 
-def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 300) -> Tuple[Optional[int], Optional[str], bool]:
+def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 1500) -> Tuple[Optional[int], Optional[str], bool]:
     r"""
     Polls transcript for up to max_wait_ms (50ms intervals) to extract observed exit code and stdout tail.
     Anchored strictly to \A (beginning of whole string) without re.MULTILINE to eliminate stdout spoofing.
@@ -1009,7 +1009,7 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
 
                 for step in reversed(matching_lines):
                     s_idx = step.get("step_index")
-                    if target_step_idx is not None and (s_idx == target_step_idx or s_idx == target_step_idx + 1 or s_idx == target_step_idx - 1):
+                    if target_step_idx is not None and (s_idx == target_step_idx or s_idx == target_step_idx + 1 or s_idx == target_step_idx - 1 or s_idx == target_step_idx + 2):
                         content = step.get("content", "")
                         exit_m = system_header_regex.search(content)
                         if exit_m:
@@ -1020,13 +1020,15 @@ def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wai
 
                 if matching_lines:
                     last_step = matching_lines[-1]
-                    content = last_step.get("content", "")
-                    exit_m = system_header_regex.search(content)
-                    if exit_m:
-                        exit_code = int(exit_m.group(1))
-                        lines = content.splitlines()
-                        tail = "\n".join(lines[-15:])[:1000] if lines else None
-                        return exit_code, tail, False
+                    s_idx = last_step.get("step_index")
+                    if target_step_idx is None or (s_idx is not None and s_idx >= target_step_idx - 1):
+                        content = last_step.get("content", "")
+                        exit_m = system_header_regex.search(content)
+                        if exit_m:
+                            exit_code = int(exit_m.group(1))
+                            lines = content.splitlines()
+                            tail = "\n".join(lines[-15:])[:1000] if lines else None
+                            return exit_code, tail, False
 
         except Exception:
             pass
@@ -1126,8 +1128,21 @@ def handle_post_tool_use(payload: dict) -> dict:
                 stdout_tail = tail
                 harness_status = "no_error" if ec == 0 else f"exit_{ec}"
             elif timed_out:
-                observed_exit_code = None
-                harness_status = "unverified_timeout"
+                if error_msg:
+                    m = re.search(r"exit status (\d+)", str(error_msg))
+                    if m:
+                        observed_exit_code = int(m.group(1))
+                        harness_status = f"exit_{observed_exit_code}"
+                    else:
+                        observed_exit_code = 1
+                        harness_status = "error"
+                elif error_msg == "" or error_msg is None:
+                    # In Antigravity PostToolUse lifecycle hook, error="" denotes successful execution (exit 0)
+                    observed_exit_code = 0
+                    harness_status = "no_error"
+                else:
+                    observed_exit_code = None
+                    harness_status = "unverified_timeout"
             else:
                 if error_msg:
                     m = re.search(r"exit status (\d+)", str(error_msg))
@@ -1135,7 +1150,11 @@ def handle_post_tool_use(payload: dict) -> dict:
                         observed_exit_code = int(m.group(1))
                         harness_status = f"exit_{observed_exit_code}"
                     else:
+                        observed_exit_code = 1
                         harness_status = "error"
+                elif error_msg == "" or error_msg is None:
+                    observed_exit_code = 0
+                    harness_status = "no_error"
                 else:
                     observed_exit_code = None
                     harness_status = "unverified_timeout"
@@ -1184,25 +1203,27 @@ def handle_post_tool_use(payload: dict) -> dict:
     }
 
     session_secret = get_or_create_session_secret(conv_id, tool_cwd)
-    call_system_one("v1/ledger/record", record_payload, timeout=2.0, session_secret=session_secret)
+    daemon_resp = call_system_one("v1/ledger/record", record_payload, timeout=2.0, session_secret=session_secret)
 
-    local_ledger = get_local_ledger()
-    if local_ledger:
-        try:
-            local_ledger.record_entry(
-                conversation_id=conv_id,
-                step_idx=step_idx,
-                tool=tool_name,
-                target=cmd_or_file,
-                observed_exit_code=observed_exit_code,
-                harness_status=harness_status,
-                error=str(error_msg) if error_msg else None,
-                stdout_tail=stdout_tail,
-                diff_stat=diff_stat,
-                cwd=tool_cwd
-            )
-        except Exception:
-            pass
+    # Only fall back to local ledger write if daemon API is unreachable
+    if not daemon_resp:
+        local_ledger = get_local_ledger()
+        if local_ledger:
+            try:
+                local_ledger.record_entry(
+                    conversation_id=conv_id,
+                    step_idx=step_idx,
+                    tool=tool_name,
+                    target=cmd_or_file,
+                    observed_exit_code=observed_exit_code,
+                    harness_status=harness_status,
+                    error=str(error_msg) if error_msg else None,
+                    stdout_tail=stdout_tail,
+                    diff_stat=diff_stat,
+                    cwd=tool_cwd
+                )
+            except Exception:
+                pass
 
     return {}
 
@@ -1546,7 +1567,12 @@ def handle_stop(payload: dict) -> dict:
             command_step_map = {}
             task_cmd_map = {}
 
-            with open(transcript_path, "r", encoding="utf-8") as tf:
+            target_transcript = transcript_path
+            full_transcript = transcript_path.replace("transcript.jsonl", "transcript_full.jsonl")
+            if os.path.exists(full_transcript):
+                target_transcript = full_transcript
+
+            with open(target_transcript, "r", encoding="utf-8") as tf:
                 pending_cmd = None
                 pending_step = -1
                 for tline in tf:
@@ -1602,32 +1628,39 @@ def handle_stop(payload: dict) -> dict:
 
                 is_resolved = False
                 resolving_step = -1
-                for succ in command_successes:
-                    if succ == cmd_target:
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
-                    # Suite encompassment: if succ is pytest tests/ and failed was pytest
-                    if cmd_target == "pytest" and succ.startswith("pytest"):
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
-                    if cmd_target == "pytest tests/" and (succ == "pytest tests/" or succ == "pytest"):
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
-                    if ("pytest tests" in succ or succ == "pytest") and cmd_target.startswith("pytest"):
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
-                    if "unittest discover" in succ and "unittest" in cmd_target:
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
-                    if cmd_target in succ:
-                        is_resolved = True
-                        resolving_step = command_step_map.get(succ, -1)
-                        break
+
+                # Non-verification / non-test commands (e.g. curl, ssh, inspect) cannot be test failures
+                if not is_verification_command(cmd_target) and not is_test_execution_command(cmd_target):
+                    is_resolved = True
+                    resolving_step = fail.get("stepIdx", -1)
+
+                if not is_resolved:
+                    for succ in command_successes:
+                        if succ == cmd_target:
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
+                        # Suite encompassment: if succ is pytest tests/ and failed was pytest
+                        if cmd_target == "pytest" and succ.startswith("pytest"):
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
+                        if cmd_target == "pytest tests/" and (succ == "pytest tests/" or succ == "pytest"):
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
+                        if ("pytest tests" in succ or succ == "pytest") and cmd_target.startswith("pytest"):
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
+                        if "unittest discover" in succ and "unittest" in cmd_target:
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
+                        if cmd_target in succ or succ in cmd_target:
+                            is_resolved = True
+                            resolving_step = command_step_map.get(succ, -1)
+                            break
 
                 if is_resolved:
                     additional_verif += 1

@@ -39,7 +39,7 @@ class TestAdversarialEvasion(unittest.TestCase):
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
-            "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
+            "SYSTEM_ONE_URL": os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281"),
             "HARDTRUTH_SKIP_TIER2": "1",
             "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key")
         }

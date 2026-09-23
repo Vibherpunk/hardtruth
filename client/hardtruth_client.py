@@ -38,7 +38,7 @@ CONTRADICTION_THRESHOLD = 0.70
 
 
 class HardTruthClient:
-    def __init__(self, daemon_url: str = "http://127.0.0.1:8000", ledger_path: str = None):
+    def __init__(self, daemon_url: str = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281"), ledger_path: str = None):
         self.daemon_url = daemon_url.rstrip("/")
         self.ledger_path = ledger_path or os.environ.get(
             "HARDTRUTH_DAEMON_LEDGER",

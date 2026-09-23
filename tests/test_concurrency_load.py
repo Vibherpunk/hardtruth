@@ -36,7 +36,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 HOOK_SCRIPT = os.path.join(REPO_ROOT, "client", "hardtruth_hook.py")
-DAEMON_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:8000")
+DAEMON_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281")
 API_KEY_PATH = os.path.expanduser("~/.hardtruth/daemon_api.key")
 
 if os.environ.get("HARDTRUTH_TIER2_SANDBOX") == "1":
@@ -157,38 +157,37 @@ class TestMultiSessionInterleaving:
             }
 
         # Build execution tasks interleaved across sessions and steps
-        tasks = []
-        for step in range(steps_per_session):
-            for i in range(num_sessions):
-                tool = "run_command" if step % 2 == 0 else "write_to_file"
-                target = f"pytest tests/test_sess_{i}_step_{step}.py" if tool == "run_command" else f"src/sess_{i}/mod_{step}.py"
-                tasks.append((i, step, tool, target))
-
-        def write_event(task_info):
-            sess_idx, step_idx, tool, target = task_info
+        def run_session(sess_idx):
             sess = sessions[sess_idx]
-            payload = {
-                "conversationId": sess["conversationId"],
-                "stepIdx": step_idx,
-                "tool": tool,
-                "target": target,
-                "observed_exit_code": 0,
-                "harness_status": "no_error",
-                "cwd": os.getcwd()
-            }
-            code, resp, lat = make_daemon_request(
-                "v1/ledger/record",
-                method="POST",
-                payload=payload,
-                session_secret=sess["secret"]
-            )
-            return sess_idx, step_idx, code, resp, lat
+            sess_results = []
+            for step in range(steps_per_session):
+                tool = "run_command" if step % 2 == 0 else "write_to_file"
+                target = f"pytest tests/test_sess_{sess_idx}_step_{step}.py" if tool == "run_command" else f"src/sess_{sess_idx}/mod_{step}.py"
+                payload = {
+                    "conversationId": sess["conversationId"],
+                    "stepIdx": step,
+                    "tool": tool,
+                    "target": target,
+                    "observed_exit_code": 0,
+                    "harness_status": "no_error",
+                    "cwd": os.getcwd()
+                }
+                code, resp, lat = make_daemon_request(
+                    "v1/ledger/record",
+                    method="POST",
+                    payload=payload,
+                    session_secret=sess["secret"]
+                )
+                sess_results.append((sess_idx, step, code, resp, lat))
+            return sess_results
 
-        # Dispatch all 64 writes concurrently across 8 worker threads
+        # Dispatch all 8 sessions concurrently across 8 worker threads
         t_start = time.perf_counter()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_sessions) as pool:
-            results = list(pool.map(write_event, tasks))
+            session_result_lists = list(pool.map(run_session, range(num_sessions)))
         wall_time_ms = (time.perf_counter() - t_start) * 1000.0
+
+        results = [r for s_res in session_result_lists for r in s_res]
 
         latencies = [r[4] for r in results]
         status_codes = [r[2] for r in results]

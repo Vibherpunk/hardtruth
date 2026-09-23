@@ -220,6 +220,49 @@ class TestRound8PurgeRecords(unittest.TestCase):
             with self.assertRaises(ValueError):
                 ledger.purge_records(["test-conv-"])
 
+    def test_eof_incomplete_line_auto_quarantine(self):
+        """Plan B: A crashed writer leaving an incomplete trailing line at EOF is auto-healed."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger_path = os.path.join(td, "l.jsonl")
+            ledger = DaemonLedger(ledger_path=ledger_path, key_path=os.path.join(td, "k"))
+            for i in range(3):
+                ledger.record_entry(conversation_id="c1", step_idx=i, tool="run_command", target="pytest", observed_exit_code=0)
+
+            # Append broken crash fragment to EOF
+            with open(ledger_path, "a", encoding="utf-8") as f:
+                f.write('{"index": 3, "prev_hash": "abc", "entry": {"conversationId": "c1", "stepIdx": 3')
+
+            valid, count, msg = ledger.verify_chain()
+            self.assertTrue(valid, f"Expected chain to auto-quarantine EOF crash line, got: {msg}")
+            self.assertEqual(count, 3)
+
+            # Next write should continue cleanly
+            rec = ledger.record_entry(conversation_id="c1", step_idx=3, tool="run_command", target="pytest", observed_exit_code=0)
+            self.assertEqual(rec["index"], 3)
+            valid2, count2, msg2 = ledger.verify_chain()
+            self.assertTrue(valid2, msg2)
+            self.assertEqual(count2, 4)
+
+    def test_midchain_tamper_strictly_halts(self):
+        """A broken or invalid JSON line mid-chain must halt immediately as tamper."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger_path = os.path.join(td, "l.jsonl")
+            ledger = DaemonLedger(ledger_path=ledger_path, key_path=os.path.join(td, "k"))
+            for i in range(3):
+                ledger.record_entry(conversation_id="c1", step_idx=i, tool="run_command", target="pytest", observed_exit_code=0)
+
+            # Inject broken JSON in the middle (line 1)
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            lines.insert(1, 'BROKEN_JSON_LINE\n')
+            with open(ledger_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+
+            valid, count, msg = ledger.verify_chain()
+            self.assertFalse(valid)
+            self.assertIn("JSON_PARSE_ERROR", msg)
+
 
 if __name__ == "__main__":
     unittest.main()
+

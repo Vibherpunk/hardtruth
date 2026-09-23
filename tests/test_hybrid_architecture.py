@@ -44,7 +44,7 @@ class TestHybridArchitecture(unittest.TestCase):
             "HARDTRUTH_LEDGER_PATH": self.ledger_file,
             "HARDTRUTH_DAEMON_LEDGER": self.ledger_file,
             "HARDTRUTH_HALT_DIR": self.halt_dir,
-            "SYSTEM_ONE_URL": "http://127.0.0.1:8000",
+            "SYSTEM_ONE_URL": os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281"),
             "HARDTRUTH_SKIP_TIER2": "1",  # Skipped unless specifically tested
             # Round 8 (#6): run hook subprocesses token-less so test suites never write
             # records into the physical daemon ledger (daemon rejects with 401; hook

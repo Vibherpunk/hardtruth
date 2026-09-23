@@ -13,3 +13,7 @@ HANDOFF_PROMPT.md
 *audit_findings*.md
 round*_audit_findings.md
 
+scratch/
+benchmarks/
+goose-plugin-hardtruth/
+

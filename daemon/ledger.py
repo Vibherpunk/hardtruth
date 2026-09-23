@@ -99,7 +99,7 @@ def strip_shell_prefixes(cmd: str) -> str:
 
 # Canonical test runners anchored to command invocation start
 TEST_RUNNER_PREFIX_PATTERN = re.compile(
-    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test)\b",
+    r"^(?:pytest|python[0-9.]*\s+(?:-m\s+(?:unittest|pytest)|\S*test\S*\.py)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test)\b",
     re.IGNORECASE
 )
 
@@ -112,12 +112,12 @@ STATIC_CHECK_PREFIX_PATTERN = re.compile(
 # Legacy aliases for backward compatibility where needed
 TEST_CMD_PATTERN = TEST_RUNNER_PREFIX_PATTERN
 VERIFICATION_CMD_PATTERN = re.compile(
-    r"^(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    r"^(?:pytest|python[0-9.]*\s+(?:-m\s+(?:unittest|pytest)|\S*test\S*\.py)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
     re.IGNORECASE
 )
 
 VERIFICATION_ANYWHERE_PATTERN = re.compile(
-    r"(?:^|[\s;&|(\r\n])(?:pytest|python[0-9.]*\s+-m\s+(?:unittest|pytest)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
+    r"(?:^|[\s;&|(\r\n])(?:pytest|python[0-9.]*\s+(?:-m\s+(?:unittest|pytest)|\S*test\S*\.py)|npm\s+test|npm\s+run\s+test(?::\S+)?|pnpm\s+(?:run\s+)?test(?::\S+)?|yarn\s+test(?::\S+)?|bun\s+test|cargo\s+test|make\s+test|go\s+test|rspec|bundle\s+exec\s+rspec|jest|vitest|tox|nox|ctest|mvn\s+test|\./gradlew\s+test|gradle\s+test|dotnet\s+test|swift\s+test|rake\s+test|phpunit|bin/rails\s+test|ruff|mypy|flake8|eslint|biome|pylint|golangci-lint|cargo\s+clippy)\b",
     re.IGNORECASE
 )
 
@@ -174,7 +174,7 @@ DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
 
 
 def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects any command chained with masking operators, subshells, conditionals, or dangerous env overrides (B1/B2 hardened)."""
+    """Detects any command chained with masking operators, subshells, conditionals, or dangerous env overrides."""
     raw_cmd = (cmd or "").strip()
     if not raw_cmd:
         return False
@@ -353,6 +353,76 @@ def can_suite_resolve_failure(
     return False
 
 
+class CrossProcessLedgerLock:
+    """
+    Robust cross-process & cross-VM lock combining an atomic directory lock (mkdir)
+    with fcntl.flock to guarantee mutual exclusion across macOS host and container bind mounts.
+    """
+    def __init__(self, ledger_path: str, timeout_sec: float = 3.0, stale_sec: float = 5.0):
+        self.lock_dir = ledger_path + ".lock"
+        self.flock_file = ledger_path + ".flock"
+        self.timeout_sec = timeout_sec
+        self.stale_sec = stale_sec
+        self._acquired_dir = False
+        self._flock_fd = None
+
+    def acquire(self) -> bool:
+        start = time.time()
+        delay = 0.005
+        while True:
+            try:
+                os.mkdir(self.lock_dir)
+                self._acquired_dir = True
+                break
+            except FileExistsError:
+                try:
+                    mtime = os.path.getmtime(self.lock_dir)
+                    if (time.time() - mtime) > self.stale_sec:
+                        try:
+                            os.rmdir(self.lock_dir)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if (time.time() - start) >= self.timeout_sec:
+                break
+
+            time.sleep(delay)
+            delay = min(delay * 1.5, 0.05)
+
+        try:
+            self._flock_fd = os.open(self.flock_file, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(self._flock_fd, fcntl.LOCK_EX)
+        except Exception:
+            pass
+
+        return True
+
+    def release(self):
+        if self._flock_fd is not None:
+            try:
+                fcntl.flock(self._flock_fd, fcntl.LOCK_UN)
+                os.close(self._flock_fd)
+            except Exception:
+                pass
+            self._flock_fd = None
+
+        if self._acquired_dir:
+            try:
+                os.rmdir(self.lock_dir)
+            except Exception:
+                pass
+            self._acquired_dir = False
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
 class DaemonLedger:
     def __init__(self, ledger_path: str = None, key_path: str = None):
         self.ledger_path = ledger_path or os.environ.get("HARDTRUTH_DAEMON_LEDGER", DEFAULT_LEDGER_PATH)
@@ -362,7 +432,7 @@ class DaemonLedger:
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._active_gates: Dict[str, Dict[str, Any]] = {}
         self._step_counters: Dict[str, int] = {}
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         self._chain_cache: Optional[Tuple[int, int, Tuple[bool, int, str]]] = None
 
     def start_session(self, conversation_id: str, workspace_path: Optional[str] = None) -> Tuple[str, Optional[str]]:
@@ -508,44 +578,50 @@ class DaemonLedger:
         msg = f"{index}:{prev_hash}:{canonical_entry}".encode("utf-8")
         return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
 
-    def _read_last_line_fast(self, f) -> Optional[str]:
-        """Reads the last non-empty line of an open file via reverse seek in O(1) time."""
+    def _read_last_record_binary(self) -> Optional[dict]:
+        """Reads backwards from the end of file in binary mode to find the last valid JSON record."""
+        if not os.path.exists(self.ledger_path):
+            return None
         try:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            if size == 0:
-                return None
-            buffer_size = min(8192, size)
-            f.seek(size - buffer_size)
-            chunk = f.read()
-            lines = chunk.splitlines()
-            for line in reversed(lines):
-                s = line.strip()
-                if s:
-                    return s
-            if buffer_size < size:
-                f.seek(0)
-                last_line = None
-                for line in f:
+            with open(self.ledger_path, "rb") as rf:
+                rf.seek(0, os.SEEK_END)
+                size = rf.tell()
+                if size == 0:
+                    return None
+                buffer_size = min(65536, size)
+                rf.seek(max(0, size - buffer_size))
+                chunk = rf.read()
+                lines = chunk.splitlines()
+                for line in reversed(lines):
                     s = line.strip()
-                    if s:
-                        last_line = s
-                return last_line
+                    if not s:
+                        continue
+                    try:
+                        r = json.loads(s.decode("utf-8"))
+                        if isinstance(r, dict) and "index" in r and "hash" in r:
+                            return r
+                    except Exception:
+                        continue
+                if buffer_size < size:
+                    rf.seek(0)
+                    last_record = None
+                    for line in rf:
+                        s = line.strip()
+                        if not s:
+                            continue
+                        try:
+                            r = json.loads(s.decode("utf-8"))
+                            if isinstance(r, dict) and "index" in r and "hash" in r:
+                                last_record = r
+                        except Exception:
+                            continue
+                    return last_record
         except Exception:
             pass
         return None
 
     def get_last_record(self) -> Optional[dict]:
-        if not os.path.exists(self.ledger_path):
-            return None
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            last_line = self._read_last_line_fast(f)
-        if last_line:
-            try:
-                return json.loads(last_line)
-            except Exception:
-                return None
-        return None
+        return self._read_last_record_binary()
 
     def record_entry(
         self,
@@ -562,7 +638,7 @@ class DaemonLedger:
         cwd: Optional[str] = None
     ) -> dict:
         """
-        Appends an entry to the HMAC-SHA256 hash-chained daemon ledger.
+        Appends an entry to the HMAC-SHA256 hash-chained daemon ledger using atomic single-call POSIX append.
         """
         now = time.time()
         self._sweep_expired_gates(now)
@@ -575,82 +651,78 @@ class DaemonLedger:
                 pass
 
             file_exists = os.path.exists(self.ledger_path)
-            with open(self.ledger_path, "a+", encoding="utf-8") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+            with CrossProcessLedgerLock(self.ledger_path):
+                last_record = self._read_last_record_binary()
+                if last_record and isinstance(last_record, dict) and "index" in last_record:
+                    index = last_record.get("index", 0) + 1
+                    prev_hash = last_record.get("hash", "0" * 64)
+                else:
+                    index = 0
+                    prev_hash = "0" * 64
+
+                # Check for shell operator taint
+                is_tainted = False
+                if tool == "run_command" and is_tainted_shell_command(target):
+                    is_tainted = True
+                    error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
+                    harness_status = "tainted_shell_operator"
+
+                # Monotonic Step Index Enforcement (defeats step backdating on indexed harnesses)
+                conv_str = str(conversation_id)
+                if hasattr(self, "_sessions") and conv_str in self._sessions:
+                    last_step = self._sessions[conv_str].get("last_step_idx", -1)
+                    if last_step > 0 and step_idx < last_step:
+                        raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+                    self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
+                elif hasattr(self, "_step_counters"):
+                    last_step = self._step_counters.get(conv_str, -1)
+                    if last_step > 0 and step_idx < last_step:
+                        raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
+                    self._step_counters[conv_str] = max(last_step, step_idx)
+
+                entry_data = {
+                    "conversationId": conversation_id,
+                    "stepIdx": step_idx,
+                    "tool": tool,
+                    "target": target,
+                    "observed_exit_code": observed_exit_code,
+                    "harness_status": harness_status or ("no_error" if observed_exit_code == 0 and not is_tainted else "error" if observed_exit_code is not None or is_tainted else None),
+                    "error": error,
+                    "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
+                    "diff_stat": diff_stat[:200] if diff_stat else None,
+                    "timestamp": timestamp or time.time(),
+                    "tainted": is_tainted,
+                    "cwd": cwd
+                }
+
+                canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
+                record_hash = self._compute_hash(index, prev_hash, canonical_entry)
+
+                status_compat = "error" if error or is_tainted or (observed_exit_code is not None and observed_exit_code != 0) else "success"
+
+                record = {
+                    "index": index,
+                    "prev_hash": prev_hash,
+                    "entry": entry_data,
+                    "hash": record_hash,
+                    # Top-level backwards compatibility fields
+                    "target": target,
+                    "status": status_compat,
+                    "tool": tool,
+                    "conversationId": conversation_id,
+                    "stepIdx": step_idx,
+                    "error": error,
+                    "cwd": cwd
+                }
+
+                record_bytes = (json.dumps(record) + "\n").encode("utf-8")
+                fd = os.open(self.ledger_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 try:
-                    last_line = self._read_last_line_fast(f)
-                    if last_line:
-                        try:
-                            last_record = json.loads(last_line)
-                            index = last_record.get("index", 0) + 1
-                            prev_hash = last_record.get("hash", "0" * 64)
-                        except Exception:
-                            index = 0
-                            prev_hash = "0" * 64
-                    else:
-                        index = 0
-                        prev_hash = "0" * 64
-
-                    # Check for shell operator taint
-                    is_tainted = False
-                    if tool == "run_command" and is_tainted_shell_command(target):
-                        is_tainted = True
-                        error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
-                        harness_status = "tainted_shell_operator"
-
-                    # Monotonic Step Index Enforcement (defeats step backdating on indexed harnesses)
-                    conv_str = str(conversation_id)
-                    if hasattr(self, "_sessions") and conv_str in self._sessions:
-                        last_step = self._sessions[conv_str].get("last_step_idx", -1)
-                        if last_step > 0 and step_idx < last_step:
-                            raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
-                        self._sessions[conv_str]["last_step_idx"] = max(last_step, step_idx)
-                    elif hasattr(self, "_step_counters"):
-                        last_step = self._step_counters.get(conv_str, -1)
-                        if last_step > 0 and step_idx < last_step:
-                            raise ValueError(f"Out-of-order step execution: stepIdx {step_idx} cannot be less than last recorded stepIdx {last_step}")
-                        self._step_counters[conv_str] = max(last_step, step_idx)
-
-                    entry_data = {
-                        "conversationId": conversation_id,
-                        "stepIdx": step_idx,
-                        "tool": tool,
-                        "target": target,
-                        "observed_exit_code": observed_exit_code,
-                        "harness_status": harness_status or ("no_error" if observed_exit_code == 0 and not is_tainted else "error" if observed_exit_code is not None or is_tainted else None),
-                        "error": error,
-                        "stdout_tail": stdout_tail[:1000] if stdout_tail else None,
-                        "diff_stat": diff_stat[:200] if diff_stat else None,
-                        "timestamp": timestamp or time.time(),
-                        "tainted": is_tainted,
-                        "cwd": cwd
-                    }
-
-                    canonical_entry = json.dumps(entry_data, sort_keys=True, separators=(',', ':'))
-                    record_hash = self._compute_hash(index, prev_hash, canonical_entry)
-
-                    status_compat = "error" if error or is_tainted or (observed_exit_code is not None and observed_exit_code != 0) else "success"
-
-                    record = {
-                        "index": index,
-                        "prev_hash": prev_hash,
-                        "entry": entry_data,
-                        "hash": record_hash,
-                        # Top-level backwards compatibility fields
-                        "target": target,
-                        "status": status_compat,
-                        "tool": tool,
-                        "conversationId": conversation_id,
-                        "stepIdx": step_idx,
-                        "error": error,
-                        "cwd": cwd
-                    }
-
-                    f.seek(0, os.SEEK_END)
-                    f.write(json.dumps(record) + "\n")
-                    f.flush()
+                    os.write(fd, record_bytes)
+                    os.fsync(fd)
                 finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    os.close(fd)
 
             if not file_exists:
                 try:
@@ -736,38 +808,81 @@ class DaemonLedger:
         expected_prev_hash = "0" * 64
         expected_index = 0
 
-        with open(self.ledger_path, "r", encoding="utf-8") as f:
-            for line_no, line in enumerate(f):
-                line_s = line.strip()
-                if not line_s:
-                    continue
-                try:
-                    record = json.loads(line_s)
-                except Exception as e:
+        lines_data = []
+        valid_byte_offset = 0
+        try:
+            with open(self.ledger_path, "rb") as f:
+                for line_no, raw_line in enumerate(f):
+                    line_len = len(raw_line)
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        valid_byte_offset += line_len
+                        continue
+                    lines_data.append((line_no, stripped, valid_byte_offset, line_len))
+                    valid_byte_offset += line_len
+        except Exception as e:
+            return False, 0, f"LEDGER_READ_ERROR: {e}"
+
+        total_lines = len(lines_data)
+        for i, (line_no, raw_line, offset, line_len) in enumerate(lines_data):
+            try:
+                record = json.loads(raw_line.decode("utf-8"))
+            except Exception as e:
+                # If this is the trailing line at EOF, retry or auto-quarantine
+                if i == total_lines - 1:
+                    repaired = False
+                    for backoff in [0.025, 0.050, 0.100]:
+                        time.sleep(backoff)
+                        try:
+                            with open(self.ledger_path, "rb") as f2:
+                                f2.seek(offset)
+                                fresh_raw = f2.read().strip()
+                                if fresh_raw:
+                                    record = json.loads(fresh_raw.decode("utf-8"))
+                                    repaired = True
+                                    break
+                        except Exception:
+                            continue
+
+                    if not repaired:
+                        # Auto-quarantine incomplete trailing EOF line from a crashed process
+                        try:
+                            with CrossProcessLedgerLock(self.ledger_path):
+                                with open(self.ledger_path, "r+b") as tf:
+                                    tf.seek(offset)
+                                    tf.truncate()
+                            break
+                        except Exception as trunc_err:
+                            return False, expected_index, f"JSON_PARSE_ERROR on line {line_no} at EOF (truncation failed: {trunc_err}): {e}"
+                else:
                     return False, expected_index, f"JSON_PARSE_ERROR on line {line_no}: {e}"
 
-                idx = record.get("index")
-                prev_h = record.get("prev_hash")
-                entry = record.get("entry")
-                rec_h = record.get("hash")
+            idx = record.get("index")
+            prev_h = record.get("prev_hash")
+            entry = record.get("entry")
+            rec_h = record.get("hash")
 
-                if idx != expected_index:
-                    return False, expected_index, f"INDEX_GAP: expected {expected_index}, got {idx}"
+            if idx != expected_index:
+                return False, expected_index, f"INDEX_GAP: expected {expected_index}, got {idx}"
 
-                if prev_h != expected_prev_hash:
-                    return False, expected_index, f"CHAIN_BROKEN at index {idx}: expected prev {expected_prev_hash[:12]}, got {prev_h[:12]}"
+            if prev_h != expected_prev_hash:
+                return False, expected_index, f"CHAIN_BROKEN at index {idx}: expected prev {expected_prev_hash[:12]}, got {prev_h[:12]}"
 
-                canonical_entry = json.dumps(entry, sort_keys=True, separators=(',', ':'))
-                recomputed = self._compute_hash(idx, prev_h, canonical_entry)
-                if not hmac.compare_digest(recomputed, rec_h):
-                    return False, expected_index, f"HASH_MISMATCH at index {idx}: computed {recomputed[:12]} vs recorded {rec_h[:12]}"
+            canonical_entry = json.dumps(entry, sort_keys=True, separators=(',', ':'))
+            recomputed = self._compute_hash(idx, prev_h, canonical_entry)
+            if not hmac.compare_digest(recomputed, rec_h):
+                return False, expected_index, f"HASH_MISMATCH at index {idx}: computed {recomputed[:12]} vs recorded {rec_h[:12]}"
 
-                expected_prev_hash = rec_h
-                expected_index += 1
+            expected_prev_hash = rec_h
+            expected_index += 1
 
         result = (True, expected_index, "VALID")
         if st is not None:
-            self._chain_cache = (st.st_mtime_ns, st.st_size, result)
+            try:
+                st_now = os.stat(self.ledger_path)
+                self._chain_cache = (st_now.st_mtime_ns, st_now.st_size, result)
+            except Exception:
+                self._chain_cache = None
         return result
 
     def count_records_by_prefix(self, prefixes) -> dict:
@@ -924,8 +1039,8 @@ class DaemonLedger:
 
             if tool == "run_command":
                 all_commands.append(e)
-                is_verif = is_verification_command(target) or tainted
-                is_test = is_test_execution_command(target) or tainted
+                is_verif = is_verification_command(target)
+                is_test = is_test_execution_command(target)
                 if is_verif:
                     failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None) or (status == "unverified_timeout")
                     if failed:
