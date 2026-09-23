@@ -253,29 +253,35 @@ def can_suite_resolve_failure(
     clean = clean_cmd.strip()
     failed = failed_cmd.strip()
 
-    # Clean command MUST be an authentic test execution command (not a linter, echo, or script)
-    if not is_test_execution_command(clean):
-        return False
-
     # CWD check: different working directories cannot resolve each other
     if clean_cwd and failed_cwd:
         if os.path.abspath(clean_cwd) != os.path.abspath(failed_cwd):
             return False
 
-    if clean == failed:
+    # Exact match: any authentic verification command (test runner or linter) resolves its previous failure
+    if clean == failed and is_verification_command(clean):
         return True
+
+    # Hierarchy resolution: clean command MUST be an authentic test execution command (not a linter, echo, or script)
+    if not is_test_execution_command(clean):
+        return False
 
     # Filter flag check: if clean runs with test filters (-k, -m, --filter),
     # it only tests a subset of tests. It can NEVER resolve a whole-file or broader failure!
     # It can only resolve if failed had the exact same filtered command.
-    clean_has_filter = bool(re.search(r"(?:^|\s)(?:-k|-m|--filter)\b", clean))
+    clean_no_py_m = re.sub(r"^(?:python3?|py)\s+-m\s+", "", clean)
+    clean_has_filter = bool(re.search(r"(?:^|\s)(?:-k|-m|--filter)\b", clean_no_py_m))
     if clean_has_filter:
         return clean == failed
 
     # Helper to extract target test file/dir token from pytest command
     def extract_pytest_target(cmd_str: str) -> Optional[str]:
         parts = cmd_str.split()
-        if not parts or parts[0] != "pytest":
+        if not parts:
+            return None
+        if len(parts) >= 3 and parts[0] in ("python", "python3", "py") and parts[1] == "-m" and parts[2] == "pytest":
+            parts = parts[2:]
+        if parts[0] != "pytest":
             return None
         skip_next = False
         for p in parts[1:]:
@@ -297,12 +303,14 @@ def can_suite_resolve_failure(
     # A root-level pytest invocation with flags only (e.g. pytest -v, pytest -x, pytest --exitfirst)
     # or bare pytest runs all tests in the workspace root, encompassing any pytest failure.
     clean_parts = clean.split()
+    if len(clean_parts) >= 3 and clean_parts[0] in ("python", "python3", "py") and clean_parts[1] == "-m" and clean_parts[2] == "pytest":
+        clean_parts = clean_parts[2:]
     is_root_clean_pytest = (
         bool(clean_parts) and (clean_parts[0] == "pytest" or "unittest" in clean)
         and not clean_has_filter
         and (t_clean is None or t_clean in [".", "./"])
     )
-    if is_root_clean_pytest and (failed.startswith("pytest") or "unittest" in failed):
+    if is_root_clean_pytest and ("pytest" in failed or "unittest" in failed):
         return True
 
     if t_clean and t_failed:
