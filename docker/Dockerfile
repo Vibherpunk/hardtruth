@@ -11,10 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r /app/requirements.txt
-# Round 8 (#5): preload the NLI model into the image cache so the first
-# /v1/verify-claim in a fresh container is fast (no runtime download).
-# Kept as its own layer so rebuilds cache it.
-RUN python3 -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; AutoTokenizer.from_pretrained('cross-encoder/nli-deberta-v3-small'); AutoModelForSequenceClassification.from_pretrained('cross-encoder/nli-deberta-v3-small')"
+# HardTruth 2.0: preload ModernBERT NLI model into image cache for instant cold starts
+ENV HARDTRUTH_NLI_MODEL="tasksource/ModernBERT-base-nli"
+RUN python3 -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; import os; m = os.environ.get('HARDTRUTH_NLI_MODEL', 'tasksource/ModernBERT-base-nli'); AutoTokenizer.from_pretrained(m); AutoModelForSequenceClassification.from_pretrained(m)"
 # Tier 2 needs pytest in-image to run canonical suites in the subprocess sandbox
 RUN pip install --no-cache-dir pytest httpx
 

@@ -16,12 +16,16 @@ import os
 import sys
 import time
 import hmac
+import logging
 import threading
 try:
     import psutil
 except ImportError:
     psutil = None
 from typing import Dict, Any, Optional, List
+
+logger = logging.getLogger("hardtruth.daemon")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 from pydantic import BaseModel, Field
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -49,7 +53,7 @@ except ImportError:
 app = FastAPI(
     title="HardTruth Verification Daemon",
     description="Sub-15ms Natural Language Inference verification, Tamper-Evident Ledger & Tier 2 Gate",
-    version="1.2.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -94,37 +98,171 @@ def require_daemon_auth(authorization: Optional[str] = Header(None)):
         raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid HardTruth API token")
 
 # ---------------------------------------------------------------------------
-# Model Engine (DeBERTa-v3 NLI Direct Token Pair Evaluation)
+# Model Engine (ModernBERT / Universal NLI Cross-Encoder)
 # ---------------------------------------------------------------------------
 
 _nli_direct_lock = threading.Lock()
 _nli_direct_model = None
 _nli_direct_tok = None
+_nli_label_indices = {"contradiction": 0, "entailment": 1, "neutral": 2}
+_nli_max_length = 2048
+_nli_model_name = os.environ.get("HARDTRUTH_NLI_MODEL", "tasksource/ModernBERT-base-nli")
+
+def _resolve_label_indices(config) -> Dict[str, int]:
+    raw = getattr(config, "label2id", None) or {}
+    l2i = {str(k).strip().lower(): int(v) for k, v in raw.items()}
+    try:
+        c_idx = l2i["contradiction"]
+        e_idx = l2i["entailment"]
+        n_idx = l2i["neutral"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"NLI model '{_nli_model_name}' has incomplete or missing label2id (got {raw!r}). "
+            f"Refusing to guess a label ordering for safety-gating NLI engine. Missing key: {exc}"
+        )
+    resolved = {"contradiction": c_idx, "entailment": e_idx, "neutral": n_idx}
+    if sorted(resolved.values()) != [0, 1, 2]:
+        raise RuntimeError(f"label2id does not resolve to a clean permutation of [0, 1, 2]: {resolved}")
+    return resolved
+
+def _run_startup_canary(tok, model, device, indices: Dict[str, int], max_len: int):
+    """
+    Executes a deterministic sanity canary on startup.
+    Asserts that contradiction pairs yield high contradiction probability,
+    and entailment pairs yield high entailment probability.
+    Aborts daemon immediately if logits/indices are inverted.
+    """
+    import torch
+    test_premise = "Pytest exit code 1; 2 tests failed."
+    test_contra = "All tests passed successfully."
+    test_entail = "Some tests failed with exit code 1."
+
+    inputs = tok(
+        [test_premise, test_premise],
+        [test_contra, test_entail],
+        padding=True,
+        truncation=True,
+        max_length=max_len,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1).tolist()
+
+    c_prob = probs[0][indices["contradiction"]]
+    e_prob = probs[1][indices["entailment"]]
+
+    logger.info(f"NLI startup canary: contradiction_p={c_prob:.4f}, entailment_p={e_prob:.4f}")
+    if c_prob < 0.50:
+        raise RuntimeError(
+            f"NLI startup canary FAILED: contradiction prob {c_prob:.4f} < 0.50 for obvious contradiction! "
+            f"Aborting daemon to prevent safety gate inversion."
+        )
+    if e_prob < 0.50:
+        raise RuntimeError(
+            f"NLI startup canary FAILED: entailment prob {e_prob:.4f} < 0.50 for obvious entailment! "
+            f"Aborting daemon to prevent safety gate inversion."
+        )
 
 def get_nli_direct():
-    global _nli_direct_model, _nli_direct_tok
+    global _nli_direct_model, _nli_direct_tok, _nli_label_indices, _nli_max_length
     if _nli_direct_model is None:
         with _nli_direct_lock:
             if _nli_direct_model is None:
                 import torch
                 from transformers import AutoTokenizer, AutoModelForSequenceClassification
                 device = "mps" if torch.backends.mps.is_available() else "cpu"
-                _nli_direct_tok = AutoTokenizer.from_pretrained("cross-encoder/nli-deberta-v3-small")
+                _nli_direct_tok = AutoTokenizer.from_pretrained(_nli_model_name)
                 _nli_direct_model = AutoModelForSequenceClassification.from_pretrained(
-                    "cross-encoder/nli-deberta-v3-small"
+                    _nli_model_name
                 ).to(device)
                 _nli_direct_model.eval()
+
+                # Strictly resolve label indices
+                _nli_label_indices = _resolve_label_indices(_nli_direct_model.config)
+
+                # Dynamically resolve max context length
+                max_pos = getattr(_nli_direct_model.config, "max_position_embeddings", 2048)
+                _nli_max_length = max(1, min(int(max_pos), 8192))
+
+                # Run startup canary self-test
+                _run_startup_canary(_nli_direct_tok, _nli_direct_model, device, _nli_label_indices, _nli_max_length)
+
+                logger.info(
+                    f"Initialized NLI model '{_nli_model_name}' on {device}. "
+                    f"Max context: {_nli_max_length}, Label indices: {_nli_label_indices}"
+                )
     return _nli_direct_tok, _nli_direct_model
 
 
+def _evaluate_nli_pairs(pairs: List[Tuple[str, str]], threshold: float = 0.70):
+    """
+    Evaluates a batch of (premise, hypothesis) pairs using the loaded NLI cross-encoder.
+    Uses dynamic label mapping and dynamic context length.
+    Returns list of dicts: {"hypothesis": ..., "status": ..., "confidence": ..., "probabilities": ...}
+    """
+    import torch
+    if not pairs:
+        return []
+
+    tok, model = get_nli_direct()
+    device = next(model.parameters()).device
+
+    inputs = tok(
+        pairs,
+        padding=True,
+        truncation=True,
+        max_length=_nli_max_length,
+        return_tensors="pt"
+    ).to(device)
+
+    with torch.no_grad():
+        logits = model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1).tolist()
+
+    idx = _nli_label_indices
+    c_i = idx["contradiction"]
+    e_i = idx["entailment"]
+    n_i = idx["neutral"]
+
+    results = []
+    for (premise, hyp), p in zip(pairs, probs):
+        contra_p = p[c_i]
+        entail_p = p[e_i]
+        neutral_p = p[n_i]
+
+        prob_dict = {
+            "contradiction": round(contra_p, 4),
+            "entailment": round(entail_p, 4),
+            "neutral": round(neutral_p, 4)
+        }
+
+        if contra_p >= threshold:
+            verdict = "CONTRADICTION"
+            conf = contra_p
+        elif entail_p >= 0.50:
+            verdict = "ENTAILED"
+            conf = entail_p
+        else:
+            verdict = "NEUTRAL"
+            conf = neutral_p
+
+        results.append({
+            "hypothesis": hyp,
+            "status": verdict,
+            "confidence": round(conf, 4),
+            "probabilities": prob_dict
+        })
+    return results
+
+
 def _warmup_nli_in_background():
-    """Round 8 (#5): eager-load the NLI model at startup (weights are baked into the
-    image by the Dockerfile preload step), so /health reports nli_loaded quickly and
-    the first /v1/verify-claim doesn't pay a cold-start download/load penalty."""
+    """Eager-load the NLI model at startup so /health reports nli_loaded quickly."""
     try:
         get_nli_direct()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(f"Failed to warmup NLI model: {exc}")
 
 
 threading.Thread(target=_warmup_nli_in_background, daemon=True, name="nli-warmup").start()
@@ -279,10 +417,12 @@ def health_check():
     return {
         "status": "healthy",
         "service": "hardtruth-daemon",
-        "version": "1.2.0",
+        "version": "2.0.0",
         "substrate": "free_local_open_source",
         "models": {
-            "nli_deberta": "cross-encoder/nli-deberta-v3-small"
+            "nli_model": _nli_model_name,
+            "max_length": _nli_max_length,
+            "label_indices": _nli_label_indices
         },
         "rss_memory_mb": round(rss_mb, 2),
         "nli_loaded": _nli_direct_model is not None,
@@ -410,108 +550,43 @@ def verify_handoff(req: HandoffVerifyRequest):
 @app.post("/v1/verify-claim", response_model=VerifyClaimResponse, dependencies=[Depends(require_daemon_auth)])
 def verify_claim(req: VerifyClaimRequest):
     """
-    Evaluates premise vs hypothesis using DeBERTa-v3 cross-encoder directly.
+    Evaluates premise vs hypothesis using ModernBERT cross-encoder directly.
     Computes exact softmax distribution across [contradiction, entailment, neutral].
     """
     t0 = time.perf_counter()
-    import torch
-
-    tok, model = get_nli_direct()
-    device = next(model.parameters()).device
-
-    inputs = tok(
-        req.premise,
-        req.hypothesis,
-        truncation=True,
-        max_length=512,
-        return_tensors="pt"
-    ).to(device)
-
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1)[0].tolist()
-
-    contradiction, entailment, neutral = probs[0], probs[1], probs[2]
-    prob_dict = {
-        "contradiction": round(contradiction, 4),
-        "entailment": round(entailment, 4),
-        "neutral": round(neutral, 4)
-    }
-
-    threshold = req.threshold or 0.70
-    if contradiction >= threshold:
-        verdict = "CONTRADICTION"
-        conf = contradiction
-    elif entailment >= 0.50:
-        verdict = "ENTAILED"
-        conf = entailment
-    else:
-        verdict = "NEUTRAL"
-        conf = neutral
-
+    eval_res = _evaluate_nli_pairs([(req.premise, req.hypothesis)], threshold=req.threshold or 0.70)
     latency = (time.perf_counter() - t0) * 1000.0
-
+    item = eval_res[0]
     return VerifyClaimResponse(
-        status=verdict,
-        confidence=round(conf, 4),
-        probabilities=prob_dict,
+        status=item["status"],
+        confidence=item["confidence"],
+        probabilities=item["probabilities"],
         latency_ms=round(latency, 2)
     )
 
 @app.post("/v1/verify-claims", response_model=VerifyClaimsResponse, dependencies=[Depends(require_daemon_auth)])
 def verify_claims(req: VerifyClaimsRequest):
     """
-    Batched NLI verification across multiple claims in a single forward pass.
-    Evaluates premise vs list of hypotheses using DeBERTa-v3 cross-encoder directly.
+    Batched NLI verification across multiple claims against a common premise in a single forward pass.
+    Evaluates premise vs list of hypotheses using ModernBERT cross-encoder directly.
     """
     t0 = time.perf_counter()
-    import torch
-
     if not req.hypotheses:
         return VerifyClaimsResponse(results=[], latency_ms=0.0)
 
-    tok, model = get_nli_direct()
-    device = next(model.parameters()).device
-
     pairs = [(req.premise, hyp) for hyp in req.hypotheses]
-    inputs = tok(
-        pairs,
-        padding=True,
-        truncation=True,
-        max_length=512,
-        return_tensors="pt"
-    ).to(device)
-
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1).tolist()
-
-    threshold = req.threshold or 0.70
-    results = []
-    for hyp, p in zip(req.hypotheses, probs):
-        contradiction, entailment, neutral = p[0], p[1], p[2]
-        prob_dict = {
-            "contradiction": round(contradiction, 4),
-            "entailment": round(entailment, 4),
-            "neutral": round(neutral, 4)
-        }
-        if contradiction >= threshold:
-            verdict = "CONTRADICTION"
-            conf = contradiction
-        elif entailment >= 0.50:
-            verdict = "ENTAILED"
-            conf = entailment
-        else:
-            verdict = "NEUTRAL"
-            conf = neutral
-        results.append(SingleClaimResult(
-            hypothesis=hyp,
-            status=verdict,
-            confidence=round(conf, 4),
-            probabilities=prob_dict
-        ))
-
+    eval_res = _evaluate_nli_pairs(pairs, threshold=req.threshold or 0.70)
     latency = (time.perf_counter() - t0) * 1000.0
+
+    results = [
+        SingleClaimResult(
+            hypothesis=item["hypothesis"],
+            status=item["status"],
+            confidence=item["confidence"],
+            probabilities=item["probabilities"]
+        )
+        for item in eval_res
+    ]
     return VerifyClaimsResponse(
         results=results,
         latency_ms=round(latency, 2)
@@ -523,53 +598,22 @@ def verify_claims_batch(req: VerifyClaimsBatchRequest):
     Batched NLI verification across multiple (premise, hypothesis) pairs in a single forward pass (B5).
     """
     t0 = time.perf_counter()
-    import torch
-
     if not req.pairs:
         return VerifyClaimsBatchResponse(results=[], latency_ms=0.0)
 
-    tok, model = get_nli_direct()
-    device = next(model.parameters()).device
-
-    input_pairs = [(pair.premise, pair.claim) for pair in req.pairs]
-    inputs = tok(
-        input_pairs,
-        padding=True,
-        truncation=True,
-        max_length=512,
-        return_tensors="pt"
-    ).to(device)
-
-    with torch.no_grad():
-        logits = model(**inputs).logits
-        probs = torch.softmax(logits, dim=-1).tolist()
-
-    threshold = req.threshold or 0.70
-    results = []
-    for pair, p in zip(req.pairs, probs):
-        contradiction, entailment, neutral = p[0], p[1], p[2]
-        prob_dict = {
-            "contradiction": round(contradiction, 4),
-            "entailment": round(entailment, 4),
-            "neutral": round(neutral, 4)
-        }
-        if contradiction >= threshold:
-            verdict = "CONTRADICTION"
-            conf = contradiction
-        elif entailment >= 0.50:
-            verdict = "ENTAILED"
-            conf = entailment
-        else:
-            verdict = "NEUTRAL"
-            conf = neutral
-        results.append(SingleClaimResult(
-            hypothesis=pair.claim,
-            status=verdict,
-            confidence=round(conf, 4),
-            probabilities=prob_dict
-        ))
-
+    pairs = [(pair.premise, pair.claim) for pair in req.pairs]
+    eval_res = _evaluate_nli_pairs(pairs, threshold=req.threshold or 0.70)
     latency = (time.perf_counter() - t0) * 1000.0
+
+    results = [
+        SingleClaimResult(
+            hypothesis=item["hypothesis"],
+            status=item["status"],
+            confidence=item["confidence"],
+            probabilities=item["probabilities"]
+        )
+        for item in eval_res
+    ]
     return VerifyClaimsBatchResponse(
         results=results,
         latency_ms=round(latency, 2)

@@ -1102,7 +1102,7 @@ class DaemonLedger:
                 ec_str = f"exit code {ec}" if ec is not None else "failed"
                 if info.get("error") and "TAINTED" in info.get("error"):
                     ec_str = "TAINTED_OPERATOR"
-                tail = f" | Output: {info.get('stdout_tail')[:120]}" if info.get("stdout_tail") else ""
+                tail = f" | Output: {info.get('stdout_tail')[:500]}" if info.get("stdout_tail") else ""
                 fails.append(f"FAILED: '{cmd}' ({ec_str}{tail})")
             premise_sections.append(f"UNRESOLVED TEST FAILURES (CRITICAL): {'; '.join(fails)}.")
 
@@ -1125,7 +1125,7 @@ class DaemonLedger:
                 else:
                     status_desc = f"ERROR ({err or 'unknown'})"
 
-                tail_str = f" [Tail: {c.get('stdout_tail')[:80]}]" if c.get("stdout_tail") else ""
+                tail_str = f" [Tail: {c.get('stdout_tail')[:300]}]" if c.get("stdout_tail") else ""
                 cmd_strs.append(f"COMMAND: '{cmd_name}'. STATUS: {status_desc}{tail_str}.")
             premise_sections.append(f"RECENT EXECUTIONS: {' '.join(cmd_strs)}")
         else:
@@ -1142,7 +1142,7 @@ class DaemonLedger:
         else:
             premise_sections.append("MODIFIED FILES: No files were modified.")
 
-        premise_str = " ".join(premise_sections)[:1500]
+        premise_str = " ".join(premise_sections)[:8000]
 
         session_start_time = 0.0
         if conv_records:
