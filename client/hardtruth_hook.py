@@ -157,7 +157,11 @@ def normalize_payload(p: dict) -> dict:
     return out
 
 CONTRADICTION_THRESHOLD = 0.70
-SYSTEM_ONE_URL = os.environ.get("SYSTEM_ONE_URL", "http://127.0.0.1:49281")
+SYSTEM_ONE_URL = (
+    os.environ.get("HARDTRUTH_URL")
+    or os.environ.get("SYSTEM_ONE_URL")
+    or f"http://127.0.0.1:{os.environ.get('HARDTRUTH_PORT', '49281')}"
+)
 
 SOURCE_CODE_EXTENSIONS = {
     ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
@@ -2116,7 +2120,7 @@ def handle_stop(payload: dict) -> dict:
                 if contradiction >= CONTRADICTION_THRESHOLD:
                     return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
             else:
-                if test_commands_executed > 0 and len(unresolved_failures) == 0:
+                if (test_commands_executed > 0 or source_files_modified == 0) and len(unresolved_failures) == 0:
                     pass
                 else:
                     return fail_halt(f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing.", remediable=False)

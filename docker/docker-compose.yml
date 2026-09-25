@@ -8,7 +8,7 @@ services:
     container_name: hardtruth-daemon
     restart: always
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:49281:8000"
     environment:
       # Round 7: daemon API write token. Set the SAME value for the hook via
       # HARDTRUTH_API_TOKEN env, or place it in ~/.hardtruth/daemon_api.key.
