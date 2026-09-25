@@ -1,3 +1,6 @@
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::useless_format)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -64,7 +67,7 @@ fn handle_post_tool(payload: &HookPayload) -> Value {
         return halt(&err);
     }
 
-    allow()
+    json!({})
 }
 
 fn handle_stop(payload: &HookPayload) -> Value {
