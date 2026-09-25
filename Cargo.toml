@@ -1,0 +1,39 @@
+[package]
+name = "hardtruthd"
+version = "0.2.0"
+edition = "2021"
+authors = ["Adam Matar <adam@skidnir.io>"]
+description = "High-performance resident anti-hallucination and integrity daemon and thin-client CLI gate"
+
+[lib]
+name = "hardtruth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hardtruthd"
+path = "src/bin/daemon.rs"
+
+[[bin]]
+name = "hardtruth-gate"
+path = "src/bin/gate.rs"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+blake3 = "1.5"
+hmac = "0.12"
+sha2 = "0.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+brush-parser = "0.4"
+libc = "0.2"
+zeroize = { version = "1.8", features = ["derive"] }
+regex = "1.10"
+dirs = "5.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+fastrand = "2.0"
+seckey = "0.12"
+
+[dev-dependencies]
+tempfile = "3.12"
