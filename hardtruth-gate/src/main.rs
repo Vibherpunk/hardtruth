@@ -104,13 +104,45 @@ fn handle_stop(payload: &HookPayload) -> Value {
                     }
                 }
             }
+            allow()
         },
         Err(_) => {
-            return halt("🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at http://127.0.0.1:49281 is offline. You must provide manual verification output before completing.");
+            // Graceful fail-secure fallback: check if manual tests were run
+            if has_manual_verification(payload.conversation_id.as_deref().unwrap_or("")) {
+                allow()
+            } else {
+                halt("🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at http://127.0.0.1:49281 is offline. You must provide manual verification output before completing.")
+            }
         }
     }
+}
 
-    allow()
+fn has_manual_verification(conv_id: &str) -> bool {
+    let ledger_path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".hardtruth/daemon_ledger.jsonl");
+        
+    if let Ok(content) = fs::read_to_string(&ledger_path) {
+        for line in content.lines().rev() {
+            if let Ok(entry) = serde_json::from_str::<Value>(line) {
+                if entry.get("conversationId").and_then(|v| v.as_str()) == Some(conv_id) {
+                    if let Some(tool) = entry.get("tool").and_then(|v| v.as_str()) {
+                        if tool == "run_command" || tool == "Bash" {
+                            if let Some(target) = entry.get("target").and_then(|v| v.as_str()) {
+                                if target.contains("cargo test") || target.contains("cargo check") || target.contains("pytest") {
+                                    if entry.get("status").and_then(|v| v.as_str()) == Some("success") {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // If not found, return false (fail-secure)
+    false
 }
 
 fn check_ast_stubs(cwd: &str) -> Option<String> {
@@ -121,15 +153,25 @@ fn check_ast_stubs(cwd: &str) -> Option<String> {
         .ok()?;
         
     let status = String::from_utf8_lossy(&output.stdout);
+    let code_extensions = [".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".zig", ".ml", ".c", ".cpp"];
     for line in status.lines() {
         if line.len() > 3 {
-            let file_path = &line[3..];
+            let file_path = line[3..].trim();
+            let is_code = code_extensions.iter().any(|ext| file_path.ends_with(ext));
+            if !is_code {
+                continue;
+            }
             let full_path = format!("{}/{}", cwd, file_path);
             if let Ok(content) = fs::read_to_string(&full_path) {
                 let s_todo = format!("{}odo!()", "t");
                 let s_unimpl = format!("{}nimplemented!()", "u");
                 let s_todo_comment = format!("// TODO");
-                if content.contains(&s_todo_comment) || content.contains(&s_todo) || content.contains(&s_unimpl) || content.contains("pass") {
+                
+                let has_todo_macro = file_path.ends_with(".rs") && (content.contains(&s_todo) || content.contains(&s_unimpl));
+                let has_todo_comment = content.contains(&s_todo_comment);
+                let has_py_pass = file_path.ends_with(".py") && content.lines().any(|l| l.trim() == "pass");
+
+                if has_todo_macro || has_todo_comment || has_py_pass {
                     return Some(format!("🚨 HARDTRUTH STUB DETECTED in {}: No stubs allowed.", file_path));
                 }
             }
