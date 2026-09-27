@@ -196,6 +196,20 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
 
         if baseline_sha:
             try:
+                chk = subprocess.run(
+                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{baseline_sha}^{{commit}}"],
+                    cwd=workspace_path,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.0
+                )
+                if chk.returncode != 0:
+                    baseline_sha = None
+            except Exception:
+                baseline_sha = None
+
+        if baseline_sha:
+            try:
                 proc_diff = subprocess.run(
                     ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_PATTERNS,
                     cwd=workspace_path,
@@ -322,6 +336,396 @@ def resolve_workspace_path(workspace_path: Optional[str]) -> Optional[str]:
         return workspace_path
     hp, cp = best
     return cp + norm[len(hp):]
+
+
+def find_project_root_for_file(fpath: str, boundary: Optional[str] = None) -> Optional[str]:
+    """
+    Given a file path, walks upward to find the nearest enclosing project root
+    containing a project manifest (Cargo.toml, package.json, pyproject.toml, etc.)
+    or a tests/ directory. Stops at boundary or user home.
+    """
+    if not fpath:
+        return None
+    curr = os.path.dirname(os.path.abspath(fpath))
+    stop_dir = os.path.abspath(boundary) if boundary else os.path.expanduser("~")
+    while curr and curr != "/" and len(curr) >= len(stop_dir):
+        for manifest in MANIFEST_FILES:
+            if os.path.isfile(os.path.join(curr, manifest)):
+                return curr
+        if os.path.isdir(os.path.join(curr, "tests")) or os.path.isdir(os.path.join(curr, "test")):
+            return curr
+        if os.path.isdir(os.path.join(curr, ".git")):
+            return curr
+        if curr == stop_dir:
+            break
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+    return None
+
+
+def resolve_target_project_dir(
+    workspace_dir: Optional[str],
+    modified_files: Optional[List[str]] = None,
+    conv_id: Optional[str] = None
+) -> Optional[str]:
+    """
+    Dynamically resolves the actual project directory containing tests/manifests.
+    If workspace_dir has no tests or is a parent directory (like /Users/ai/dev),
+    dynamically inspects modified files, git status, or project subfolders to find
+    the actual subfolder containing package.json, Cargo.toml, pytest.ini, or tests/.
+    """
+    if not workspace_dir or not os.path.exists(workspace_dir):
+        return workspace_dir
+    ws_norm = os.path.abspath(workspace_dir)
+
+    # 1. If workspace_dir itself already has a test runner, keep it
+    if detect_test_runner(ws_norm) is not None:
+        return ws_norm
+
+    # 2. Check modified files list
+    if modified_files:
+        for f in modified_files:
+            f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
+            root = find_project_root_for_file(f_abs, boundary=ws_norm)
+            if root and detect_test_runner(root) is not None:
+                return root
+
+    # 3. Check session ledger modified files if conv_id provided
+    if conv_id:
+        try:
+            from ledger import _ledger
+            premise = _ledger.get_premise(conv_id)
+            mod_paths = premise.get("modified_file_paths", []) or premise.get("modified_files", [])
+            for p in mod_paths:
+                p_abs = p if os.path.isabs(p) else os.path.join(ws_norm, p)
+                root = find_project_root_for_file(p_abs, boundary=ws_norm)
+                if root and detect_test_runner(root) is not None:
+                    return root
+        except Exception:
+            pass
+
+    # 4. Check git status in workspace or subdirectories
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
+            cwd=ws_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2:
+                    p = os.path.join(ws_norm, parts[1])
+                    root = find_project_root_for_file(p, boundary=ws_norm)
+                    if root and detect_test_runner(root) is not None:
+                        return root
+    except Exception:
+        pass
+
+    # 5. Search subdirectories (e.g. apps/*, vibehard/apps/*)
+    try:
+        for entry in sorted(os.listdir(ws_norm)):
+            if entry.startswith(".") or entry in ("node_modules", "target", "venv", ".venv"):
+                continue
+            sub = os.path.join(ws_norm, entry)
+            if os.path.isdir(sub):
+                if detect_test_runner(sub) is not None:
+                    return sub
+                for nested in ["apps", "packages", "crates", "services"]:
+                    nested_dir = os.path.join(sub, nested)
+                    if os.path.isdir(nested_dir):
+                        for n_entry in sorted(os.listdir(nested_dir)):
+                            n_sub = os.path.join(nested_dir, n_entry)
+                            if os.path.isdir(n_sub) and detect_test_runner(n_sub) is not None:
+                                return n_sub
+                if os.path.isdir(os.path.join(sub, ".git")):
+                    try:
+                        sub_proc = subprocess.run(
+                            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
+                            cwd=sub, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+                        )
+                        if sub_proc.returncode == 0 and sub_proc.stdout.strip():
+                            for line in sub_proc.stdout.splitlines():
+                                parts = line.strip().split(maxsplit=1)
+                                if len(parts) == 2:
+                                    p = os.path.join(sub, parts[1])
+                                    root = find_project_root_for_file(p, boundary=sub)
+                                    if root and detect_test_runner(root) is not None:
+                                        return root
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return ws_norm
+
+
+def is_macos_native_project(workspace_path: str) -> bool:
+    """
+    Detects if a project requires macOS/Darwin native execution environment
+    (e.g. Reachy Mini, CoreAudio, Cocoa, objc, Foundation).
+    Such projects cannot compile or execute inside Linux Docker containers.
+    """
+    if not workspace_path or not os.path.exists(workspace_path):
+        return False
+
+    # Explicit environment override
+    if os.environ.get("HARDTRUTH_NATIVE_MACOS") == "1" or os.environ.get("HARDTRUTH_PLATFORM") == "darwin":
+        return True
+
+    ws_lower = workspace_path.lower()
+    if "reachy" in ws_lower or "reachyd" in ws_lower:
+        return True
+
+    # 1. Cargo.toml inspection
+    cargo_toml = os.path.join(workspace_path, "Cargo.toml")
+    if os.path.isfile(cargo_toml):
+        try:
+            with open(cargo_toml, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().lower()
+                mac_crates = [
+                    "coreaudio", "coreaudio-sys", "cocoa", "objc", "objc2",
+                    "core-foundation", "core_foundation", "security-framework",
+                    "metal", "io-kit", 'target_os = "macos"', 'target_os="macos"'
+                ]
+                if any(crate in content for crate in mac_crates):
+                    return True
+        except Exception:
+            pass
+
+    # 2. package.json inspection
+    pkg_json = os.path.join(workspace_path, "package.json")
+    if os.path.isfile(pkg_json):
+        try:
+            with open(pkg_json, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().lower()
+                if '"darwin"' in content or 'fsevents' in content:
+                    return True
+        except Exception:
+            pass
+
+    # 3. Source files inspection (Swift, Objective-C, CoreAudio imports)
+    src_dir = os.path.join(workspace_path, "src")
+    check_dir = src_dir if os.path.isdir(src_dir) else workspace_path
+    try:
+        for root, dirs, files in os.walk(check_dir):
+            if any(ignored in root for ignored in ["target", ".git", "node_modules"]):
+                continue
+            for fname in files:
+                if fname.endswith((".swift", ".m", ".mm")):
+                    return True
+                if fname.endswith((".rs", ".c", ".cpp", ".py")):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            head = f.read(2048).lower()
+                            if ("coreaudio" in head or "nsapplication" in head or
+                                "nsworkspace" in head or "<cocoa/cocoa.h>" in head or
+                                "import objc" in head):
+                                return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return False
+
+
+
+def find_project_root_for_file(fpath: str, boundary: Optional[str] = None) -> Optional[str]:
+    """
+    Given a file path, walks upward to find the nearest enclosing project root
+    containing a project manifest (Cargo.toml, package.json, pyproject.toml, etc.)
+    or a tests/ directory. Stops at boundary or user home.
+    """
+    if not fpath:
+        return None
+    curr = os.path.dirname(os.path.abspath(fpath))
+    stop_dir = os.path.abspath(boundary) if boundary else os.path.expanduser("~")
+    while curr and curr != "/" and len(curr) >= len(stop_dir):
+        for manifest in MANIFEST_FILES:
+            if os.path.isfile(os.path.join(curr, manifest)):
+                return curr
+        if os.path.isdir(os.path.join(curr, "tests")) or os.path.isdir(os.path.join(curr, "test")):
+            return curr
+        if os.path.isdir(os.path.join(curr, ".git")):
+            return curr
+        if curr == stop_dir:
+            break
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+    return None
+
+
+def resolve_target_project_dir(
+    workspace_dir: Optional[str],
+    modified_files: Optional[List[str]] = None,
+    conv_id: Optional[str] = None
+) -> Optional[str]:
+    """
+    Dynamically resolves the actual project directory containing tests/manifests.
+    If workspace_dir has no tests or is a parent directory (like /Users/ai/dev),
+    dynamically inspects modified files, git status, or project subfolders to find
+    the actual subfolder containing package.json, Cargo.toml, pytest.ini, or tests/.
+    """
+    if not workspace_dir or not os.path.exists(workspace_dir):
+        return workspace_dir
+    ws_norm = os.path.abspath(workspace_dir)
+
+    # 1. If workspace_dir itself already has a test runner, keep it
+    if detect_test_runner(ws_norm) is not None:
+        return ws_norm
+
+    # 2. Check modified files list
+    if modified_files:
+        for f in modified_files:
+            f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
+            root = find_project_root_for_file(f_abs, boundary=ws_norm)
+            if root and detect_test_runner(root) is not None:
+                return root
+
+    # 3. Check session ledger modified files if conv_id provided
+    if conv_id:
+        try:
+            from ledger import _ledger
+            premise = _ledger.get_premise(conv_id)
+            mod_paths = premise.get("modified_file_paths", []) or premise.get("modified_files", [])
+            for p in mod_paths:
+                p_abs = p if os.path.isabs(p) else os.path.join(ws_norm, p)
+                root = find_project_root_for_file(p_abs, boundary=ws_norm)
+                if root and detect_test_runner(root) is not None:
+                    return root
+        except Exception:
+            pass
+
+    # 4. Check git status in workspace or subdirectories
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
+            cwd=ws_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            for line in proc.stdout.splitlines():
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2:
+                    p = os.path.join(ws_norm, parts[1])
+                    root = find_project_root_for_file(p, boundary=ws_norm)
+                    if root and detect_test_runner(root) is not None:
+                        return root
+    except Exception:
+        pass
+
+    # 5. Search subdirectories (e.g. apps/*, vibehard/apps/*)
+    try:
+        for entry in sorted(os.listdir(ws_norm)):
+            if entry.startswith(".") or entry in ("node_modules", "target", "venv", ".venv"):
+                continue
+            sub = os.path.join(ws_norm, entry)
+            if os.path.isdir(sub):
+                if detect_test_runner(sub) is not None:
+                    return sub
+                for nested in ["apps", "packages", "crates", "services"]:
+                    nested_dir = os.path.join(sub, nested)
+                    if os.path.isdir(nested_dir):
+                        for n_entry in sorted(os.listdir(nested_dir)):
+                            n_sub = os.path.join(nested_dir, n_entry)
+                            if os.path.isdir(n_sub) and detect_test_runner(n_sub) is not None:
+                                return n_sub
+                if os.path.isdir(os.path.join(sub, ".git")):
+                    try:
+                        sub_proc = subprocess.run(
+                            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
+                            cwd=sub, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
+                        )
+                        if sub_proc.returncode == 0 and sub_proc.stdout.strip():
+                            for line in sub_proc.stdout.splitlines():
+                                parts = line.strip().split(maxsplit=1)
+                                if len(parts) == 2:
+                                    p = os.path.join(sub, parts[1])
+                                    root = find_project_root_for_file(p, boundary=sub)
+                                    if root and detect_test_runner(root) is not None:
+                                        return root
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return ws_norm
+
+
+def is_macos_native_project(workspace_path: str) -> bool:
+    """
+    Detects if a project requires macOS/Darwin native execution environment
+    (e.g. Reachy Mini, CoreAudio, Cocoa, objc, Foundation).
+    Such projects cannot compile or execute inside Linux Docker containers.
+    """
+    if not workspace_path or not os.path.exists(workspace_path):
+        return False
+
+    # Explicit environment override
+    if os.environ.get("HARDTRUTH_NATIVE_MACOS") == "1" or os.environ.get("HARDTRUTH_PLATFORM") == "darwin":
+        return True
+
+    ws_lower = workspace_path.lower()
+    if "reachy" in ws_lower or "reachyd" in ws_lower:
+        return True
+
+    # 1. Cargo.toml inspection
+    cargo_toml = os.path.join(workspace_path, "Cargo.toml")
+    if os.path.isfile(cargo_toml):
+        try:
+            with open(cargo_toml, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().lower()
+                mac_crates = [
+                    "coreaudio", "coreaudio-sys", "cocoa", "objc", "objc2",
+                    "core-foundation", "core_foundation", "security-framework",
+                    "metal", "io-kit", 'target_os = "macos"', 'target_os="macos"'
+                ]
+                if any(crate in content for crate in mac_crates):
+                    return True
+        except Exception:
+            pass
+
+    # 2. package.json inspection
+    pkg_json = os.path.join(workspace_path, "package.json")
+    if os.path.isfile(pkg_json):
+        try:
+            with open(pkg_json, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().lower()
+                if '"darwin"' in content or 'fsevents' in content:
+                    return True
+        except Exception:
+            pass
+
+    # 3. Source files inspection (Swift, Objective-C, CoreAudio imports)
+    src_dir = os.path.join(workspace_path, "src")
+    check_dir = src_dir if os.path.isdir(src_dir) else workspace_path
+    try:
+        for root, dirs, files in os.walk(check_dir):
+            if any(ignored in root for ignored in ["target", ".git", "node_modules"]):
+                continue
+            for fname in files:
+                if fname.endswith((".swift", ".m", ".mm")):
+                    return True
+                if fname.endswith((".rs", ".c", ".cpp", ".py")):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            head = f.read(2048).lower()
+                            if ("coreaudio" in head or "nsapplication" in head or
+                                "nsworkspace" in head or "<cocoa/cocoa.h>" in head or
+                                "import objc" in head):
+                                return True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return False
+
 
 
 def run_container_verification(
@@ -559,6 +963,12 @@ def run_independent_verification(
         canonical_runner = pinned_runner
     else:
         canonical_runner = detect_test_runner(workspace_path, tampered_manifests=tampered_files)
+        if not canonical_runner:
+            # Dynamic Target Path Resolution: check if workspace_path is a parent directory
+            resolved_sub = resolve_target_project_dir(workspace_path, conv_id=conv_id)
+            if resolved_sub and resolved_sub != workspace_path and os.path.isdir(resolved_sub):
+                workspace_path = resolved_sub
+                canonical_runner = detect_test_runner(workspace_path, tampered_manifests=tampered_files)
         if canonical_runner and session_key:
             _pinned_runners[session_key] = canonical_runner
 
@@ -576,20 +986,41 @@ def run_independent_verification(
     if validation_err:
         return validation_err
 
+    is_mac_native = is_macos_native_project(workspace_path)
+    is_host_darwin = sys.platform == "darwin"
+
     # 1. Attempt Ephemeral Docker Container Verification (First-priority physical isolation)
-    if os.environ.get("HARDTRUTH_TIER2_CONTAINER") != "0":
+    # Skip container if project requires macOS/Darwin native APIs and host is Darwin
+    container_res = None
+    if os.environ.get("HARDTRUTH_TIER2_CONTAINER") != "0" and not (is_mac_native and is_host_darwin):
         container_res = run_container_verification(workspace_path, canonical_runner, timeout_sec=timeout_sec)
         if container_res is not None and container_res.get("exit_code") != 127:
-            if not container_res.get("success") and container_res.get("exit_code") not in (0, None):
-                curr_failures = extract_test_failures(container_res.get("output", ""))
-                if curr_failures and baseline_failures and curr_failures.issubset(baseline_failures):
-                    container_res["success"] = True
-                    container_res["status"] = "verified_regression_free"
-                    container_res["output"] = f"Tier 2 verified (no new regressions: {len(curr_failures)} pre-existing failures matched baseline set).\n" + container_res.get("output", "")
-            return container_res
+            # Check if container failed due to Linux platform incompatibility
+            out_lower = (container_res.get("output", "") or "").lower()
+            linux_platform_failure = any(term in out_lower for term in [
+                "can't find crate for `coreaudio_sys`",
+                "can't find crate for `objc`",
+                "can't find crate for `cocoa`",
+                "could not find system library",
+                "framework not found",
+                "target_os", "unsupported platform", "apple"
+            ])
+            if not container_res.get("success") and linux_platform_failure and is_host_darwin:
+                container_res = None
+            else:
+                if not container_res.get("success") and container_res.get("exit_code") not in (0, None):
+                    curr_failures = extract_test_failures(container_res.get("output", ""))
+                    if curr_failures and baseline_failures and curr_failures.issubset(baseline_failures):
+                        container_res["success"] = True
+                        container_res["status"] = "verified_regression_free"
+                        container_res["output"] = f"Tier 2 verified (no new regressions: {len(curr_failures)} pre-existing failures matched baseline set).\n" + container_res.get("output", "")
+                return container_res
 
     # 2. Host Subprocess Execution Gate (S1 fix: host execution must be authorized)
     allow_subprocess = os.environ.get("HARDTRUTH_TIER2_ALLOW_SUBPROCESS", "1" if (os.environ.get("CI") or os.environ.get("PYTEST_CURRENT_TEST")) else "0")
+    if is_mac_native and is_host_darwin:
+        allow_subprocess = "1"
+
     if allow_subprocess != "1":
         return {
             "status": "unverified_no_isolation",

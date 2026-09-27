@@ -92,61 +92,17 @@ class PythonStubVisitor(ast.NodeVisitor):
             if isinstance(statements[0].value, ast.Constant) and isinstance(statements[0].value.value, str):
                 statements = statements[1:]
 
-        if len(statements) != 1:
-            return
-
-        stmt = statements[0]
         is_stub = False
         stub_type = ""
 
-        # 1. pass
-        if isinstance(stmt, ast.Pass):
-            # Exempt pass if inside an Exception class or standard lifecycle / event methods
-            if not self._is_enclosing_class_exception():
-                if node.name in ("setUp", "tearDown", "close", "cleanup", "__init__") or node.name.startswith("on_"):
-                    return
+        if not statements:
+            is_stub = True
+            stub_type = "empty body"
+        else:
+            stub_evals = [self._is_stmt_stub(s, node) for s in statements]
+            if all(is_s for is_s, _ in stub_evals):
                 is_stub = True
-                stub_type = "pass"
-
-        # 2. raise NotImplementedError / raise NotImplementedError(...)
-        elif isinstance(stmt, ast.Raise):
-            exc = stmt.exc
-            if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
-                is_stub = True
-                stub_type = "NotImplementedError"
-            elif isinstance(exc, ast.Call):
-                func = exc.func
-                if isinstance(func, ast.Name) and func.id == "NotImplementedError":
-                    is_stub = True
-                    stub_type = "NotImplementedError()"
-                elif isinstance(func, ast.Attribute) and func.attr == "NotImplementedError":
-                    is_stub = True
-                    stub_type = "NotImplementedError()"
-            elif isinstance(exc, ast.Attribute) and exc.attr == "NotImplementedError":
-                is_stub = True
-                stub_type = "NotImplementedError"
-
-        # 3. ... (Ellipsis)
-        elif isinstance(stmt, ast.Expr):
-            if isinstance(stmt.value, ast.Constant) and stmt.value.value is Ellipsis:
-                is_stub = True
-                stub_type = "..."
-
-        # 4. return True, return None, bare return (exempt accessors / predicate / lifecycle methods)
-        elif isinstance(stmt, ast.Return):
-            if node.name in ("close", "cleanup", "setUp", "tearDown", "reset") or node.name.startswith(("is_", "has_", "can_", "should_", "supports_", "get_", "__")):
-                return
-            val = stmt.value
-            if val is None:
-                is_stub = True
-                stub_type = "return"
-            elif isinstance(val, ast.Constant):
-                if val.value is None:
-                    is_stub = True
-                    stub_type = "return None"
-                elif val.value is True:
-                    is_stub = True
-                    stub_type = "return True"
+                stub_type = ", ".join(dict.fromkeys(t for _, t in stub_evals if t))
 
         if is_stub:
             node_start = getattr(node, "lineno", 1)
@@ -158,6 +114,48 @@ class PythonStubVisitor(ast.NodeVisitor):
             self.violations.append(
                 f"Function '{node.name}' in {self.filename} is an empty stub ({stub_type}). Write actual working implementation before completing."
             )
+
+    def _is_stmt_stub(self, stmt: ast.AST, node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[bool, str]:
+        # 1. pass
+        if isinstance(stmt, ast.Pass):
+            if not self._is_enclosing_class_exception():
+                if node.name in ("setUp", "tearDown", "close", "cleanup", "__init__") or node.name.startswith("on_"):
+                    return False, ""
+                return True, "pass"
+        # 2. raise NotImplementedError / raise NotImplementedError(...)
+        elif isinstance(stmt, ast.Raise):
+            exc = stmt.exc
+            if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
+                return True, "NotImplementedError"
+            elif isinstance(exc, ast.Call):
+                func = exc.func
+                if isinstance(func, ast.Name) and func.id == "NotImplementedError":
+                    return True, "NotImplementedError()"
+                elif isinstance(func, ast.Attribute) and func.attr == "NotImplementedError":
+                    return True, "NotImplementedError()"
+            elif isinstance(exc, ast.Attribute) and exc.attr == "NotImplementedError":
+                return True, "NotImplementedError"
+        # 3. ... (Ellipsis)
+        elif isinstance(stmt, ast.Expr):
+            if isinstance(stmt.value, ast.Constant) and stmt.value.value is Ellipsis:
+                return True, "..."
+        # 4. return None, bare return, return True/False/empty in non-interface methods
+        elif isinstance(stmt, ast.Return):
+            if node.name in ("close", "cleanup", "setUp", "tearDown", "reset") or node.name.startswith(("is_", "has_", "can_", "should_", "supports_", "get_", "__")):
+                return False, ""
+            val = stmt.value
+            if val is None:
+                return True, "return None"
+            elif isinstance(val, ast.Constant):
+                if val.value is None:
+                    return True, "return None"
+                elif val.value in (True, False, 0, ""):
+                    return True, f"return {val.value!r}"
+            elif isinstance(val, (ast.Dict, ast.List, ast.Set)):
+                elts = getattr(val, "keys", getattr(val, "elts", []))
+                if len(elts) == 0:
+                    return True, "return empty container"
+        return False, ""
 
 
 def check_ast_stubs(filepath: str, modified_lines: Optional[Set[int]] = None) -> List[str]:

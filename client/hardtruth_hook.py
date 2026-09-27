@@ -28,6 +28,7 @@ import hashlib
 import subprocess
 import signal
 import threading
+import unicodedata
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -61,6 +62,20 @@ except ImportError:
         is_tainted_shell_command = lambda cmd: False
         classify_file = lambda path, workspace_dir=None: "other"
         _IMPORT_DEGRADED = "daemon.ledger module unavailable"
+
+try:
+    from daemon.tier2_runner import resolve_target_project_dir, is_macos_native_project, run_independent_verification
+except ImportError:
+    try:
+        from tier2_runner import resolve_target_project_dir, is_macos_native_project, run_independent_verification
+    except ImportError:
+        try:
+            from hardtruth.tier2_runner import resolve_target_project_dir, is_macos_native_project, run_independent_verification
+        except ImportError:
+            resolve_target_project_dir = lambda ws, mod=None, cid=None: ws
+            is_macos_native_project = lambda ws: False
+            run_independent_verification = None
+
 
 def get_canonical_hook_path() -> Optional[str]:
     env_path = os.environ.get("HARDTRUTH_CANONICAL_HOOK")
@@ -905,7 +920,16 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
     # 4. Fallback if .git is missing (e.g. rm -rf .git)
     if not os.path.exists(os.path.join(workspace_dir, ".git")):
         home_dir = os.path.expanduser("~")
-        if os.path.abspath(workspace_dir) in [home_dir, "/", "/Users"]:
+        has_sub_repos = False
+        try:
+            for entry in os.listdir(workspace_dir):
+                if os.path.isdir(os.path.join(workspace_dir, entry, ".git")):
+                    has_sub_repos = True
+                    break
+        except Exception:
+            pass
+
+        if os.path.abspath(workspace_dir) in [home_dir, "/", "/Users"] or has_sub_repos:
             pass
         else:
             try:
@@ -1067,6 +1091,72 @@ def get_git_diff_stat(filepath: str) -> Optional[str]:
     except Exception:
         return None
 
+
+# ---------------------------------------------------------------------------
+# PreToolUse: HardTruth G2 Mutation Gate Check
+# ---------------------------------------------------------------------------
+
+def check_hardtruth_g2_mutation(file_path: str) -> Tuple[bool, Optional[str]]:
+    """
+    Physically checks HardTruth G2 mutation gate before or during file mutations.
+    Enforces Rule 5 Mechanical Lock and Channel B Artifact Closure.
+    """
+    if not file_path:
+        return True, None
+
+    gate_bin = os.path.expanduser("~/.local/bin/hardtruth-gate")
+    if not os.path.exists(gate_bin):
+        gate_bin = "hardtruth-gate"
+
+    payload_json = json.dumps({"mutated_files": [file_path]})
+    try:
+        proc = subprocess.run(
+            [gate_bin, "gate", "G2", "--payload", payload_json],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            reason = err
+            for line in err.splitlines():
+                if "Reason:" in line:
+                    reason = line.split("Reason:", 1)[1].strip()
+                    break
+                elif "REJECT:" in line:
+                    reason = line.strip()
+                    break
+            return False, reason
+        return True, None
+    except Exception:
+        return True, None
+
+def handle_pre_tool_use(payload: dict) -> dict:
+    """
+    Lifecycle Hook: PreToolUse
+    Physically verifies HardTruth G2 Mutation Gate before mutations are applied to disk.
+    Blocks any violation of Rule 5 or unauthorized artifact closure mutation.
+    """
+    payload = normalize_payload(payload)
+    tool_call = payload.get("toolCall", {})
+    tool_name = tool_call.get("name", "unknown")
+    tool_args = tool_call.get("args", {})
+
+    if tool_name in ["write_to_file", "replace_file_content", "Write", "write", "Edit", "edit"]:
+        target_file = (
+            tool_args.get("TargetFile")
+            or tool_args.get("target_file")
+            or tool_args.get("file_path")
+            or ""
+        )
+        if target_file:
+            passed, reason = check_hardtruth_g2_mutation(target_file)
+            if not passed:
+                msg = f"🚨 HARDTRUTH G2 MUTATION GATE BLOCKED: {reason}"
+                sys.stderr.write(msg + "\n")
+                return {"decision": "deny", "reason": msg}
+
+    return {"decision": "allow"}
 
 # ---------------------------------------------------------------------------
 # PostToolUse: Ledger Recording
@@ -1264,6 +1354,19 @@ imperative_filter = re.compile(
 )
 
 
+def normalize_agent_prose(text: str) -> str:
+    """
+    HT-SEC-04: Unicode Normalization Shield.
+    1. Normalizes Unicode to Compatibility Decomposition/Composition (NFKC).
+    2. Strips zero-width and invisible formatting codepoints (\u200B-\u200D, \uFEFF, \u00A0).
+    """
+    if not text:
+        return ""
+    norm = unicodedata.normalize("NFKC", text)
+    norm = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", " ", norm)
+    return norm
+
+
 # ---------------------------------------------------------------------------
 # Stop: Pre-Termination Verification Gate (Hybrid Two-Tier)
 # ---------------------------------------------------------------------------
@@ -1368,13 +1471,29 @@ def handle_stop(payload: dict) -> dict:
         pass
 
     counter_file = get_halt_counter_file(conv_id)
+    halt_data = {}
     halt_count = 0
+    consecutive_no_change = 0
+    prev_state_hash = None
     if os.path.exists(counter_file):
         try:
             with open(counter_file, "r") as f:
-                halt_count = json.load(f).get("count", 0)
+                halt_data = json.load(f)
+                halt_count = halt_data.get("count", 0)
+                consecutive_no_change = halt_data.get("consecutive_no_change", 0)
+                prev_state_hash = halt_data.get("last_state_hash")
         except Exception:
             halt_count = 0
+            consecutive_no_change = 0
+            prev_state_hash = None
+
+    source_files_modified = 0
+    verification_commands_executed = 0
+    test_commands_executed = 0
+    last_source_mod_step = -1
+    last_test_step = -1
+    unresolved_failures = []
+    modified_paths = []
 
     def fail_halt(reason: str, remediable: bool = True) -> dict:
         _disarm_alarm()
@@ -1394,9 +1513,49 @@ def handle_stop(payload: dict) -> dict:
             }, timeout=1.0)
         except Exception:
             pass
+
+        current_state = {
+            "ledger_src": source_files_modified,
+            "verification_exec": verification_commands_executed,
+            "test_exec": test_commands_executed,
+            "last_source_mod_step": last_source_mod_step,
+            "last_test_step": last_test_step,
+            "unresolved_failures": [u.get("command") for u in unresolved_failures] if unresolved_failures else [],
+            "modified_paths": sorted(list(modified_paths)) if modified_paths else [],
+            "workspace": workspace_dir or ""
+        }
+        state_hash = hashlib.sha256(json.dumps(current_state, sort_keys=True).encode("utf-8")).hexdigest()
+
+        if prev_state_hash and prev_state_hash == state_hash:
+            no_change_count = consecutive_no_change + 1
+        else:
+            no_change_count = 1
+
         new_count = halt_count + 1 if remediable else halt_count
         if remediable:
-            record_halt(counter_file, new_count)
+            record_halt(counter_file, new_count, no_change_count, state_hash, reason)
+
+        # Circuit Breaker: >3 consecutive verification attempts without state change
+        if no_change_count > 3:
+            breaker_msg = (
+                f"\n🚨 HARDTRUTH CIRCUIT BREAKER: Verification halted after {no_change_count} consecutive attempts without state change.\n"
+                f"Loop breaker activated to prevent trapping agent in an infinite loop.\n"
+                f"Actionable Failure Report:\n"
+                f"  • Root Cause: {reason}\n"
+                f"  • Target Workspace: {workspace_dir}\n"
+                f"  • Unresolved Failures: {len(unresolved_failures)}\n"
+                f"  • Remediation: Resolve failure by updating code/tests or reset halt counter: rm {counter_file}\n"
+            )
+            sys.stderr.write(breaker_msg + "\n")
+            if HARNESS in ("claude_code", "claude"):
+                # Break infinite loop in Claude Code by allowing turn completion with actionable error reported
+                return _allow()
+            return _halt(
+                f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts, {no_change_count} without state change). "
+                "HardTruth never fails open. Manual verification or human operator escalation required.\n\n"
+                f"Root Cause: {reason}"
+            )
+
         if new_count >= 3:
             sys.stderr.write(
                 f"[HARDTRUTH OPERATOR NOTICE] Escalation halt reached for session {conv_id} ({new_count} consecutive halts).\n"
@@ -1904,11 +2063,43 @@ def handle_stop(payload: dict) -> dict:
                 "hard gate and git integrity checks could not run. HardTruth never fails open.",
                 remediable=False
             )
-        tier2_result = call_system_one("v1/verify/handoff", {
-            "workspace_path": workspace_dir,
-            "conversationId": conv_id,
-            "timeout_sec": 50
-        }, timeout=55.0)
+
+        # Dynamic Target Path Resolution:
+        resolved_ws = resolve_target_project_dir(workspace_dir, modified_paths, conv_id)
+        if resolved_ws and os.path.exists(resolved_ws):
+            workspace_dir = resolved_ws
+
+        tier2_result = None
+        if is_macos_native_project(workspace_dir):
+            if run_independent_verification is not None:
+                try:
+                    tier2_result = run_independent_verification(
+                        workspace_path=workspace_dir,
+                        timeout_sec=30,
+                        conv_id=conv_id
+                    )
+                except Exception:
+                    pass
+        else:
+            tier2_result = call_system_one("v1/verify/handoff", {
+                "workspace_path": workspace_dir,
+                "conversationId": conv_id,
+                "timeout_sec": 30
+            }, timeout=35.0)
+
+            # Fallback to host tier2_runner if daemon container cannot see workspace or has no runner inside container
+            if tier2_result is None or tier2_result.get("status") in ("unverified_no_workspace", "unverified_no_runner"):
+                if run_independent_verification is not None:
+                    try:
+                        host_res = run_independent_verification(
+                            workspace_path=workspace_dir,
+                            timeout_sec=30,
+                            conv_id=conv_id
+                        )
+                        if host_res is not None:
+                            tier2_result = host_res
+                    except Exception:
+                        pass
 
         if tier2_result is None:
             return fail_halt(
@@ -2004,7 +2195,8 @@ def handle_stop(payload: dict) -> dict:
     # -----------------------------------------------------------------------
     p11_wall = time.perf_counter()
     p11_cpu = time.process_time()
-    text_without_fences = re.sub(r"```[\s\S]*?```", "", agent_text)
+    agent_text_norm = normalize_agent_prose(agent_text)
+    text_without_fences = re.sub(r"```[\s\S]*?```", "", agent_text_norm)
     text_clean = text_without_fences.replace("`", "")
     text_clean = re.sub(r"^\s*>\s*", "", text_clean, flags=re.MULTILINE)
 
@@ -2160,10 +2352,22 @@ def handle_stop(payload: dict) -> dict:
     return _allow()
 
 
-def record_halt(counter_file: str, new_count: int):
+def record_halt(
+    counter_file: str,
+    new_count: int,
+    consecutive_no_change: int = 1,
+    state_hash: Optional[str] = None,
+    reason: Optional[str] = None
+):
     try:
         with open(counter_file, "w") as f:
-            json.dump({"count": new_count, "timestamp": time.time()}, f)
+            json.dump({
+                "count": new_count,
+                "consecutive_no_change": consecutive_no_change,
+                "last_state_hash": state_hash,
+                "last_reason": str(reason)[:300] if reason else None,
+                "timestamp": time.time()
+            }, f)
     except Exception:
         pass
 
@@ -2183,7 +2387,9 @@ if __name__ == "__main__":
     payload = normalize_payload(payload)
 
     try:
-        if mode in ["post_tool", "PostToolUse"]:
+        if mode in ["pre_tool", "PreToolUse"]:
+            out = handle_pre_tool_use(payload)
+        elif mode in ["post_tool", "PostToolUse"]:
             out = handle_post_tool_use(payload)
         else:
             out = handle_stop(payload)

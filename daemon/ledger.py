@@ -14,6 +14,7 @@ import hashlib
 import secrets
 import fcntl
 import threading
+import unicodedata
 from typing import Dict, List, Optional, Tuple, Any
 
 DEFAULT_LEDGER_PATH = os.path.expanduser("~/.hardtruth/daemon_ledger.jsonl")
@@ -123,7 +124,7 @@ VERIFICATION_ANYWHERE_PATTERN = re.compile(
 
 # Chained shell operators, pipes, subshells, newlines, negation, or conditionals that mask exit codes
 SHELL_OPERATOR_MASK_PATTERN = re.compile(
-    r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|^\s*!\s*|^\s*not\s+|\beval\b|\bexec\b|\(|\))",
+    r"(?:[\r\n]|\|\||;|&&|\|(?!=)|&|^\s*if\b|^\s*!\s*|^\s*not\s+|\beval\b|\bexec\b|\(|\)|`)",
     re.IGNORECASE
 )
 
@@ -148,7 +149,10 @@ DOC_EXTENSIONS = {
 
 def is_test_execution_command(cmd: str) -> bool:
     """Returns True if the command executes a test runner (excluding linters and non-test commands)."""
-    cmd_clean = strip_shell_prefixes(cmd)
+    raw = (cmd or "").strip()
+    raw = unicodedata.normalize("NFKC", raw)
+    raw = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", raw)
+    cmd_clean = strip_shell_prefixes(raw)
     if not cmd_clean:
         return False
     if re.search(r"(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--fixtures|--markers|--setup-only|--setup-plan|--setup-show|--cache-show)(?:\s|$)", cmd_clean):
@@ -158,7 +162,10 @@ def is_test_execution_command(cmd: str) -> bool:
 
 def is_verification_command(cmd: str) -> bool:
     """Returns True if the command executes tests or static analysis linters."""
-    cmd_clean = strip_shell_prefixes(cmd)
+    raw = (cmd or "").strip()
+    raw = unicodedata.normalize("NFKC", raw)
+    raw = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", raw)
+    cmd_clean = strip_shell_prefixes(raw)
     if not cmd_clean:
         return False
     # Fake verification commands like pytest --version, pytest --help, pytest --fixtures are NOT verification runs
@@ -178,6 +185,9 @@ def is_tainted_shell_command(cmd: str) -> bool:
     raw_cmd = (cmd or "").strip()
     if not raw_cmd:
         return False
+    # HT-SEC-04: Unicode NFKC normalization and zero-width character stripping
+    raw_cmd = unicodedata.normalize("NFKC", raw_cmd)
+    raw_cmd = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", raw_cmd)
     if DANGEROUS_ENV_OVERRIDE_PATTERN.search(raw_cmd):
         return True
     if "\n" in raw_cmd or "\r" in raw_cmd:
