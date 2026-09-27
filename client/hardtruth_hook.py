@@ -2620,7 +2620,26 @@ def handle_stop(payload: dict) -> dict:
                 if contradiction >= CONTRADICTION_THRESHOLD:
                     return fail_halt(f"🚨 HARDTRUTH ENGINE CONTRADICTION DETECTED (conf: {contradiction:.2f}):\nClaim: '{claim}' contradicts the execution ledger.\nLedger Evidence: {premise_str}\nFix the failure and provide verified command output before stopping.")
             else:
-                if (test_commands_executed > 0 or source_files_modified == 0) and len(unresolved_failures) == 0:
+                # Daemon unreachable (or, in test isolation, rejecting an intentionally
+                # mismatched token -- see the "token-less isolation" setup used across
+                # this suite): fail closed UNLESS there is already deterministic ledger
+                # evidence that genuine verification happened this session. This loop
+                # only ever runs over claims_to_verify, i.e. sentences that already
+                # matched action_triggers -- the agent asserting it DID something
+                # (created, fixed, verified, ...) -- so reaching here always means there
+                # IS a claim needing daemon verification.
+                #
+                # The prior condition also exempted source_files_modified == 0, which is
+                # exactly backwards: "nothing was modified AND nothing was tested" is the
+                # single most dangerous case (a bare completion/verification claim with
+                # zero corroborating activity of any kind), not a safe one -- that is
+                # precisely the hallucinated claim this rule exists to catch. Requiring
+                # test_commands_executed > 0 (a real test run this session, with no
+                # unresolved failures) keeps the legitimate case working: when the
+                # session's own ledger already shows the claimed verification actually
+                # ran cleanly, the NLI check is a redundant semantic double-check, not
+                # the only line of defense, so a daemon outage doesn't need to block it.
+                if test_commands_executed > 0 and len(unresolved_failures) == 0:
                     pass
                 else:
                     return fail_halt(f"🚨 HARDTRUTH DAEMON UNREACHABLE: Verifier at {SYSTEM_ONE_URL} is offline. Factual claim '{claim}' cannot be verified autonomously. You must provide manual verification output before completing.", remediable=False)

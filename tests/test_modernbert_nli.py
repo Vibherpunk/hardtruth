@@ -10,6 +10,7 @@ Verifies:
 
 import os
 import sys
+import importlib.util
 import unittest
 import pytest
 
@@ -18,6 +19,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 
 from app import _resolve_label_indices, _run_startup_canary
 from ledger import DaemonLedger
+
+# Genuine availability checks (not a re-import of the already-loaded `app` module, which
+# would never raise ImportError since torch/transformers are only imported lazily INSIDE
+# app.py's functions -- the module itself imports cleanly without them). Tests that
+# actually invoke those functions must skip on THIS check, not on re-importing `app`.
+_TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
+_TRANSFORMERS_AVAILABLE = importlib.util.find_spec("transformers") is not None
 
 
 class DummyConfig:
@@ -127,6 +135,7 @@ class TestLedgerPremiseExpansion(unittest.TestCase):
         self.assertEqual(len(premise_data["unresolved_failures"]), 1)
 
 
+@unittest.skipUnless(_TORCH_AVAILABLE, "PyTorch not available in this test runner")
 class TestStartupCanary(unittest.TestCase):
     def test_canary_failure_raises(self):
         class InvertedModel:
@@ -155,12 +164,13 @@ class TestStartupCanary(unittest.TestCase):
         self.assertIn("NLI startup canary FAILED", str(ctx.exception))
 
 
+@unittest.skipUnless(
+    _TORCH_AVAILABLE and _TRANSFORMERS_AVAILABLE,
+    "PyTorch/Transformers not available in this test runner"
+)
 class TestLiveModernBERTInference(unittest.TestCase):
     def test_live_inference_contradiction_and_entailment(self):
-        try:
-            from app import _evaluate_nli_pairs, _nli_max_length
-        except ImportError:
-            self.skipTest("PyTorch/Transformers not available in this test runner")
+        from app import _evaluate_nli_pairs, _nli_max_length
 
         # Test contradiction
         res_contra = _evaluate_nli_pairs([
@@ -179,10 +189,7 @@ class TestLiveModernBERTInference(unittest.TestCase):
         self.assertGreaterEqual(res_entail[0]["probabilities"]["entailment"], 0.80)
 
     def test_long_sequence_beyond_512_tokens(self):
-        try:
-            from app import _evaluate_nli_pairs, _nli_max_length
-        except ImportError:
-            self.skipTest("PyTorch/Transformers not available in this test runner")
+        from app import _evaluate_nli_pairs, _nli_max_length
 
         # Create a long premise with > 800 tokens of test log text
         long_log = "PASSED tests/test_core.py::test_case_num_%d in 0.05s\n"

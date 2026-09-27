@@ -97,26 +97,38 @@ class TestBug4TargetResolution(unittest.TestCase):
 
     def test_resolves_to_project_containing_an_actually_edited_file(self):
         """A file the session actually edited, nested under the workspace, correctly
-        resolves to ITS project root (not the parent, not an unrelated sibling)."""
+        resolves to ITS project root (not the parent, not an unrelated sibling).
+
+        Uses pytest/Python fixtures rather than npm/cargo projects so this test is
+        hermetic in any environment that can run this test suite at all (e.g. a Tier 2
+        verification container, which has pytest but not necessarily node or cargo).
+        """
         parent = os.path.join(self.test_dir, "dev")
         os.makedirs(parent, exist_ok=True)
 
         target_proj = os.path.join(parent, "vibehard", "apps", "reachyd")
         _git_init(os.path.join(parent, "vibehard"))
-        os.makedirs(target_proj, exist_ok=True)
-        with open(os.path.join(target_proj, "Cargo.toml"), "w") as f:
-            f.write("[package]\nname = \"reachyd\"\n")
+        os.makedirs(os.path.join(target_proj, "tests"), exist_ok=True)
+        with open(os.path.join(target_proj, "pytest.ini"), "w") as f:
+            f.write("[pytest]\n")
+        with open(os.path.join(target_proj, "tests", "test_x.py"), "w") as f:
+            f.write("def test_x(): pass\n")
 
-        edited_file = os.path.join(target_proj, "src", "main.rs")
+        edited_file = os.path.join(target_proj, "src", "main.py")
         os.makedirs(os.path.dirname(edited_file), exist_ok=True)
         with open(edited_file, "w") as f:
-            f.write("fn main() {}\n")
+            f.write("def main(): pass\n")
 
-        # An unrelated sibling project that should NOT be picked even though it also exists.
+        # An unrelated sibling project -- ALSO pytest-runnable -- that should NOT be
+        # picked even though it exists and has its own detectable runner, proving
+        # selection follows the actually-edited file rather than "any runnable project".
         unrelated = os.path.join(parent, "goose")
         _git_init(unrelated)
-        with open(os.path.join(unrelated, "package.json"), "w") as f:
-            f.write('{"name": "goose", "scripts": {"test": "echo ok"}}')
+        os.makedirs(os.path.join(unrelated, "tests"), exist_ok=True)
+        with open(os.path.join(unrelated, "pytest.ini"), "w") as f:
+            f.write("[pytest]\n")
+        with open(os.path.join(unrelated, "tests", "test_y.py"), "w") as f:
+            f.write("def test_y(): pass\n")
 
         result = resolve_target_project_dir(parent, modified_files=[edited_file], conv_id=None)
         self.assertEqual(os.path.abspath(result), os.path.abspath(target_proj))
@@ -141,19 +153,27 @@ class TestBug4TargetResolution(unittest.TestCase):
 
     def test_relative_modified_file_paths_resolved_against_workspace(self):
         """modified_files may be relative paths (as stored in the ledger/premise) --
-        these must resolve against workspace_dir, not cwd."""
+        these must resolve against workspace_dir, not cwd.
+
+        Uses a pytest/Python fixture rather than an npm project so this test is hermetic
+        in any environment that can run this test suite at all (e.g. a Tier 2
+        verification container, which has pytest but not necessarily node installed).
+        """
         parent = os.path.join(self.test_dir, "dev")
         os.makedirs(parent, exist_ok=True)
         target_proj = os.path.join(parent, "myproj")
         _git_init(target_proj)
-        with open(os.path.join(target_proj, "package.json"), "w") as f:
-            f.write('{"name": "myproj", "scripts": {"test": "echo ok"}}')
+        os.makedirs(os.path.join(target_proj, "tests"), exist_ok=True)
+        with open(os.path.join(target_proj, "pytest.ini"), "w") as f:
+            f.write("[pytest]\n")
+        with open(os.path.join(target_proj, "tests", "test_index.py"), "w") as f:
+            f.write("def test_index(): pass\n")
         os.makedirs(os.path.join(target_proj, "src"), exist_ok=True)
-        with open(os.path.join(target_proj, "src", "index.js"), "w") as f:
-            f.write("// x\n")
+        with open(os.path.join(target_proj, "src", "index.py"), "w") as f:
+            f.write("# x\n")
 
         result = resolve_target_project_dir(
-            target_proj, modified_files=["src/index.js"], conv_id=None
+            target_proj, modified_files=["src/index.py"], conv_id=None
         )
         self.assertEqual(os.path.abspath(result), os.path.abspath(target_proj))
 

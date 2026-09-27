@@ -46,18 +46,24 @@ class TestReachyCircuitBreaker(unittest.TestCase):
     def test_01_find_project_root_for_file(self):
         """Tests that find_project_root_for_file identifies the nearest manifest."""
         reachy_src = "/Users/ai/dev/vibehard/apps/reachyd/src/types.rs"
+        if not os.path.isfile(reachy_src):
+            self.skipTest("reachyd fixture project not present on this host/container")
         root = find_project_root_for_file(reachy_src)
         self.assertEqual(root, "/Users/ai/dev/vibehard/apps/reachyd")
 
     def test_02_resolve_target_project_dir_with_modified_files(self):
         """Tests that parent dir /Users/ai/dev resolves to reachyd when modified files are present."""
         reachy_src = "/Users/ai/dev/vibehard/apps/reachyd/src/types.rs"
+        if not os.path.isfile(reachy_src):
+            self.skipTest("reachyd fixture project not present on this host/container")
         resolved = resolve_target_project_dir("/Users/ai/dev", modified_files=[reachy_src])
         self.assertEqual(resolved, "/Users/ai/dev/vibehard/apps/reachyd")
 
     def test_03_is_macos_native_project_detection(self):
         """Tests that reachyd is detected as macOS native due to CoreAudio/Cocoa/objc dependencies."""
         reachyd_dir = "/Users/ai/dev/vibehard/apps/reachyd"
+        if not os.path.isdir(reachyd_dir):
+            self.skipTest("reachyd fixture project not present on this host/container")
         self.assertTrue(is_macos_native_project(reachyd_dir))
 
         # Non-mac project should be false
@@ -69,6 +75,8 @@ class TestReachyCircuitBreaker(unittest.TestCase):
     def test_04_run_independent_verification_reachyd(self):
         """Tests that Tier 2 independent runner resolves reachyd and passes tests cleanly on host."""
         reachyd_dir = "/Users/ai/dev/vibehard/apps/reachyd"
+        if not os.path.isdir(reachyd_dir):
+            self.skipTest("reachyd fixture project not present on this host/container")
         res = run_independent_verification(reachyd_dir, conv_id=self.conv_id, timeout_sec=30)
         self.assertTrue(res.get("success"), f"Tier 2 failed: {res.get('output')}")
         self.assertEqual(res.get("status"), "verified")
