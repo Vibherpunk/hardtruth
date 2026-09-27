@@ -22,7 +22,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from daemon.ledger import DaemonLedger, can_suite_resolve_failure, is_tainted_shell_command
+from daemon.ledger import DaemonLedger, can_suite_resolve_failure, is_tainted_shell_command, get_base_command
 from daemon.tier2_runner import detect_test_runner, resolve_workspace_path, run_independent_verification
 
 
@@ -166,6 +166,66 @@ class TestHybridArchitecture(unittest.TestCase):
         })
 
         ledger = DaemonLedger(ledger_path=self.ledger_file)
+        premise = ledger.get_premise(conv)
+        self.assertEqual(len(premise["unresolved_failures"]), 1)
+        self.assertIn("TAINTED", premise["unresolved_failures"][0]["error"])
+
+    def test_get_base_command_strips_operator_tail(self):
+        """get_base_command recovers the real invocation regardless of how the masking
+        operator/redirection was attached (piped tail, semicolon with no space, cd prefix)."""
+        self.assertEqual(get_base_command("pytest tests/ 2>&1 | tail -15"), "pytest tests/")
+        self.assertEqual(get_base_command("pytest tests/; echo done"), "pytest tests/")
+        self.assertEqual(get_base_command("pytest tests/ ; true"), "pytest tests/")
+        self.assertEqual(get_base_command("pytest tests/ || exit 0"), "pytest tests/")
+        self.assertEqual(
+            get_base_command("cd /workspace/foo && pytest tests/ 2>&1 | tail -15"),
+            "pytest tests/"
+        )
+        self.assertEqual(
+            get_base_command("python3 -m pytest /Users/ai/dev/hardtruth-fix/tests"),
+            "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests"
+        )
+
+    def test_tainted_piped_run_superseded_by_later_bare_pass(self):
+        """
+        Reproduces the real incident: three TAINTED piped runs of the same suite must be
+        cleared by a later bare, clean, passing run of that suite in the same session/workspace.
+        """
+        ledger = DaemonLedger(ledger_path=self.ledger_file)
+        conv = f"taint-supersede-{uuid.uuid4().hex}"
+        cwd = "/Users/ai/dev/hardtruth-fix"
+
+        # Three tainted piped runs -- correctly recorded as TAINTED/failed
+        for i, cmd in enumerate([
+            "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests 2>&1 | tail -15",
+            "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests 2>&1 | tail -15",
+            "cd /Users/ai/dev/hardtruth-fix && python3 -m pytest /Users/ai/dev/hardtruth-fix/tests 2>&1 | tail -15",
+        ]):
+            ledger.record_entry(conv, i + 1, "run_command", cmd, observed_exit_code=1, cwd=cwd)
+
+        premise_before = ledger.get_premise(conv)
+        self.assertGreaterEqual(len(premise_before["unresolved_failures"]), 1)
+        self.assertIn("TAINTED", premise_before["unresolved_failures"][0]["error"])
+
+        # A later BARE, clean, passing run of the same suite in the same workspace
+        ledger.record_entry(
+            conv, 4, "run_command",
+            "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests",
+            observed_exit_code=0, cwd=cwd
+        )
+        premise_after = ledger.get_premise(conv)
+        self.assertEqual(premise_after["unresolved_failures"], [])
+
+    def test_earlier_pass_never_supersedes_later_failure(self):
+        """A clean pass followed by a genuine later failure must NOT be cleared -- resolution
+        is one-directional (later good run clears earlier bad ones, never the reverse)."""
+        ledger = DaemonLedger(ledger_path=self.ledger_file)
+        conv = f"no-reverse-resolve-{uuid.uuid4().hex}"
+        cwd = "/Users/ai/dev/hardtruth-fix"
+
+        ledger.record_entry(conv, 1, "run_command", "python3 -m pytest tests/", observed_exit_code=0, cwd=cwd)
+        ledger.record_entry(conv, 2, "run_command", "python3 -m pytest tests/ 2>&1 | tail -15", observed_exit_code=1, cwd=cwd)
+
         premise = ledger.get_premise(conv)
         self.assertEqual(len(premise["unresolved_failures"]), 1)
         self.assertIn("TAINTED", premise["unresolved_failures"][0]["error"])

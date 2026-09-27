@@ -1,0 +1,4 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_tp1", "name": "Bash", "input": {"command": "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests 2>&1 | tail -15"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_tp1", "is_error": true, "content": "1 failed, 115 passed"}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_tp2", "name": "Bash", "input": {"command": "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_tp2", "content": "116 passed in 12.3s"}]}}

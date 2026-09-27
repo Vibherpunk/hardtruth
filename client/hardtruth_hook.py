@@ -775,12 +775,31 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
     return None
 
 
-def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = None) -> Tuple[Set[str], Set[str], List[str]]:
+def get_git_modified_source_files(
+    workspace_dir: str,
+    conv_id: Optional[str] = None,
+    transcript_path: Optional[str] = None
+) -> Tuple[Set[str], Set[str], List[str]]:
     """
     Universal File Tracking:
     1. Checks working tree modifications (M, A, ??, R, !!) via git status --porcelain --ignored=matching.
     2. Checks committed modifications made during this session via git diff --name-only <baseline_sha> HEAD.
+    3. (Claude Code only, if transcript_path given) Adds files the session's OWN transcript
+       shows were edited via Edit/Write/NotebookEdit tool_use blocks -- a signal independent
+       of git, so an edit is never missed even if it was later reverted or the repo state
+       is otherwise ambiguous.
     Defeats the 'commit & run' evasion loophole completely.
+
+    Note on baseline_dirty: it is a point-in-time snapshot taken whenever the session's
+    baseline is FIRST established (by whichever hook call happens first -- PostToolUse or
+    this Stop-time call). git status is always the final source of truth for Rule 1 -- a
+    file dirtied by the session's own very first raw-shell action (before any baseline
+    exists) is deliberately still caught here rather than being excluded as "pre-existing",
+    since making detection depend on baseline timing would open an evasion path. Bug #3's
+    fix instead adds an independent, additive signal below (2b) from the session's own
+    transcript, and relies on PostToolUse establishing the baseline promptly (on the
+    session's first tool call, before any edit tool can run) for the ordinary case.
+
     Returns: (source_files, doc_files, full_file_paths)
     """
     source_files = set()
@@ -848,29 +867,42 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
             raise RuntimeError("git status timed out after 5.0s during workspace verification")
 
     # 2. Committed files since session baseline
-    if is_git_repo and conv_id:
-        baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
-        if baseline_sha:
+    baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id) if (is_git_repo and conv_id) else None
+    if is_git_repo and conv_id and baseline_sha:
+        try:
+            res_diff = subprocess.run(
+                ["git"] + git_safe_flags + ["diff", "--name-only", baseline_sha, "HEAD", "--"],
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5.0,
+                text=True
+            )
+            if res_diff.returncode != 0:
+                raise RuntimeError(f"git diff failed with exit code {res_diff.returncode}: {res_diff.stderr.strip()}")
+            if res_diff.stdout:
+                for line in res_diff.stdout.splitlines():
+                    f = line.strip()
+                    if f.startswith('"') and f.endswith('"'):
+                        f = f[1:-1]
+                    if f:
+                        all_rel_paths.add(f)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"git diff against baseline {baseline_sha} timed out after 5.0s")
+
+    # 2b. Claude Code only: files the session's own transcript shows were edited via
+    # Edit/Write/NotebookEdit tool_use blocks -- independent of git entirely.
+    if transcript_path and HARNESS in ("claude_code", "claude"):
+        for fp in extract_claude_code_edited_files(transcript_path):
             try:
-                res_diff = subprocess.run(
-                    ["git"] + git_safe_flags + ["diff", "--name-only", baseline_sha, "HEAD", "--"],
-                    cwd=workspace_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=5.0,
-                    text=True
-                )
-                if res_diff.returncode != 0:
-                    raise RuntimeError(f"git diff failed with exit code {res_diff.returncode}: {res_diff.stderr.strip()}")
-                if res_diff.stdout:
-                    for line in res_diff.stdout.splitlines():
-                        f = line.strip()
-                        if f.startswith('"') and f.endswith('"'):
-                            f = f[1:-1]
-                        if f:
-                            all_rel_paths.add(f)
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(f"git diff against baseline {baseline_sha} timed out after 5.0s")
+                fp_abs = fp if os.path.isabs(fp) else os.path.join(workspace_dir, fp)
+                fp_abs = os.path.abspath(fp_abs)
+                common = os.path.commonpath([fp_abs, ws_abs])
+            except Exception:
+                continue
+            if common != ws_abs:
+                continue  # outside this workspace -- not this project's file tracking scope
+            all_rel_paths.add(os.path.relpath(fp_abs, ws_abs))
 
     # 3. Check for git index manipulation (assume-unchanged or skip-worktree)
     if is_git_repo:
@@ -1003,6 +1035,252 @@ def get_git_modified_source_files(workspace_dir: str, conv_id: Optional[str] = N
             doc_files.add(base)
 
     return source_files, doc_files, full_paths
+
+
+# ---------------------------------------------------------------------------
+# Claude Code Transcript Adapter
+#
+# Claude Code transcripts are JSONL where each line is a record with
+# "type": "assistant" | "user" | "system" | ... . Tool calls live in
+# message.content[] blocks: an assistant record carries
+# {"type": "tool_use", "id": ..., "name": "Bash", "input": {"command": ...}}
+# and the tool's outcome arrives in the content[] of the NEXT "user" record as
+# {"type": "tool_result", "tool_use_id": ..., "content": ..., "is_error": bool}.
+# Edits/writes are tool_use blocks named Edit/Write/NotebookEdit with input.file_path.
+# There is no numeric step_index in this schema (unlike Antigravity's PLANNER_RESPONSE/
+# GENERIC records), so a monotonically increasing line counter stands in for ordering.
+#
+# A backgrounded Bash run reports back with tool_result text like "Command running in
+# background with ID <id>" and no exit code yet; its real completion (if any) shows up
+# later as a separate tool_result (e.g. a BashOutput poll) or task notification mentioning
+# that same id. HardTruth's non-synthesis rule means an in-flight/unresolved background
+# run is NEVER treated as a pass -- only an explicitly corroborated later completion is.
+# ---------------------------------------------------------------------------
+
+_CC_EXIT_CODE_RE = re.compile(r"exit(?:ed with)?\s*(?:code|status)[:\s]+(-?\d+)", re.IGNORECASE)
+_CC_BACKGROUND_RE = re.compile(r"running in (?:the )?background with (?:process )?id[:\s]+[\"']?([a-zA-Z0-9_-]+)", re.IGNORECASE)
+_CC_STILL_RUNNING_RE = re.compile(r"\bnot yet completed\b|\bstill running\b|\bstatus[:\s]+running\b", re.IGNORECASE)
+_CC_BG_COMPLETED_RE = re.compile(r"\bstatus[:\s]+completed\b", re.IGNORECASE)
+
+
+def _cc_tool_result_text(content: Any) -> str:
+    """Flattens a Claude Code tool_result's content (a plain string, or a list of
+    {"type": "text", "text": ...} blocks) into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "\n".join(parts)
+    return ""
+
+
+def parse_claude_code_transcript_commands(transcript_path: str) -> List[Dict[str, Any]]:
+    """
+    Parses a Claude Code transcript into one record per Bash tool_use/tool_result pair, in
+    transcript order:
+        {"command": str, "step": int, "resolved": bool, "exit_code": Optional[int],
+         "tail": Optional[str], "background_id": Optional[str]}
+
+    'resolved' is False for a backgrounded run unless a LATER tool_result in the same
+    transcript (a BashOutput poll or task-completion notice mentioning the same background
+    id) corroborates a clean completion -- in which case that original record's exit_code/
+    resolved fields are updated in place. An unresolved background run keeps
+    resolved=False, exit_code=None: callers must not treat this as a pass.
+    """
+    records: List[Dict[str, Any]] = []
+    if not transcript_path or not os.path.exists(transcript_path):
+        return records
+
+    pending_tool_use: Dict[str, int] = {}  # tool_use_id -> index into `records`
+    pending_bg: Dict[str, int] = {}        # background_id -> index into `records`
+    line_no = 0
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_no += 1
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                try:
+                    d = json.loads(line_s)
+                except Exception:
+                    continue
+
+                dtype = d.get("type")
+                msg = d.get("message") if isinstance(d.get("message"), dict) else d
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+
+                if dtype == "assistant":
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") in ("Bash", "bash"):
+                            tid = block.get("id")
+                            tinput = block.get("input") or {}
+                            cmd = str(tinput.get("command", "")).strip()
+                            if tid and cmd:
+                                records.append({
+                                    "command": cmd, "step": line_no, "resolved": False,
+                                    "exit_code": None, "tail": None, "background_id": None
+                                })
+                                pending_tool_use[tid] = len(records) - 1
+
+                elif dtype == "user":
+                    for block in content:
+                        if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                            continue
+                        tid = block.get("tool_use_id")
+                        text = _cc_tool_result_text(block.get("content"))
+                        is_error = bool(block.get("is_error"))
+                        tail = "\n".join(text.splitlines()[-15:])[:1000] if text else None
+
+                        idx = pending_tool_use.get(tid)
+                        if idx is not None:
+                            rec = records[idx]
+                            rec["tail"] = tail
+                            m_bg = _CC_BACKGROUND_RE.search(text)
+                            if m_bg:
+                                bg_id = m_bg.group(1).strip()
+                                rec["background_id"] = bg_id
+                                pending_bg[bg_id] = idx
+                                continue  # in-flight: never synthesize a pass
+                            m_ec = _CC_EXIT_CODE_RE.search(text)
+                            if m_ec:
+                                rec["exit_code"] = int(m_ec.group(1))
+                                rec["resolved"] = True
+                            elif is_error:
+                                rec["exit_code"] = 1
+                                rec["resolved"] = True
+                            else:
+                                rec["exit_code"] = 0
+                                rec["resolved"] = True
+                            continue
+
+                        # Not a direct Bash tool_result: check whether it resolves a
+                        # pending background command (e.g. a BashOutput poll or a task
+                        # completion notification referencing that background id).
+                        if not pending_bg:
+                            continue
+                        for bg_id, bg_idx in list(pending_bg.items()):
+                            if bg_id not in text:
+                                continue
+                            if _CC_STILL_RUNNING_RE.search(text):
+                                continue  # explicitly still running -- stays unresolved
+                            m_ec = _CC_EXIT_CODE_RE.search(text)
+                            if m_ec:
+                                records[bg_idx]["exit_code"] = int(m_ec.group(1))
+                                records[bg_idx]["resolved"] = True
+                                records[bg_idx]["tail"] = tail or records[bg_idx]["tail"]
+                                pending_bg.pop(bg_id, None)
+                            elif _CC_BG_COMPLETED_RE.search(text) and not is_error:
+                                records[bg_idx]["exit_code"] = 0
+                                records[bg_idx]["resolved"] = True
+                                records[bg_idx]["tail"] = tail or records[bg_idx]["tail"]
+                                pending_bg.pop(bg_id, None)
+    except Exception:
+        pass
+
+    return records
+
+
+def extract_claude_code_edited_files(transcript_path: str) -> Set[str]:
+    """
+    Scans a Claude Code transcript for Edit/Write/NotebookEdit tool_use blocks and returns
+    the set of file paths (input.file_path) the agent edited during THIS session.
+
+    This is an independent signal from git: Rule 1 (source modified without verification)
+    must fire based on what the session's own transcript shows it touched, or on git
+    changes relative to the SESSION BASELINE -- never on pre-existing uncommitted changes
+    that predate the session (a plain `git status` / diff-against-HEAD would wrongly
+    include those too).
+    """
+    edited: Set[str] = set()
+    if not transcript_path or not os.path.exists(transcript_path):
+        return edited
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line_s = line.strip()
+                if not line_s:
+                    continue
+                try:
+                    d = json.loads(line_s)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                msg = d.get("message") if isinstance(d.get("message"), dict) else d
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    if block.get("name") not in ("Edit", "Write", "NotebookEdit"):
+                        continue
+                    tinput = block.get("input") or {}
+                    fp = tinput.get("file_path") or tinput.get("notebook_path")
+                    if fp:
+                        edited.add(str(fp))
+    except Exception:
+        pass
+    return edited
+
+
+def extract_claude_code_command_resolutions(transcript_path: str) -> Tuple[Set[str], Dict[str, int]]:
+    """
+    Claude Code transcript adapter for Phase 4 reconciliation (see handle_stop): returns
+    (command_successes, command_step_map) in the same shape the Antigravity per-line
+    transcript parser produces, so the shared hierarchical-resolution loop in handle_stop
+    can resolve unresolved_failures regardless of harness.
+    """
+    successes: Set[str] = set()
+    step_map: Dict[str, int] = {}
+    for rec in parse_claude_code_transcript_commands(transcript_path):
+        if rec["resolved"] and rec["exit_code"] == 0:
+            successes.add(rec["command"])
+            step_map[rec["command"]] = rec["step"]
+    return successes, step_map
+
+
+def poll_claude_code_transcript_for_command(transcript_path: str, target_command: str, max_wait_ms: int = 1500) -> Tuple[Optional[int], Optional[str], bool]:
+    """
+    Claude Code transcript adapter used by handle_post_tool_use as a fallback when the
+    live PostToolUse payload itself carries no corroborated exit code. Correlates the
+    just-run Bash command back to its tool_use/tool_result pair (there is no step_index in
+    this schema, so matching is by exact command text, falling back to the most recent
+    Bash call if no exact match is found). Polls for up to max_wait_ms in case the
+    transcript write lags the hook firing, mirroring poll_transcript_for_step's contract.
+
+    Returns (exit_code, stdout_tail, timed_out). exit_code is None with timed_out=True both
+    when the transcript hasn't caught up yet AND when the matched command is a background
+    run with no resolution found -- HardTruth never synthesizes a pass for either case.
+    """
+    target_command = (target_command or "").strip()
+    end_time = time.time() + (max_wait_ms / 1000.0)
+    while True:
+        try:
+            records = parse_claude_code_transcript_commands(transcript_path)
+            match = None
+            for rec in reversed(records):
+                if rec["command"] == target_command:
+                    match = rec
+                    break
+            if match is None and records:
+                match = records[-1]
+            if match is not None and match["resolved"]:
+                return match["exit_code"], match["tail"], False
+        except Exception:
+            pass
+
+        if time.time() >= end_time:
+            break
+        time.sleep(0.05)
+
+    return None, None, True
 
 
 def poll_transcript_for_step(transcript_path: str, target_step_idx: int, max_wait_ms: int = 1500) -> Tuple[Optional[int], Optional[str], bool]:
@@ -1216,7 +1494,11 @@ def handle_post_tool_use(payload: dict) -> dict:
                 lines = str(raw_out).splitlines()
                 stdout_tail = "\n".join(lines[-15:])[:1000] if lines else None
         elif transcript_path and os.path.exists(transcript_path):
-            ec, tail, timed_out = poll_transcript_for_step(transcript_path, step_idx)
+            is_claude_code_harness = HARNESS in ("claude_code", "claude")
+            if is_claude_code_harness:
+                ec, tail, timed_out = poll_claude_code_transcript_for_command(transcript_path, cmd_or_file)
+            else:
+                ec, tail, timed_out = poll_transcript_for_step(transcript_path, step_idx)
             if ec is not None:
                 observed_exit_code = ec
                 stdout_tail = tail
@@ -1230,8 +1512,12 @@ def handle_post_tool_use(payload: dict) -> dict:
                     else:
                         observed_exit_code = 1
                         harness_status = "error"
-                elif error_msg == "" or error_msg is None:
-                    # In Antigravity PostToolUse lifecycle hook, error="" denotes successful execution (exit 0)
+                elif (error_msg == "" or error_msg is None) and not is_claude_code_harness:
+                    # In Antigravity's PostToolUse lifecycle hook, error="" denotes successful
+                    # execution (exit 0). This convention does NOT hold for Claude Code: an
+                    # unresolved transcript match there (e.g. a still-running background
+                    # command) must never be synthesized into a pass just because no error
+                    # string happened to be attached to the payload.
                     observed_exit_code = 0
                     harness_status = "no_error"
                 else:
@@ -1697,7 +1983,7 @@ def handle_stop(payload: dict) -> dict:
     p3_wall = time.perf_counter()
     p3_cpu = time.process_time()
     try:
-        git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id)
+        git_src_files, git_doc_files, git_paths = get_git_modified_source_files(workspace_dir, conv_id=conv_id, transcript_path=transcript_path)
     except Exception as e:
         return fail_halt(f"🚨 HARDTRUTH UNDETERMINED: Git command failed or timed out during workspace verification: {e}. HardTruth fails closed.", remediable=False)
 
@@ -1735,54 +2021,61 @@ def handle_stop(payload: dict) -> dict:
             if os.path.exists(full_transcript):
                 target_transcript = full_transcript
 
-            with open(target_transcript, "r", encoding="utf-8") as tf:
-                pending_cmd = None
-                pending_step = -1
-                for tline in tf:
-                    tline_s = tline.strip()
-                    if not tline_s:
-                        continue
-                    try:
-                        td = json.loads(tline_s)
-                        ttype = td.get("type")
-                        if ttype == "PLANNER_RESPONSE":
-                            tcalls = td.get("tool_calls", [])
-                            for tc in tcalls:
-                                if tc.get("name") == "run_command":
-                                    cargs = tc.get("args", {})
-                                    raw_c = str(cargs.get("CommandLine", "")).strip()
-                                    while (raw_c.startswith('"') and raw_c.endswith('"')) or (raw_c.startswith("'") and raw_c.endswith("'")):
-                                        raw_c = raw_c[1:-1].strip()
-                                    pending_cmd = raw_c
-                                    pending_step = td.get("step_index", -1)
-                        elif ttype == "GENERIC":
-                            tcontent = td.get("content", "")
-                            m_exit = re.search(r"\bThe command exited with code 0\b", tcontent)
-                            if m_exit and pending_cmd:
-                                command_successes.add(pending_cmd)
-                                command_step_map[pending_cmd] = td.get("step_index", pending_step)
-                            m_bg = re.search(r"[Tt]ask id:?\s*[\"']?([a-zA-Z0-9_/-]+)", tcontent)
-                            if m_bg:
-                                t_id_found = m_bg.group(1).strip()
-                                cmd_found = pending_cmd
-                                m_desc = re.search(r"Task Description:\s*(.*)", tcontent)
-                                if m_desc and not cmd_found:
-                                    cmd_found = m_desc.group(1).strip()
-                                if cmd_found:
-                                    task_cmd_map[t_id_found] = (cmd_found, pending_step)
-                            pending_cmd = None
-                        elif ttype in ("USER_INPUT", "GENERIC", "SYSTEM_MESSAGE"):
-                            tcontent = str(td.get("content", ""))
-                            m_fin = re.search(r'Task id\s+"?([a-zA-Z0-9_/-]+)"?\s+finished with result:.*?[Tt]he command exited with code (\d+)', tcontent, re.DOTALL)
-                            if m_fin:
-                                t_id = m_fin.group(1).strip()
-                                t_ec = int(m_fin.group(2))
-                                if t_ec == 0 and t_id in task_cmd_map:
-                                    bg_cmd, bg_step = task_cmd_map[t_id]
-                                    command_successes.add(bg_cmd)
-                                    command_step_map[bg_cmd] = td.get("step_index", bg_step)
-                    except Exception:
-                        continue
+            if HARNESS in ("claude_code", "claude"):
+                # Claude Code transcript adapter: assistant tool_use/user tool_result pairs,
+                # no step_index. See extract_claude_code_command_resolutions.
+                cc_successes, cc_step_map = extract_claude_code_command_resolutions(target_transcript)
+                command_successes |= cc_successes
+                command_step_map.update(cc_step_map)
+            else:
+                with open(target_transcript, "r", encoding="utf-8") as tf:
+                    pending_cmd = None
+                    pending_step = -1
+                    for tline in tf:
+                        tline_s = tline.strip()
+                        if not tline_s:
+                            continue
+                        try:
+                            td = json.loads(tline_s)
+                            ttype = td.get("type")
+                            if ttype == "PLANNER_RESPONSE":
+                                tcalls = td.get("tool_calls", [])
+                                for tc in tcalls:
+                                    if tc.get("name") == "run_command":
+                                        cargs = tc.get("args", {})
+                                        raw_c = str(cargs.get("CommandLine", "")).strip()
+                                        while (raw_c.startswith('"') and raw_c.endswith('"')) or (raw_c.startswith("'") and raw_c.endswith("'")):
+                                            raw_c = raw_c[1:-1].strip()
+                                        pending_cmd = raw_c
+                                        pending_step = td.get("step_index", -1)
+                            elif ttype == "GENERIC":
+                                tcontent = td.get("content", "")
+                                m_exit = re.search(r"\bThe command exited with code 0\b", tcontent)
+                                if m_exit and pending_cmd:
+                                    command_successes.add(pending_cmd)
+                                    command_step_map[pending_cmd] = td.get("step_index", pending_step)
+                                m_bg = re.search(r"[Tt]ask id:?\s*[\"']?([a-zA-Z0-9_/-]+)", tcontent)
+                                if m_bg:
+                                    t_id_found = m_bg.group(1).strip()
+                                    cmd_found = pending_cmd
+                                    m_desc = re.search(r"Task Description:\s*(.*)", tcontent)
+                                    if m_desc and not cmd_found:
+                                        cmd_found = m_desc.group(1).strip()
+                                    if cmd_found:
+                                        task_cmd_map[t_id_found] = (cmd_found, pending_step)
+                                pending_cmd = None
+                            elif ttype in ("USER_INPUT", "GENERIC", "SYSTEM_MESSAGE"):
+                                tcontent = str(td.get("content", ""))
+                                m_fin = re.search(r'Task id\s+"?([a-zA-Z0-9_/-]+)"?\s+finished with result:.*?[Tt]he command exited with code (\d+)', tcontent, re.DOTALL)
+                                if m_fin:
+                                    t_id = m_fin.group(1).strip()
+                                    t_ec = int(m_fin.group(2))
+                                    if t_ec == 0 and t_id in task_cmd_map:
+                                        bg_cmd, bg_step = task_cmd_map[t_id]
+                                        command_successes.add(bg_cmd)
+                                        command_step_map[bg_cmd] = td.get("step_index", bg_step)
+                        except Exception:
+                            continue
 
             for fail in unresolved_failures:
                 cmd_target = fail.get("command", "").strip()
@@ -2050,12 +2343,17 @@ def handle_stop(payload: dict) -> dict:
 
     # -----------------------------------------------------------------------
     # Phase 9: Tier 2: External Deterministic Hard Gate Handoff
-    # Only triggered if source files were modified or tests were executed
+    # Only triggered if source files were actually modified this session. A test command
+    # having run with no code changes is not, on its own, reason to hand off to Tier 2 --
+    # doing so previously let target resolution wander into unrelated sibling projects
+    # (see resolve_target_project_dir) purely because a test happened to run somewhere.
+    # Rule 2 (unresolved test failures) is enforced independently above, regardless of
+    # this gate.
     # -----------------------------------------------------------------------
     p9_wall = time.perf_counter()
     p9_cpu = time.process_time()
     tier2_ran = False
-    if (source_files_modified > 0 or test_commands_executed > 0) and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1" and HARNESS != "antigravity":
+    if source_files_modified > 0 and os.environ.get("HARDTRUTH_SKIP_TIER2") != "1" and HARNESS != "antigravity":
         tier2_ran = True
         if not workspace_dir:
             return fail_halt(
@@ -2064,9 +2362,17 @@ def handle_stop(payload: dict) -> dict:
                 remediable=False
             )
 
-        # Dynamic Target Path Resolution:
+        # Dynamic Target Path Resolution: derived exclusively from files this session
+        # actually edited (modified_paths / the session's own ledger) -- never from an
+        # unrelated sibling project that merely has uncommitted changes lying around.
         resolved_ws = resolve_target_project_dir(workspace_dir, modified_paths, conv_id)
-        if resolved_ws and os.path.exists(resolved_ws):
+        # session_evidence: True only when resolve_target_project_dir actually returned a
+        # target derived from this session's own edits -- gates the approved scoped
+        # native-host policy (daemon/tier2_runner.scoped_native_host_permitted). If it
+        # returned None, workspace_dir stays the original, unresolved value and that
+        # policy must not apply.
+        session_evidence = bool(resolved_ws and os.path.exists(resolved_ws))
+        if session_evidence:
             workspace_dir = resolved_ws
 
         tier2_result = None
@@ -2076,7 +2382,8 @@ def handle_stop(payload: dict) -> dict:
                     tier2_result = run_independent_verification(
                         workspace_path=workspace_dir,
                         timeout_sec=30,
-                        conv_id=conv_id
+                        conv_id=conv_id,
+                        session_evidence=session_evidence
                     )
                 except Exception:
                     pass
@@ -2094,7 +2401,8 @@ def handle_stop(payload: dict) -> dict:
                         host_res = run_independent_verification(
                             workspace_path=workspace_dir,
                             timeout_sec=30,
-                            conv_id=conv_id
+                            conv_id=conv_id,
+                            session_evidence=session_evidence
                         )
                         if host_res is not None:
                             tier2_result = host_res

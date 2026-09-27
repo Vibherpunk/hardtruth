@@ -1,0 +1,2 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_pass1", "name": "Bash", "input": {"command": "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests", "description": "run tests"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_pass1", "content": "116 passed in 12.3s"}]}}

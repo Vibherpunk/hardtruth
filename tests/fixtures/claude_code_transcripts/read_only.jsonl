@@ -1,0 +1,2 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_read1", "name": "Read", "input": {"file_path": "/Users/ai/dev/hardtruth-fix/client/hardtruth_hook.py"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_read1", "content": "1\tdef foo(): pass\n"}]}}

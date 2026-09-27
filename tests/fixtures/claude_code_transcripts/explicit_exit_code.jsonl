@@ -1,0 +1,2 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_ec1", "name": "Bash", "input": {"command": "cargo test", "description": "run cargo tests"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_ec1", "content": "test result: FAILED. 2 passed; 1 failed\nProcess exited with exit code 1"}]}}

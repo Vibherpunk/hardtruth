@@ -128,6 +128,54 @@ SHELL_OPERATOR_MASK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Round: suite-resolution keying. Matches the *start* of a chained/masking operator or
+# shell redirection (pipe, ;, &&, ||, background &, or an fd redirect like 2>&1, >, >>, <)
+# as a whole token, used only to recover the "real" command a tainted entry represents
+# (e.g. 'pytest tests/ 2>&1 | tail -15' -> 'pytest tests/') so a later bare, clean pass of
+# that same invocation can supersede it. Never used to decide tainting itself -- purely an
+# best-effort normalization for matching; under-stripping only leaves the gate stricter
+# (fails closed), it never causes a false resolution on its own.
+OPERATOR_TAIL_PATTERN = re.compile(
+    r"[\r\n]|;|&&|\|\||\||\d*>{1,2}&?\d*|<|&(?!&)"
+)
+
+
+def get_base_command(cmd: str) -> str:
+    """
+    Strips leading cd/env-assignment/wrapper prefixes AND any trailing chained shell
+    operator or redirection (';', '&&', '||', '|', '&', '2>&1', '>', '>>', '<') from cmd,
+    returning the underlying test/verification invocation it represents.
+
+    Used exclusively to key suite-resolution: a tainted/failed entry and a later bare,
+    clean pass are considered the *same invocation* if their base commands match, even
+    though the raw recorded strings differ because of the operator tail. This does not
+    change tainting detection (is_tainted_shell_command is untouched) -- a masked-exit-code
+    command is still recorded as tainted; this only lets a genuinely clean, later run of
+    the same underlying command resolve it.
+    """
+    raw = (cmd or "").strip()
+    raw = unicodedata.normalize("NFKC", raw)
+    raw = re.sub(r"[​-‍﻿ ]", "", raw)
+
+    # Strip leading 'cd <dir> && ' / 'cd <dir> ; ' prefixes (mirrors is_tainted_shell_command)
+    cmd_clean = raw
+    while True:
+        cd_m = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*(?:&&|;)\s*", cmd_clean)
+        if cd_m:
+            cmd_clean = cmd_clean[cd_m.end():].strip()
+            continue
+        break
+
+    # Strip env-assignment / package-manager wrapper prefixes (poetry run, npx, timeout N, ...)
+    cmd_clean = strip_shell_prefixes(cmd_clean)
+
+    m = OPERATOR_TAIL_PATTERN.search(cmd_clean)
+    if m:
+        cmd_clean = cmd_clean[:m.start()]
+
+    return cmd_clean.strip().rstrip(";").strip()
+
+
 EXPLORATORY_CMD_PATTERN = re.compile(
     r"^(?:cat|ls|grep|find|echo|cd|pwd|curl|head|tail|which|whoami|env|date|uname|git\s+(?:status|log|diff|branch|show))\b",
     re.IGNORECASE
@@ -259,9 +307,16 @@ def can_suite_resolve_failure(
     - Same working directory (CWD-aware)
     - Strict path encompassment (tests/ does NOT resolve integration_tests/)
     - Subtest/parameterized resolution (tests/test_foo.py resolves tests/test_foo.py::test_bar)
+
+    Both commands are first reduced to their base invocation (get_base_command): leading
+    cd/env/wrapper prefixes and any trailing chained shell operator or redirection tail
+    (';', '&&', '||', '|', '&', '2>&1', '>', '>>', '<') are stripped. This lets a later
+    bare, clean pass of a suite supersede an earlier TAINTED/failed entry for that same
+    suite even though the raw recorded command strings differ only by the operator tail
+    the agent appended (e.g. 'pytest tests/ 2>&1 | tail -15' -> 'pytest tests/').
     """
-    clean = clean_cmd.strip()
-    failed = failed_cmd.strip()
+    clean = get_base_command(clean_cmd)
+    failed = get_base_command(failed_cmd)
 
     # CWD check: different working directories cannot resolve each other
     if clean_cwd and failed_cwd:

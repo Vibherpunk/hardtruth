@@ -371,291 +371,54 @@ def resolve_target_project_dir(
     conv_id: Optional[str] = None
 ) -> Optional[str]:
     """
-    Dynamically resolves the actual project directory containing tests/manifests.
-    If workspace_dir has no tests or is a parent directory (like /Users/ai/dev),
-    dynamically inspects modified files, git status, or project subfolders to find
-    the actual subfolder containing package.json, Cargo.toml, pytest.ini, or tests/.
+    Resolves the actual project directory to run Tier 2 verification in, deriving the
+    target EXCLUSIVELY from files this session is known to have edited: the `modified_files`
+    the caller passes (from the session's own transcript / git-diff-against-baseline) and
+    the session's own ledger-recorded modified file paths.
+
+    This intentionally does NOT fall back to scanning `git status` across the workspace or
+    its subdirectories for "some project with uncommitted changes" -- that picks up
+    unrelated sibling repos with pre-existing/leftover dirty state this session never
+    touched (e.g. running `npm test` in an unrelated `goose` checkout, or `cargo test` in
+    vibehard/apps/reachyd, just because they happened to have local changes sitting under
+    the same parent directory as the actual workspace).
+
+    Returns None when no file this session actually edited can be attributed to a project
+    with a detectable test runner -- callers must treat that as "there is nothing here for
+    Tier 2 to verify", not as license to guess at an unrelated project.
     """
     if not workspace_dir or not os.path.exists(workspace_dir):
-        return workspace_dir
+        return None
     ws_norm = os.path.abspath(workspace_dir)
 
-    # 1. If workspace_dir itself already has a test runner, keep it
-    if detect_test_runner(ws_norm) is not None:
-        return ws_norm
+    candidate_files: List[str] = list(modified_files) if modified_files else []
 
-    # 2. Check modified files list
-    if modified_files:
-        for f in modified_files:
-            f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
-            root = find_project_root_for_file(f_abs, boundary=ws_norm)
-            if root and detect_test_runner(root) is not None:
-                return root
-
-    # 3. Check session ledger modified files if conv_id provided
+    # Session ledger modified files (this conversation's own recorded edits)
     if conv_id:
         try:
             from ledger import _ledger
             premise = _ledger.get_premise(conv_id)
             mod_paths = premise.get("modified_file_paths", []) or premise.get("modified_files", [])
-            for p in mod_paths:
-                p_abs = p if os.path.isabs(p) else os.path.join(ws_norm, p)
-                root = find_project_root_for_file(p_abs, boundary=ws_norm)
-                if root and detect_test_runner(root) is not None:
-                    return root
+            candidate_files.extend(mod_paths)
         except Exception:
             pass
 
-    # 4. Check git status in workspace or subdirectories
-    try:
-        proc = subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
-            cwd=ws_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            for line in proc.stdout.splitlines():
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) == 2:
-                    p = os.path.join(ws_norm, parts[1])
-                    root = find_project_root_for_file(p, boundary=ws_norm)
-                    if root and detect_test_runner(root) is not None:
-                        return root
-    except Exception:
-        pass
+    # 1. Check each session-edited file for its nearest project root with a runner.
+    for f in candidate_files:
+        f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
+        root = find_project_root_for_file(f_abs, boundary=ws_norm)
+        if root and detect_test_runner(root) is not None:
+            return root
 
-    # 5. Search subdirectories (e.g. apps/*, vibehard/apps/*)
-    try:
-        for entry in sorted(os.listdir(ws_norm)):
-            if entry.startswith(".") or entry in ("node_modules", "target", "venv", ".venv"):
-                continue
-            sub = os.path.join(ws_norm, entry)
-            if os.path.isdir(sub):
-                if detect_test_runner(sub) is not None:
-                    return sub
-                for nested in ["apps", "packages", "crates", "services"]:
-                    nested_dir = os.path.join(sub, nested)
-                    if os.path.isdir(nested_dir):
-                        for n_entry in sorted(os.listdir(nested_dir)):
-                            n_sub = os.path.join(nested_dir, n_entry)
-                            if os.path.isdir(n_sub) and detect_test_runner(n_sub) is not None:
-                                return n_sub
-                if os.path.isdir(os.path.join(sub, ".git")):
-                    try:
-                        sub_proc = subprocess.run(
-                            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
-                            cwd=sub, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
-                        )
-                        if sub_proc.returncode == 0 and sub_proc.stdout.strip():
-                            for line in sub_proc.stdout.splitlines():
-                                parts = line.strip().split(maxsplit=1)
-                                if len(parts) == 2:
-                                    p = os.path.join(sub, parts[1])
-                                    root = find_project_root_for_file(p, boundary=sub)
-                                    if root and detect_test_runner(root) is not None:
-                                        return root
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+    # 2. workspace_dir itself has a runner. Safe to use even without a resolved per-file
+    #    root because it's the session's own workspace (never an unrelated sibling
+    #    project) -- but only when there is SOME evidence this session touched something.
+    if candidate_files and detect_test_runner(ws_norm) is not None:
+        return ws_norm
 
-    return ws_norm
-
-
-def is_macos_native_project(workspace_path: str) -> bool:
-    """
-    Detects if a project requires macOS/Darwin native execution environment
-    (e.g. Reachy Mini, CoreAudio, Cocoa, objc, Foundation).
-    Such projects cannot compile or execute inside Linux Docker containers.
-    """
-    if not workspace_path or not os.path.exists(workspace_path):
-        return False
-
-    # Explicit environment override
-    if os.environ.get("HARDTRUTH_NATIVE_MACOS") == "1" or os.environ.get("HARDTRUTH_PLATFORM") == "darwin":
-        return True
-
-    ws_lower = workspace_path.lower()
-    if "reachy" in ws_lower or "reachyd" in ws_lower:
-        return True
-
-    # 1. Cargo.toml inspection
-    cargo_toml = os.path.join(workspace_path, "Cargo.toml")
-    if os.path.isfile(cargo_toml):
-        try:
-            with open(cargo_toml, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read().lower()
-                mac_crates = [
-                    "coreaudio", "coreaudio-sys", "cocoa", "objc", "objc2",
-                    "core-foundation", "core_foundation", "security-framework",
-                    "metal", "io-kit", 'target_os = "macos"', 'target_os="macos"'
-                ]
-                if any(crate in content for crate in mac_crates):
-                    return True
-        except Exception:
-            pass
-
-    # 2. package.json inspection
-    pkg_json = os.path.join(workspace_path, "package.json")
-    if os.path.isfile(pkg_json):
-        try:
-            with open(pkg_json, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read().lower()
-                if '"darwin"' in content or 'fsevents' in content:
-                    return True
-        except Exception:
-            pass
-
-    # 3. Source files inspection (Swift, Objective-C, CoreAudio imports)
-    src_dir = os.path.join(workspace_path, "src")
-    check_dir = src_dir if os.path.isdir(src_dir) else workspace_path
-    try:
-        for root, dirs, files in os.walk(check_dir):
-            if any(ignored in root for ignored in ["target", ".git", "node_modules"]):
-                continue
-            for fname in files:
-                if fname.endswith((".swift", ".m", ".mm")):
-                    return True
-                if fname.endswith((".rs", ".c", ".cpp", ".py")):
-                    fpath = os.path.join(root, fname)
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            head = f.read(2048).lower()
-                            if ("coreaudio" in head or "nsapplication" in head or
-                                "nsworkspace" in head or "<cocoa/cocoa.h>" in head or
-                                "import objc" in head):
-                                return True
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    return False
-
-
-
-def find_project_root_for_file(fpath: str, boundary: Optional[str] = None) -> Optional[str]:
-    """
-    Given a file path, walks upward to find the nearest enclosing project root
-    containing a project manifest (Cargo.toml, package.json, pyproject.toml, etc.)
-    or a tests/ directory. Stops at boundary or user home.
-    """
-    if not fpath:
-        return None
-    curr = os.path.dirname(os.path.abspath(fpath))
-    stop_dir = os.path.abspath(boundary) if boundary else os.path.expanduser("~")
-    while curr and curr != "/" and len(curr) >= len(stop_dir):
-        for manifest in MANIFEST_FILES:
-            if os.path.isfile(os.path.join(curr, manifest)):
-                return curr
-        if os.path.isdir(os.path.join(curr, "tests")) or os.path.isdir(os.path.join(curr, "test")):
-            return curr
-        if os.path.isdir(os.path.join(curr, ".git")):
-            return curr
-        if curr == stop_dir:
-            break
-        parent = os.path.dirname(curr)
-        if parent == curr:
-            break
-        curr = parent
     return None
 
 
-def resolve_target_project_dir(
-    workspace_dir: Optional[str],
-    modified_files: Optional[List[str]] = None,
-    conv_id: Optional[str] = None
-) -> Optional[str]:
-    """
-    Dynamically resolves the actual project directory containing tests/manifests.
-    If workspace_dir has no tests or is a parent directory (like /Users/ai/dev),
-    dynamically inspects modified files, git status, or project subfolders to find
-    the actual subfolder containing package.json, Cargo.toml, pytest.ini, or tests/.
-    """
-    if not workspace_dir or not os.path.exists(workspace_dir):
-        return workspace_dir
-    ws_norm = os.path.abspath(workspace_dir)
-
-    # 1. If workspace_dir itself already has a test runner, keep it
-    if detect_test_runner(ws_norm) is not None:
-        return ws_norm
-
-    # 2. Check modified files list
-    if modified_files:
-        for f in modified_files:
-            f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
-            root = find_project_root_for_file(f_abs, boundary=ws_norm)
-            if root and detect_test_runner(root) is not None:
-                return root
-
-    # 3. Check session ledger modified files if conv_id provided
-    if conv_id:
-        try:
-            from ledger import _ledger
-            premise = _ledger.get_premise(conv_id)
-            mod_paths = premise.get("modified_file_paths", []) or premise.get("modified_files", [])
-            for p in mod_paths:
-                p_abs = p if os.path.isabs(p) else os.path.join(ws_norm, p)
-                root = find_project_root_for_file(p_abs, boundary=ws_norm)
-                if root and detect_test_runner(root) is not None:
-                    return root
-        except Exception:
-            pass
-
-    # 4. Check git status in workspace or subdirectories
-    try:
-        proc = subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
-            cwd=ws_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            for line in proc.stdout.splitlines():
-                parts = line.strip().split(maxsplit=1)
-                if len(parts) == 2:
-                    p = os.path.join(ws_norm, parts[1])
-                    root = find_project_root_for_file(p, boundary=ws_norm)
-                    if root and detect_test_runner(root) is not None:
-                        return root
-    except Exception:
-        pass
-
-    # 5. Search subdirectories (e.g. apps/*, vibehard/apps/*)
-    try:
-        for entry in sorted(os.listdir(ws_norm)):
-            if entry.startswith(".") or entry in ("node_modules", "target", "venv", ".venv"):
-                continue
-            sub = os.path.join(ws_norm, entry)
-            if os.path.isdir(sub):
-                if detect_test_runner(sub) is not None:
-                    return sub
-                for nested in ["apps", "packages", "crates", "services"]:
-                    nested_dir = os.path.join(sub, nested)
-                    if os.path.isdir(nested_dir):
-                        for n_entry in sorted(os.listdir(nested_dir)):
-                            n_sub = os.path.join(nested_dir, n_entry)
-                            if os.path.isdir(n_sub) and detect_test_runner(n_sub) is not None:
-                                return n_sub
-                if os.path.isdir(os.path.join(sub, ".git")):
-                    try:
-                        sub_proc = subprocess.run(
-                            ["git", "-c", "core.hooksPath=/dev/null", "status", "--porcelain"],
-                            cwd=sub, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0
-                        )
-                        if sub_proc.returncode == 0 and sub_proc.stdout.strip():
-                            for line in sub_proc.stdout.splitlines():
-                                parts = line.strip().split(maxsplit=1)
-                                if len(parts) == 2:
-                                    p = os.path.join(sub, parts[1])
-                                    root = find_project_root_for_file(p, boundary=sub)
-                                    if root and detect_test_runner(root) is not None:
-                                        return root
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    return ws_norm
-
-
 def is_macos_native_project(workspace_path: str) -> bool:
     """
     Detects if a project requires macOS/Darwin native execution environment
@@ -726,6 +489,44 @@ def is_macos_native_project(workspace_path: str) -> bool:
 
     return False
 
+
+
+def find_cargo_workspace_root(crate_dir: str) -> str:
+    """
+    Bug #6: a crate inside a cargo workspace can inherit shared settings from the
+    workspace's own Cargo.toml (e.g. `edition.workspace = true`), which `cargo` cannot
+    resolve without the workspace root also being present on disk -- mounting only the
+    crate subdir makes cargo fail with "failed to find a workspace root" or similar.
+
+    Walks upward from crate_dir looking for the nearest ancestor Cargo.toml. If that
+    manifest declares a `[workspace]` table, its directory is the workspace root (kept
+    walking up in case of a further-nested workspace is unusual, so this returns as soon
+    as one is found). Stops and returns crate_dir unchanged if an ancestor Cargo.toml is
+    found WITHOUT a `[workspace]` table (an unrelated project boundary), or if none is
+    found before the user's home directory.
+    """
+    try:
+        curr = os.path.abspath(crate_dir)
+        stop_dir = os.path.expanduser("~")
+        search = curr
+        while True:
+            parent = os.path.dirname(search)
+            if not parent or parent == search or len(parent) < len(stop_dir):
+                break
+            cargo_toml = os.path.join(parent, "Cargo.toml")
+            if os.path.isfile(cargo_toml):
+                try:
+                    with open(cargo_toml, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+                except Exception:
+                    content = ""
+                if re.search(r"(?m)^\s*\[workspace\]", content):
+                    return parent
+                break  # ancestor manifest with no [workspace]: unrelated project boundary
+            search = parent
+        return curr
+    except Exception:
+        return crate_dir
 
 
 def run_container_verification(
@@ -762,6 +563,18 @@ def run_container_verification(
     if actual_cmd.startswith("pytest") and "-o cache_dir" not in actual_cmd:
         actual_cmd = f"{actual_cmd} -o cache_dir=/tmp/.pytest_cache -p no:cacheprovider"
 
+    # Bug #6: for a cargo crate inside a larger workspace, mount the WORKSPACE ROOT
+    # (read-only) and set the container's working directory to the crate subdir within
+    # it, instead of mounting only the crate dir (which breaks workspace-inherited config).
+    mount_root = os.path.abspath(workspace_path)
+    container_workdir = "/workspace"
+    if "cargo" in test_cmd:
+        ws_root = os.path.abspath(find_cargo_workspace_root(workspace_path))
+        if ws_root != mount_root:
+            rel = os.path.relpath(mount_root, ws_root)
+            mount_root = ws_root
+            container_workdir = f"/workspace/{rel}"
+
     docker_args = [
         docker_bin, "run", "--rm",
         "--network", "none",
@@ -769,8 +582,8 @@ def run_container_verification(
         "--cap-drop", "ALL",
         "--pids-limit", "256",
         "--memory", "1024m",
-        "-v", f"{os.path.abspath(workspace_path)}:/workspace:ro",
-        "-w", "/workspace",
+        "-v", f"{mount_root}:/workspace:ro",
+        "-w", container_workdir,
         "--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
         "--tmpfs", "/root/.cache:rw,exec,nosuid,size=512m",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
@@ -909,16 +722,140 @@ def validate_runner_command(cmd: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Approved policy: "automatic scoped host verification" for macOS-native projects.
+#
+# Host (non-container) Tier 2 execution is permitted WITHOUT an explicit
+# HARDTRUTH_TIER2_ALLOW_SUBPROCESS=1 opt-in only when ALL of:
+#   1. host is Darwin AND is_macos_native_project(target) is true (a Linux container
+#      cannot build or run macOS-native code, so there is no safer isolated option).
+#   2. the resolved target project dir is inside an allowed root (default ~/dev,
+#      overridable via HARDTRUTH_TIER2_NATIVE_HOST_ROOTS, os.pathsep-separated).
+#   3. the target was resolved from files THIS session actually edited -- never a
+#      guessed/unrelated project. Callers must explicitly assert this (session_evidence);
+#      it defaults to False, so any caller that doesn't plumb it through gets the
+#      pre-existing, stricter behavior.
+# Everything else is unchanged: HARDTRUTH_TIER2_ALLOW_SUBPROCESS still defaults to "0",
+# and non-native projects still require a container or the explicit env var.
+# ---------------------------------------------------------------------------
+
+DEFAULT_NATIVE_HOST_ROOT = "~/dev"
+
+
+def get_native_host_allowed_roots() -> List[str]:
+    """
+    Resolved (expanduser + realpath) allowed roots for scoped native-host execution.
+    Default: ~/dev. Overridable via HARDTRUTH_TIER2_NATIVE_HOST_ROOTS (os.pathsep-separated).
+    """
+    raw = os.environ.get("HARDTRUTH_TIER2_NATIVE_HOST_ROOTS")
+    candidates = [p for p in raw.split(os.pathsep) if p.strip()] if raw else [DEFAULT_NATIVE_HOST_ROOT]
+    roots = []
+    for c in candidates:
+        try:
+            roots.append(os.path.realpath(os.path.expanduser(c.strip())))
+        except Exception:
+            continue
+    return roots
+
+
+def is_within_native_host_allowed_roots(target_dir: str, allowed_roots: Optional[List[str]] = None) -> bool:
+    """
+    True iff target_dir is contained within one of the allowed native-host roots.
+    Uses realpath on BOTH sides (defeats symlink escapes) and a real path-component
+    prefix check -- '/Users/ai/dev-evil' must NOT match an allowed root of
+    '/Users/ai/dev' just because it shares a string prefix.
+    """
+    if not target_dir:
+        return False
+    try:
+        real_target = os.path.realpath(os.path.abspath(target_dir))
+    except Exception:
+        return False
+    roots = allowed_roots if allowed_roots is not None else get_native_host_allowed_roots()
+    for root in roots:
+        if not root:
+            continue
+        if real_target == root or real_target.startswith(root + os.sep):
+            return True
+    return False
+
+
+def scoped_native_host_permitted(
+    workspace_path: str,
+    is_mac_native: bool,
+    is_host_darwin: bool,
+    session_evidence: bool
+) -> bool:
+    """Combines all three gating conditions for the scoped-native-host policy (see module
+    docstring above). Returns False unless every condition explicitly holds."""
+    if not (is_host_darwin and is_mac_native):
+        return False
+    if not session_evidence:
+        return False
+    return is_within_native_host_allowed_roots(workspace_path)
+
+
+def get_native_host_timeout_sec(default_timeout_sec: int) -> int:
+    """Timeout bound for the scoped-native-host path (a cold cargo/native build can take
+    much longer than the normal Tier 2 bound). Default 240s, overridable via
+    HARDTRUTH_TIER2_NATIVE_TIMEOUT_SEC. Never shrinks a caller-specified larger timeout."""
+    try:
+        native_default = int(os.environ.get("HARDTRUTH_TIER2_NATIVE_TIMEOUT_SEC", "240"))
+    except (TypeError, ValueError):
+        native_default = 240
+    return max(int(default_timeout_sec or 0), native_default)
+
+
+def apply_native_host_env(env: Dict[str, str]) -> Dict[str, str]:
+    """
+    Mutates (and returns) env in place for the scoped-native-host path: reuses the user's
+    own toolchain/target cache rather than a possibly-different `cargo`/`rustc` earlier on
+    PATH (e.g. a Homebrew install vs rustup's ~/.cargo/bin), which would otherwise
+    invalidate target/ fingerprints and force a full rebuild on every run. Prepends
+    ~/.cargo/bin to PATH if it exists (and isn't already present) and defaults
+    CARGO_HOME/RUSTUP_HOME to ~/.cargo and ~/.rustup only if not already set -- never
+    overrides an explicit value, and touches nothing else in the allowlisted env.
+    """
+    cargo_bin = os.path.expanduser("~/.cargo/bin")
+    if os.path.isdir(cargo_bin):
+        existing_path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        if cargo_bin not in existing_path_parts:
+            env["PATH"] = os.pathsep.join([cargo_bin] + existing_path_parts)
+    env.setdefault("CARGO_HOME", os.path.expanduser("~/.cargo"))
+    env.setdefault("RUSTUP_HOME", os.path.expanduser("~/.rustup"))
+    return env
+
+
+def _cargo_can_run_offline(workspace_path: str, cargo_home: str) -> bool:
+    """True if a Cargo.lock is present (for workspace_path or its enclosing cargo
+    workspace) and the local cargo registry cache exists, so `--offline` is safe to add
+    rather than attempting a network fetch."""
+    try:
+        candidates = [workspace_path, find_cargo_workspace_root(workspace_path)]
+        lock_present = any(os.path.isfile(os.path.join(c, "Cargo.lock")) for c in candidates)
+        registry_present = os.path.isdir(os.path.join(cargo_home, "registry"))
+        return bool(lock_present and registry_present)
+    except Exception:
+        return False
+
+
 def run_independent_verification(
     workspace_path: str,
     test_cmd: Optional[str] = None,
     timeout_sec: int = 60,
-    conv_id: Optional[str] = None
+    conv_id: Optional[str] = None,
+    session_evidence: bool = False
 ) -> Dict[str, Any]:
     """
     Executes the canonical test suite outside the agent context.
     Prioritizes ephemeral read-only Docker container isolation,
     falling back to clean subprocess sandbox if Docker is unavailable and subprocess execution is authorized.
+
+    session_evidence: must be explicitly set True by the caller only when workspace_path
+    was resolved from files THIS session actually edited (e.g. resolve_target_project_dir
+    returned it from modified_files / the session's own ledger) -- it gates the scoped
+    native-host policy (see scoped_native_host_permitted) and defaults to False, so a
+    caller that doesn't plumb it through gets the pre-existing, stricter behavior.
     """
     orig_path = workspace_path
     workspace_path = resolve_workspace_path(workspace_path)
@@ -1017,11 +954,44 @@ def run_independent_verification(
                 return container_res
 
     # 2. Host Subprocess Execution Gate (S1 fix: host execution must be authorized)
+    # Bug #6: macOS-native projects (Cocoa/objc/CoreAudio, e.g. reachyd) must NOT auto-bypass
+    # this gate just because the host happens to be Darwin -- that silently skipped the
+    # operator's own HARDTRUTH_TIER2_ALLOW_SUBPROCESS decision. The default itself is
+    # unchanged (still "0" unless CI/pytest); a macOS-native project simply cannot be
+    # verified in a container at all, so it falls through to this SAME gate like any other
+    # host-subprocess path, with a message that says exactly why -- UNLESS the approved
+    # scoped-native-host policy applies (Darwin + native + inside an allowed root + this
+    # session's own edit evidence), in which case it is permitted without the explicit env var.
     allow_subprocess = os.environ.get("HARDTRUTH_TIER2_ALLOW_SUBPROCESS", "1" if (os.environ.get("CI") or os.environ.get("PYTEST_CURRENT_TEST")) else "0")
-    if is_mac_native and is_host_darwin:
-        allow_subprocess = "1"
 
+    scoped_native_host = False
     if allow_subprocess != "1":
+        scoped_native_host = scoped_native_host_permitted(
+            workspace_path=workspace_path,
+            is_mac_native=is_mac_native,
+            is_host_darwin=is_host_darwin,
+            session_evidence=session_evidence
+        )
+
+    if allow_subprocess != "1" and not scoped_native_host:
+        if is_mac_native and is_host_darwin:
+            return {
+                "status": "unverified_no_isolation",
+                "success": False,
+                "exit_code": 1,
+                "runner": "isolation_guard",
+                "output": (
+                    "🚨 TIER 2 HARD GATE REJECTED: macOS-native project detected (Cocoa/objc/CoreAudio "
+                    "or an equivalent macOS-only dependency) -- container verification not possible "
+                    "(a Linux container cannot build or run macOS-native code). Host verification "
+                    "requires HARDTRUTH_TIER2_ALLOW_SUBPROCESS=1 (operator decision), UNLESS the target "
+                    f"is inside an allowed native-host root ({', '.join(get_native_host_allowed_roots()) or DEFAULT_NATIVE_HOST_ROOT}, "
+                    "configurable via HARDTRUTH_TIER2_NATIVE_HOST_ROOTS) and was resolved from files this "
+                    "session actually edited. HardTruth never executes repository code unsandboxed on the "
+                    "host without either explicit operator approval or that scoped exception."
+                ),
+                "isolation": "isolation_guard"
+            }
         return {
             "status": "unverified_no_isolation",
             "success": False,
@@ -1034,6 +1004,9 @@ def run_independent_verification(
             ),
             "isolation": "isolation_guard"
         }
+
+    isolation_label = "scoped_native_host" if scoped_native_host else "clean_subprocess_sandbox"
+    effective_timeout_sec = get_native_host_timeout_sec(timeout_sec) if scoped_native_host else timeout_sec
 
     # 2. Clean Subprocess Sandbox Execution (Clean Environment Boundary)
     # Construct clean_env from an explicit allowlist to prevent leaking daemon HMAC keys, API tokens, or ledger paths
@@ -1051,11 +1024,19 @@ def run_independent_verification(
     clean_env["CI"] = "true"
     clean_env["HARDTRUTH_TIER2_SANDBOX"] = "1"
 
+    if scoped_native_host:
+        apply_native_host_env(clean_env)
+
     cmd_args = shlex.split(canonical_runner)
     if cmd_args and cmd_args[0] == "pytest" and "-o" not in cmd_args:
         cmd_args.extend(["-o", "cache_dir=/tmp/.pytest_cache", "-p", "no:cacheprovider"])
 
-    resolved_bin = shutil.which(cmd_args[0])
+    if scoped_native_host and cmd_args and os.path.basename(cmd_args[0]) == "cargo" and "--offline" not in cmd_args:
+        if _cargo_can_run_offline(workspace_path, clean_env.get("CARGO_HOME", os.path.expanduser("~/.cargo"))):
+            insert_at = 2 if len(cmd_args) >= 2 else len(cmd_args)
+            cmd_args.insert(insert_at, "--offline")
+
+    resolved_bin = shutil.which(cmd_args[0], path=clean_env.get("PATH"))
     if resolved_bin:
         cmd_args[0] = resolved_bin
 
@@ -1070,7 +1051,7 @@ def run_independent_verification(
             text=True,
             start_new_session=True
         )
-        stdout, _ = proc.communicate(timeout=timeout_sec)
+        stdout, _ = proc.communicate(timeout=effective_timeout_sec)
         exit_code = proc.returncode
         output = (stdout or "").strip()
 
@@ -1080,7 +1061,7 @@ def run_independent_verification(
             "exit_code": exit_code,
             "runner": canonical_runner,
             "output": output[:4000],
-            "isolation": "clean_subprocess_sandbox"
+            "isolation": isolation_label
         }
         if not sub_res["success"] and sub_res["exit_code"] not in (0, None):
             curr_failures = extract_test_failures(sub_res.get("output", ""))
@@ -1102,8 +1083,8 @@ def run_independent_verification(
             "success": False,
             "exit_code": 124,
             "runner": canonical_runner,
-            "output": f"Tier 2 external test execution timed out after {timeout_sec}s.\n{(stdout or '')[:1000]}",
-            "isolation": "clean_subprocess_sandbox"
+            "output": f"Tier 2 external test execution timed out after {effective_timeout_sec}s.\n{(stdout or '')[:1000]}",
+            "isolation": isolation_label
         }
     except Exception as e:
         return {
@@ -1112,5 +1093,5 @@ def run_independent_verification(
             "exit_code": -1,
             "runner": canonical_runner,
             "output": f"Tier 2 execution encountered an internal error: {e}",
-            "isolation": "clean_subprocess_sandbox"
+            "isolation": isolation_label
         }
