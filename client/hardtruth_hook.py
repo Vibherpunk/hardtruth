@@ -775,6 +775,252 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
     return None
 
 
+# ---------------------------------------------------------------------------
+# SessionStart: eager per-file content-hash baseline
+#
+# get_or_set_session_baseline() (above) is deliberately lazy: it captures a
+# baseline commit SHA (and, as a side effect, a list of file *paths* that were
+# already dirty) the first time ANY hook call happens to touch a given
+# workspace. That is normally the session's first PreToolUse/PostToolUse call,
+# which fires before the agent's first edit -- but if the *very first* hook
+# call in a session is the final Stop (nothing was ever edited), the lazy
+# baseline is captured only at that moment, i.e. after any pre-existing dirt
+# already existed AND with no chance to see the workspace "before" the
+# session at all. Path-only matching (baseline_dirty_files) then either (a)
+# excludes a pre-existing dirty file forever, even if the agent silently
+# edited it via a raw shell command afterwards (an evasion hole), or -- the
+# failure mode this fix targets -- (b), when the snapshot and the Stop call
+# are the same event, cannot exclude the pre-existing dirt at all.
+#
+# The SessionStart hook (handle_session_start, below) closes this by running
+# BEFORE the agent's first tool call and recording, per session_id, a real
+# baseline for every git repo relevant to cwd: HEAD sha *plus* a content hash
+# of each currently-dirty/untracked file. get_session_start_file_hash_baseline()
+# lets get_git_modified_source_files use that precise baseline when present: a
+# file is excluded only if it was dirty at baseline AND its content hash is
+# still identical now. Any edit made after baseline -- via an editor tool or a
+# raw `echo`/`sed`/`patch` in the shell -- changes the hash and is still
+# caught, so the anti-evasion guarantee is unaffected. When no SessionStart
+# baseline was recorded for this exact workspace (older sessions, harnesses
+# other than Claude Code, or a repo SessionStart never saw), this returns
+# None and callers fall back to the pre-existing path-only behavior exactly.
+# ---------------------------------------------------------------------------
+
+def _compute_file_content_hash(abs_path: str) -> str:
+    """Returns a sha256 content hash for a file, or a stable sentinel if it
+    cannot be read (deleted, permission denied, not a regular file)."""
+    try:
+        if not os.path.isfile(abs_path):
+            return "__missing__"
+        h = hashlib.sha256()
+        with open(abs_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 256), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return "__unreadable__"
+
+
+def _discover_relevant_git_repos(cwd: str, max_repos: int = 25, time_budget_sec: float = 1.5) -> List[str]:
+    """
+    Returns absolute paths of git repos relevant to `cwd` for SessionStart baselining:
+    cwd itself if it is a repo, plus any git repos found directly under it (depth 1) --
+    the common case of a workspace directory (e.g. ~/dev) containing several project
+    repos as immediate children. Bounded by `max_repos` and a wall-clock time budget
+    so SessionStart can never meaningfully delay the session.
+    """
+    start = time.time()
+    repos: List[str] = []
+    if not cwd or not os.path.isdir(cwd):
+        return repos
+    cwd_abs = os.path.abspath(cwd)
+    if os.path.isdir(os.path.join(cwd_abs, ".git")):
+        repos.append(cwd_abs)
+    try:
+        with os.scandir(cwd_abs) as it:
+            for entry in it:
+                if time.time() - start > time_budget_sec:
+                    break
+                if len(repos) >= max_repos:
+                    break
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                except Exception:
+                    continue
+                if entry.name.startswith(".") or entry.name in IGNORED_BUILD_DIRS:
+                    continue
+                try:
+                    child_is_repo = os.path.isdir(os.path.join(entry.path, ".git"))
+                except Exception:
+                    child_is_repo = False
+                if child_is_repo:
+                    child_abs = os.path.abspath(entry.path)
+                    if child_abs not in repos:
+                        repos.append(child_abs)
+    except Exception:
+        pass
+    return repos
+
+
+def get_session_start_baseline_file(conv_id: str) -> str:
+    """Returns the (conv_id-keyed) baseline cache file path used by both
+    get_or_set_session_baseline's local-cache layer and SessionStart."""
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    halt_dir = get_halt_counter_dir()
+    return os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+
+
+def get_session_start_file_hash_baseline(workspace_dir: str, conv_id: str) -> Optional[Dict[str, str]]:
+    """
+    Returns the SessionStart-recorded {relpath: content_hash} baseline for the exact
+    repo at `workspace_dir`, or None if no SessionStart baseline covers it. Returning
+    None is the signal callers use to fall back to today's path-only behavior exactly
+    -- it must never be conflated with "baseline exists but is empty" (an empty dict
+    IS a valid baseline, meaning the repo was fully clean at session start).
+    """
+    if not workspace_dir or not conv_id:
+        return None
+    baseline_file = get_session_start_baseline_file(conv_id)
+    if not os.path.exists(baseline_file):
+        return None
+    try:
+        with open(baseline_file, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("session_start_recorded"):
+        return None
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        return None
+    ws_abs = os.path.abspath(workspace_dir)
+    repo_entry = repos.get(ws_abs)
+    if not isinstance(repo_entry, dict):
+        return None
+    file_hashes = repo_entry.get("file_hashes")
+    if not isinstance(file_hashes, dict):
+        return None
+    return file_hashes
+
+
+def handle_session_start(payload: dict) -> dict:
+    """
+    Lifecycle Hook: SessionStart (Claude Code).
+    Records, per session_id, an eager baseline of the working tree for every git repo
+    relevant to cwd (see _discover_relevant_git_repos): HEAD sha plus a content hash of
+    each currently-dirty/untracked file. Stored in the same per-session baseline cache
+    file get_or_set_session_baseline already uses, so existing readers/writers of that
+    file continue to work unmodified.
+
+    On source: resume|compact|clear -- and on a repeated startup call -- an existing
+    baseline for this session_id is never overwritten.
+
+    SessionStart hooks do not gate the session in Claude Code. This function must
+    return quickly and must never raise past this point; every step below is
+    best-effort and any failure just results in no baseline being recorded (which is
+    safe: get_session_start_file_hash_baseline then returns None and the hook falls
+    back to today's exact prior behavior -- it never fails open on the gate itself).
+    """
+    try:
+        conv_id = payload.get("conversationId") or "unknown"
+        source = str(payload.get("source") or "startup")
+        cwd = payload.get("cwd") or os.getcwd()
+
+        if conv_id == "unknown" or not cwd or not os.path.isdir(cwd):
+            return {}
+
+        baseline_file = get_session_start_baseline_file(conv_id)
+        halt_dir = os.path.dirname(baseline_file)
+        os.makedirs(halt_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(halt_dir, 0o700)
+        except Exception:
+            pass
+
+        data: Dict[str, Any] = {}
+        if os.path.exists(baseline_file):
+            try:
+                with open(baseline_file, "r") as f:
+                    data = json.load(f)
+                    if not isinstance(data, dict):
+                        data = {}
+            except Exception:
+                data = {}
+
+        # Idempotent + resume/compact/clear safe: never overwrite a baseline already
+        # recorded for this session_id, regardless of why we were called again.
+        if data.get("session_start_recorded"):
+            return {}
+
+        cwd_abs = os.path.abspath(cwd)
+        repos = _discover_relevant_git_repos(cwd_abs)
+        repo_data: Dict[str, Any] = {}
+        primary_sha: Optional[str] = None
+        primary_dirty: List[str] = []
+
+        for repo_root in repos:
+            head_sha = None
+            try:
+                head = subprocess.run(
+                    ["git", "-c", f"safe.directory={repo_root}", "rev-parse", "HEAD"],
+                    cwd=repo_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=2.0,
+                    text=True
+                )
+                if head.returncode == 0 and head.stdout.strip():
+                    head_sha = head.stdout.strip()
+            except Exception:
+                head_sha = None
+
+            try:
+                dirty_files = get_dirty_files(repo_root)
+            except Exception:
+                dirty_files = set()
+
+            file_hashes = {}
+            for rel in dirty_files:
+                try:
+                    file_hashes[rel] = _compute_file_content_hash(os.path.join(repo_root, rel))
+                except Exception:
+                    file_hashes[rel] = "__unreadable__"
+
+            repo_data[repo_root] = {
+                "head_sha": head_sha,
+                "file_hashes": file_hashes,
+                "captured_at": time.time()
+            }
+            if repo_root == cwd_abs:
+                primary_sha = head_sha
+                primary_dirty = list(dirty_files)
+
+        data["session_start_recorded"] = True
+        data["session_start_source"] = source
+        data["repos"] = repo_data
+        data.setdefault("workspace_path", cwd_abs)
+        data.setdefault("created_at", time.time())
+        if primary_sha:
+            data.setdefault("baseline_sha", primary_sha)
+        data.setdefault("baseline_dirty_files", primary_dirty)
+
+        try:
+            with open(baseline_file, "w") as f:
+                json.dump(data, f)
+        except Exception:
+            pass
+
+    except Exception as e:
+        try:
+            sys.stderr.write(f"HARDTRUTH SessionStart non-fatal error (ignored, allow): {e}\n")
+        except Exception:
+            pass
+
+    return {}
+
+
 def get_git_modified_source_files(
     workspace_dir: str,
     conv_id: Optional[str] = None,
@@ -823,6 +1069,11 @@ def get_git_modified_source_files(
     # Uses --ignored=matching with explicit pathspec exclusions to prevent crawling node_modules/venv
     if is_git_repo:
         baseline_dirty = get_session_baseline_dirty_files(workspace_dir, conv_id) if conv_id else set()
+        # Precise SessionStart baseline (HEAD sha + per-file content hash), when one was
+        # recorded for this exact repo -- see get_session_start_file_hash_baseline's
+        # docstring. None means "no SessionStart baseline for this repo": callers must
+        # fall back to the path-only `baseline_dirty` check below exactly as before.
+        baseline_file_hashes = get_session_start_file_hash_baseline(workspace_dir, conv_id) if conv_id else None
         exclude_pathspecs = [
             "--", ".",
             ":(exclude).git",
@@ -860,7 +1111,17 @@ def get_git_modified_source_files(
                         filepath_rel = filepath_rel.split(" -> ")[1].strip()
                         if filepath_rel.startswith('"') and filepath_rel.endswith('"'):
                             filepath_rel = filepath_rel[1:-1]
-                    if conv_id and filepath_rel in baseline_dirty:
+                    if conv_id and baseline_file_hashes is not None:
+                        # A SessionStart baseline exists for this repo: exclude the file
+                        # ONLY if it was dirty at baseline AND its content is unchanged
+                        # since then. Any edit made after baseline -- via a tool or a raw
+                        # shell command -- changes the hash and is still counted, so the
+                        # echo/sed/patch anti-evasion guarantee (Rule 1) is preserved.
+                        if filepath_rel in baseline_file_hashes:
+                            current_hash = _compute_file_content_hash(os.path.join(workspace_dir, filepath_rel))
+                            if current_hash == baseline_file_hashes[filepath_rel]:
+                                continue
+                    elif conv_id and filepath_rel in baseline_dirty:
                         continue
                     all_rel_paths.add(filepath_rel)
         except subprocess.TimeoutExpired:
@@ -2718,10 +2979,22 @@ if __name__ == "__main__":
             out = handle_pre_tool_use(payload)
         elif mode in ["post_tool", "PostToolUse"]:
             out = handle_post_tool_use(payload)
+        elif mode in ["session_start", "SessionStart"]:
+            out = handle_session_start(payload)
         else:
             out = handle_stop(payload)
     except Exception as e:
-        out = _halt(f"🚨 HARDTRUTH INTERNAL ERROR (FAIL-CLOSED): {e}. Termination forbidden.")
+        # SessionStart never gates in Claude Code: any error here (including one that
+        # escaped handle_session_start's own internal try/except) must still exit 0
+        # with non-blocking output, never the fail-closed halt used for other modes.
+        if mode in ["session_start", "SessionStart"]:
+            try:
+                sys.stderr.write(f"HARDTRUTH SessionStart non-fatal error (ignored, allow): {e}\n")
+            except Exception:
+                pass
+            out = {}
+        else:
+            out = _halt(f"🚨 HARDTRUTH INTERNAL ERROR (FAIL-CLOSED): {e}. Termination forbidden.")
 
     sys.stdout.write(json.dumps(out))
     sys.stdout.flush()
