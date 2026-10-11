@@ -99,6 +99,13 @@ impl HardtruthDaemon {
         // 1. Prepare directory and clean stale socket
         if let Some(parent) = self.socket_path.parent() {
             fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if parent.starts_with("/run/hardtruth") || parent.starts_with("/run") {
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o777));
+                }
+            }
         }
         if self.socket_path.exists() {
             let _ = fs::remove_file(&self.socket_path);
@@ -107,11 +114,11 @@ impl HardtruthDaemon {
         // 2. Bind Unix Domain Socket
         let listener = UnixListener::bind(&self.socket_path)?;
 
-        // 3. Set strict permissions (0600)
+        // 3. Set socket permissions
         secure_socket_permissions(&self.socket_path)?;
 
         println!(
-            "[hardtruthd] Resident daemon listening on {} (mode 0600)",
+            "[hardtruthd] Resident daemon listening on {}",
             self.socket_path.display()
         );
 

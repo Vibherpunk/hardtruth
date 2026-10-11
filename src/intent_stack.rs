@@ -484,7 +484,27 @@ impl IntentStack {
     /// Check if a model string violates the Lead Architect & Planner policy
     pub fn is_forbidden_planner_model(model: &str) -> bool {
         let lower = model.to_lowercase();
-        lower.contains("flash") || lower.contains("gemini-3.1-pro") || lower.contains("gemini-3.8-flash")
+        // Specifically forbid outdated models
+        if lower.contains("flash") || lower.contains("gemini-3.1-pro") || lower.contains("gemini-3.8-flash") || lower.contains("claude-3-7-sonnet") || lower.contains("claude-3.7-sonnet") {
+            return true;
+        }
+        
+        // Allowed frontier models: Claude Opus 5.5, DeepSeek v4 Pro / DeepSeek Reasoner, Kimi k1.5 / k3, MiniMax Mimo Pro
+        // Also allow dynamic latest alias pointers
+        let is_allowed = lower.contains("claude-opus-5.5") || 
+                         lower.contains("claude-opus-latest") ||
+                         lower.contains("claude-3-opus-latest") ||
+                         lower.contains("deepseek-v4-pro") || 
+                         lower.contains("deepseek-reasoner") ||
+                         lower.contains("kimi-k1.5") ||
+                         lower.contains("kimi-k3") ||
+                         lower.contains("kimi-latest") ||
+                         lower.contains("moonshot-v1-auto") ||
+                         lower.contains("minimax-01") ||
+                         lower.contains("mimo-pro") ||
+                         lower.contains("mimo pro");
+        
+        !is_allowed
     }
 
     /// Check if a planner model is forbidden under the Frontier Planning Invariant
@@ -643,12 +663,20 @@ error[E0425]: cannot find value in this scope
         assert!(IntentStack::is_forbidden_planner_model("flash"));
         assert!(IntentStack::is_forbidden_planner_model("gemini-flash-1.5"));
         assert!(IntentStack::is_forbidden_planner_model("deepseek-v4-flash"));
+        assert!(IntentStack::is_forbidden_planner_model("claude-3-7-sonnet"));
+        assert!(IntentStack::is_forbidden_planner_model("claude-3-7-sonnet-20250219"));
 
         assert!(!IntentStack::is_forbidden_planner_model("claude-opus-5.5"));
         assert!(!IntentStack::is_forbidden_planner_model("deepseek-v4-pro"));
+        assert!(!IntentStack::is_forbidden_planner_model("deepseek-reasoner"));
         assert!(!IntentStack::is_forbidden_planner_model("kimi-k3"));
         assert!(!IntentStack::is_forbidden_planner_model("mimo-pro"));
-        assert!(!IntentStack::is_forbidden_planner_model("gpt-5.6-terra"));
+        
+        // Latest dynamic alias pointers
+        assert!(!IntentStack::is_forbidden_planner_model("claude-opus-latest"));
+        assert!(!IntentStack::is_forbidden_planner_model("claude-3-opus-latest"));
+        assert!(!IntentStack::is_forbidden_planner_model("kimi-latest"));
+        assert!(!IntentStack::is_forbidden_planner_model("moonshot-v1-auto"));
     }
 
     #[test]
