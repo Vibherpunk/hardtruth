@@ -905,6 +905,40 @@ def get_session_start_file_hash_baseline(workspace_dir: str, conv_id: str) -> Op
     return file_hashes
 
 
+def _session_start_workspace_state(workspace_dir: str, conv_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Returns whether `workspace_dir` was a git repo when the session started, plus
+    the session-start timestamp. Reads the same baseline file that
+    get_session_start_file_hash_baseline reads.
+
+    Returns None if no session-start record exists or it is unreadable -- the
+    caller must then fall back to today's behavior (fail safe). Otherwise returns
+    {"was_git": bool, "created_at": float} where was_git is True if the
+    workspace was listed under `repos` or a `baseline_sha` was recorded.
+    """
+    if not workspace_dir or not conv_id:
+        return None
+    baseline_file = get_session_start_baseline_file(conv_id)
+    if not os.path.exists(baseline_file):
+        return None
+    try:
+        with open(baseline_file, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or not data.get("session_start_recorded"):
+        return None
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        return None
+    ws_abs = os.path.abspath(workspace_dir)
+    was_git = ws_abs in repos or bool(data.get("baseline_sha"))
+    created_at = data.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        created_at = time.time()
+    return {"was_git": was_git, "created_at": float(created_at)}
+
+
 def handle_session_start(payload: dict) -> dict:
     """
     Lifecycle Hook: SessionStart (Claude Code).
@@ -1225,11 +1259,28 @@ def get_git_modified_source_files(
         if os.path.abspath(workspace_dir) in [home_dir, "/", "/Users"] or has_sub_repos:
             pass
         else:
+            # Distinguish ".git deleted mid-session" from "never was a repo".
+            # If the workspace was a git repo at session start, .git was deleted
+            # to hide edits -> count every file, as before. If the record exists
+            # and it was NOT a repo, count only files with ctime after session
+            # start (ctime can't be faked with touch -t, unlike mtime).
+            # No record -> count every file (fail safe).
+            only_changed_after = None
+            start_state = _session_start_workspace_state(workspace_dir, conv_id) if conv_id else None
+            if start_state is not None and not start_state["was_git"]:
+                only_changed_after = start_state["created_at"] - 2.0
             try:
                 for root, dirs, files in os.walk(workspace_dir):
                     dirs[:] = [d for d in dirs if d not in IGNORED_BUILD_DIRS]
                     for fname in files:
-                        rel_p = os.path.relpath(os.path.join(root, fname), workspace_dir)
+                        full = os.path.join(root, fname)
+                        if only_changed_after is not None:
+                            try:
+                                if os.lstat(full).st_ctime < only_changed_after:
+                                    continue
+                            except OSError:
+                                pass  # unreadable: count it, fail safe
+                        rel_p = os.path.relpath(full, workspace_dir)
                         all_rel_paths.add(rel_p)
             except Exception:
                 pass
