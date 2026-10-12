@@ -365,16 +365,68 @@ def find_project_root_for_file(fpath: str, boundary: Optional[str] = None) -> Op
     return None
 
 
-def resolve_target_project_dir(
+# Mirrors client/hardtruth_hook.py SOURCE_CODE_EXTENSIONS: only edited source files outside
+# the workspace pull their own project into Tier 2 (notes, memory files, etc. do not).
+_TIER2_SOURCE_EXTENSIONS = {
+    ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
+    ".cc", ".cxx", ".h", ".hpp", ".java", ".rb", ".sh", ".bash",
+    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig",
+    ".mjs", ".cjs"
+}
+
+
+def _path_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _is_within_workspace(f_abs: str, ws_norm: str) -> bool:
+    """True if f_abs lies under ws_norm, comparing both lexical and symlink-resolved paths
+    (macOS /tmp -> /private/tmp, /var -> /private/var)."""
+    return (_path_within(os.path.abspath(f_abs), ws_norm)
+            or _path_within(os.path.realpath(f_abs), os.path.realpath(ws_norm)))
+
+
+def git_toplevel_for_file(fpath: str) -> Optional[str]:
+    """
+    Returns the top-level directory of the git repository containing fpath
+    (`git rev-parse --show-toplevel`), or None if fpath is in no git repository.
+    Walks up to the nearest existing directory first, so an edited-then-deleted file
+    still resolves. GIT_DIR / GIT_WORK_TREE are stripped from the environment so the
+    caller's environment cannot redirect the lookup to a different repository.
+    """
+    d = os.path.dirname(os.path.abspath(fpath))
+    while d and not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    env = {k: v for k, v in os.environ.items() if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_CEILING_DIRECTORIES")}
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "rev-parse", "--show-toplevel"],
+            cwd=d, env=env, capture_output=True, text=True, timeout=2.0
+        )
+    except Exception:
+        return None
+    top = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not top or not os.path.isdir(top):
+        return None
+    return os.path.realpath(top)
+
+
+def resolve_target_project_dirs(
     workspace_dir: Optional[str],
     modified_files: Optional[List[str]] = None,
     conv_id: Optional[str] = None
-) -> Optional[str]:
+) -> List[str]:
     """
-    Resolves the actual project directory to run Tier 2 verification in, deriving the
-    target EXCLUSIVELY from files this session is known to have edited: the `modified_files`
-    the caller passes (from the session's own transcript / git-diff-against-baseline) and
-    the session's own ledger-recorded modified file paths.
+    Resolves EVERY project directory Tier 2 must verify for this session, deriving targets
+    EXCLUSIVELY from files this session is known to have edited: the `modified_files` the
+    caller passes (from the session's own transcript / git-diff-against-baseline) and the
+    session's own ledger-recorded modified file paths.
 
     This intentionally does NOT fall back to scanning `git status` across the workspace or
     its subdirectories for "some project with uncommitted changes" -- that picks up
@@ -383,12 +435,23 @@ def resolve_target_project_dir(
     vibehard/apps/reachyd, just because they happened to have local changes sitting under
     the same parent directory as the actual workspace).
 
-    Returns None when no file this session actually edited can be attributed to a project
+    - An edited file inside the workspace resolves to its nearest project root, bounded by
+      the workspace.
+    - An edited SOURCE file outside the workspace (a session started in one directory that
+      edits a repo elsewhere) resolves to its own nearest project root, bounded by that
+      file's git repository top-level. A file in no git repository is never resolved -- it
+      contributes no target, so a session whose only edits are such files still fails
+      closed exactly as before.
+    - Only roots with a detectable test runner are returned. If nothing resolves, the
+      workspace itself is returned when it has a runner and the session edited something.
+
+    Returns [] when no file this session actually edited can be attributed to a project
     with a detectable test runner -- callers must treat that as "there is nothing here for
-    Tier 2 to verify", not as license to guess at an unrelated project.
+    Tier 2 to verify", not as license to guess at an unrelated project. Callers must
+    verify ALL returned roots and require every one to pass.
     """
     if not workspace_dir or not os.path.exists(workspace_dir):
-        return None
+        return []
     ws_norm = os.path.abspath(workspace_dir)
 
     candidate_files: List[str] = list(modified_files) if modified_files else []
@@ -403,20 +466,53 @@ def resolve_target_project_dir(
         except Exception:
             pass
 
-    # 1. Check each session-edited file for its nearest project root with a runner.
+    roots: List[str] = []
+
+    def _add(root: Optional[str]) -> None:
+        if root and root not in roots and detect_test_runner(root) is not None:
+            roots.append(root)
+
+    # 1. Each session-edited file -> its nearest project root with a runner.
     for f in candidate_files:
+        if not f:
+            continue
         f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
-        root = find_project_root_for_file(f_abs, boundary=ws_norm)
-        if root and detect_test_runner(root) is not None:
-            return root
+        if _is_within_workspace(f_abs, ws_norm):
+            _add(find_project_root_for_file(f_abs, boundary=ws_norm))
+            continue
+        # Outside the workspace: bounded by the file's own git repository, never beyond.
+        if os.path.splitext(f_abs)[1].lower() not in _TIER2_SOURCE_EXTENSIONS:
+            continue
+        toplevel = git_toplevel_for_file(f_abs)
+        if not toplevel:
+            continue
+        f_real = os.path.realpath(f_abs)
+        if not _path_within(f_real, toplevel):
+            continue
+        _add(find_project_root_for_file(f_real, boundary=toplevel))
 
     # 2. workspace_dir itself has a runner. Safe to use even without a resolved per-file
     #    root because it's the session's own workspace (never an unrelated sibling
     #    project) -- but only when there is SOME evidence this session touched something.
-    if candidate_files and detect_test_runner(ws_norm) is not None:
-        return ws_norm
+    if not roots and candidate_files and detect_test_runner(ws_norm) is not None:
+        roots.append(ws_norm)
 
-    return None
+    return roots
+
+
+def resolve_target_project_dir(
+    workspace_dir: Optional[str],
+    modified_files: Optional[List[str]] = None,
+    conv_id: Optional[str] = None
+) -> Optional[str]:
+    """
+    Single-target form of resolve_target_project_dirs: the first resolved root, or None
+    when no file this session actually edited can be attributed to a project with a
+    detectable test runner. Callers that gate on the result must use
+    resolve_target_project_dirs and verify every root.
+    """
+    roots = resolve_target_project_dirs(workspace_dir, modified_files, conv_id)
+    return roots[0] if roots else None
 
 
 def is_macos_native_project(workspace_path: str) -> bool:

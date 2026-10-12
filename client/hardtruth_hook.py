@@ -76,6 +76,19 @@ except ImportError:
             is_macos_native_project = lambda ws: False
             run_independent_verification = None
 
+try:
+    from daemon.tier2_runner import resolve_target_project_dirs
+except ImportError:
+    try:
+        from tier2_runner import resolve_target_project_dirs
+    except ImportError:
+        try:
+            from hardtruth.tier2_runner import resolve_target_project_dirs
+        except ImportError:
+            def resolve_target_project_dirs(ws, mod=None, cid=None):
+                r = resolve_target_project_dir(ws, mod, cid)
+                return [r] if r else []
+
 
 def get_canonical_hook_path() -> Optional[str]:
     env_path = os.environ.get("HARDTRUTH_CANONICAL_HOOK")
@@ -2696,64 +2709,72 @@ def handle_stop(payload: dict) -> dict:
         # Dynamic Target Path Resolution: derived exclusively from files this session
         # actually edited (modified_paths / the session's own ledger) -- never from an
         # unrelated sibling project that merely has uncommitted changes lying around.
-        resolved_ws = resolve_target_project_dir(workspace_dir, modified_paths, conv_id)
-        # session_evidence: True only when resolve_target_project_dir actually returned a
-        # target derived from this session's own edits -- gates the approved scoped
-        # native-host policy (daemon/tier2_runner.scoped_native_host_permitted). If it
-        # returned None, workspace_dir stays the original, unresolved value and that
+        # Edits outside workspace_dir (a session started in one directory that edits a
+        # repo elsewhere) resolve to that file's own project, bounded by its git top-level.
+        # Every resolved project is verified and every one must pass.
+        resolved_roots = [r for r in resolve_target_project_dirs(workspace_dir, modified_paths, conv_id)
+                          if r and os.path.exists(r)]
+        # session_evidence: True only when the target was derived from this session's own
+        # edits -- gates the approved scoped native-host policy
+        # (daemon/tier2_runner.scoped_native_host_permitted). With no resolved root,
+        # workspace_dir is verified as-is (and fails closed if it has no runner); that
         # policy must not apply.
-        session_evidence = bool(resolved_ws and os.path.exists(resolved_ws))
-        if session_evidence:
-            workspace_dir = resolved_ws
-
-        tier2_result = None
-        if is_macos_native_project(workspace_dir):
-            if run_independent_verification is not None:
-                try:
-                    tier2_result = run_independent_verification(
-                        workspace_path=workspace_dir,
-                        timeout_sec=30,
-                        conv_id=conv_id,
-                        session_evidence=session_evidence
-                    )
-                except Exception:
-                    pass
+        if resolved_roots:
+            tier2_targets = [(r, True) for r in resolved_roots]
+            workspace_dir = resolved_roots[0]
         else:
-            tier2_result = call_system_one("v1/verify/handoff", {
-                "workspace_path": workspace_dir,
-                "conversationId": conv_id,
-                "timeout_sec": 30
-            }, timeout=35.0)
+            tier2_targets = [(workspace_dir, False)]
 
-            # Fallback to host tier2_runner if daemon container cannot see workspace or has no runner inside container
-            if tier2_result is None or tier2_result.get("status") in ("unverified_no_workspace", "unverified_no_runner"):
+        for target_dir, session_evidence in tier2_targets:
+            tier2_result = None
+            if is_macos_native_project(target_dir):
                 if run_independent_verification is not None:
                     try:
-                        host_res = run_independent_verification(
-                            workspace_path=workspace_dir,
+                        tier2_result = run_independent_verification(
+                            workspace_path=target_dir,
                             timeout_sec=30,
                             conv_id=conv_id,
                             session_evidence=session_evidence
                         )
-                        if host_res is not None:
-                            tier2_result = host_res
                     except Exception:
                         pass
+            else:
+                tier2_result = call_system_one("v1/verify/handoff", {
+                    "workspace_path": target_dir,
+                    "conversationId": conv_id,
+                    "timeout_sec": 30
+                }, timeout=35.0)
 
-        if tier2_result is None:
-            return fail_halt(
-                f"🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier daemon at {SYSTEM_ONE_URL} is unreachable. "
-                "HardTruth will not execute untrusted workspace test code inside the host agent process. "
-                "Ensure the HardTruth verification daemon is running.",
-                remediable=False
-            )
+                # Fallback to host tier2_runner if daemon container cannot see workspace or has no runner inside container
+                if tier2_result is None or tier2_result.get("status") in ("unverified_no_workspace", "unverified_no_runner"):
+                    if run_independent_verification is not None:
+                        try:
+                            host_res = run_independent_verification(
+                                workspace_path=target_dir,
+                                timeout_sec=30,
+                                conv_id=conv_id,
+                                session_evidence=session_evidence
+                            )
+                            if host_res is not None:
+                                tier2_result = host_res
+                        except Exception:
+                            pass
 
-        if not tier2_result.get("success"):
-            if tier2_result.get("status") != "unverified_no_workspace":
-                runner = tier2_result.get("runner", "external runner")
-                ec = tier2_result.get("exit_code")
-                out_tail = (tier2_result.get("output", "") or "")[:600]
-                return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
+            if tier2_result is None:
+                return fail_halt(
+                    f"🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier daemon at {SYSTEM_ONE_URL} is unreachable. "
+                    "HardTruth will not execute untrusted workspace test code inside the host agent process. "
+                    "Ensure the HardTruth verification daemon is running.",
+                    remediable=False
+                )
+
+            if not tier2_result.get("success"):
+                if tier2_result.get("status") != "unverified_no_workspace":
+                    runner = tier2_result.get("runner", "external runner")
+                    ec = tier2_result.get("exit_code")
+                    out_tail = (tier2_result.get("output", "") or "")[:600]
+                    where = f" in {target_dir}" if len(tier2_targets) > 1 else ""
+                    return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment{where} (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
     _log_phase(conv_id, "phase9_tier2_gate", time.perf_counter() - p9_wall, time.process_time() - p9_cpu, {
         "tier2_ran": tier2_ran
