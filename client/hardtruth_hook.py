@@ -852,9 +852,12 @@ def get_baseline_roots() -> List[str]:
 def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: float = 5.0, max_repos: int = 200) -> int:
     """Registers HEAD and refs/stash of every candidate repository in the daemon under the
     session-start namespace, session directory first. Returns the number of repositories
-    snapshotted by the deadline. Registrations not started by then are cancelled, so the hook
-    outlives the budget by at most one in-flight call (1.5s timeout) and stays inside the
-    SessionStart hook timeout; a repository left without a snapshot fails closed at Stop.
+    snapshotted by the deadline. Registrations not started by then are cancelled, but a worker
+    already running makes two sequential calls (HEAD, then stash; 1.5s timeout each), so the
+    hook process outlives the budget by at most 3s (it exits only once in-flight workers
+    finish) and stays inside the SessionStart hook timeout. A repository left without a
+    snapshot fails closed at Stop when it is outside the workspace (see
+    workspace_snapshot_baseline for repositories inside it).
     Values are read before the agent's first tool call, so an in-flight registration that
     lands after the deadline still records the session-start state."""
     import concurrent.futures
@@ -908,15 +911,64 @@ def _session_start_value(ns: str, repo_root: str, conv_id: str) -> Optional[str]
         return None
 
 
+# Hook payloads without a session id normalise to these; every such session shares one
+# daemon key, so a snapshot under it may belong to another session and is never trusted.
+ID_LESS_SESSION_IDS = ("unknown", "default")
+
+
 def trusted_repo_baseline(repo_root: str, conv_id: str) -> Optional[str]:
     """HEAD of repo_root as snapshotted in the daemon at session start, or None. Never
     records anything and never consults agent-writable stores."""
-    if not repo_root or not conv_id:
+    if not repo_root or not conv_id or conv_id in ID_LESS_SESSION_IDS:
         return None
     sha = _session_start_value(SESSION_START_HEAD_NS, repo_root, conv_id)
     if sha and is_valid_commit(sha, repo_root):
         return sha
     return None
+
+
+# ---------------------------------------------------------------------------
+# Repositories inside the workspace
+#
+# The workspace repository (and the repository of any in-workspace Tier 2 target) is
+# verified against its session-start snapshot whenever one exists, exactly like a
+# repository outside the workspace: Phase 5 lineage and stash (by value, not by the
+# agent-settable stash commit time), Phases 6 and 8 changed lines and assertion counts,
+# and check_outside_repo_integrity (committed manifest/conftest tamper with that explicit
+# baseline, assertion deletion, tautologies) for each in-workspace Tier 2 target.
+#
+# With no snapshot (SessionStart did not run: another harness, a hook installed
+# mid-session, an id-less session; or it ran out of budget before reaching the
+# repository) the in-workspace checks keep today's behaviour and use
+# get_or_set_session_baseline, which is lazy and agent-influenceable. Failing closed
+# there would halt every such session, so it is opt-in: HARDTRUTH_REQUIRE_SESSION_SNAPSHOT=1
+# halts (non-remediable) when an in-workspace repository the gate checks has no snapshot.
+# A repository outside the workspace always fails closed without one.
+# ---------------------------------------------------------------------------
+
+def require_session_snapshot() -> bool:
+    return os.environ.get("HARDTRUTH_REQUIRE_SESSION_SNAPSHOT") == "1"
+
+
+def repo_toplevel(path: Optional[str]) -> Optional[str]:
+    """Real path of the git working tree containing path, or None."""
+    if not path or not os.path.isdir(path):
+        return None
+    rc, out = _git_out(path, ["rev-parse", "--show-toplevel"], timeout=2.0)
+    out = out.strip()
+    return os.path.realpath(out) if rc == 0 and out else None
+
+
+def workspace_snapshot_baseline(path: Optional[str], conv_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """(git top-level of path, its session-start snapshot HEAD or None)."""
+    top = repo_toplevel(path)
+    return top, (trusted_repo_baseline(top, conv_id) if top else None)
+
+
+def no_snapshot_message(repo_root: str) -> str:
+    return (f"🚨 HARDTRUTH UNDETERMINED: {repo_root} has no session-start snapshot and "
+            "HARDTRUTH_REQUIRE_SESSION_SNAPSHOT=1 forbids the lazy baseline. Start a new session so "
+            "SessionStart can snapshot it. HardTruth fails closed.")
 
 
 def _test_weakening_marker(line_str: str) -> Optional[str]:
@@ -947,15 +999,9 @@ def _test_weakening_marker(line_str: str) -> Optional[str]:
 _ASSERTION_RE = re.compile(r"\b(?:assert|expect|self\.assert)\b")
 
 
-def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str) -> Optional[str]:
-    """
-    The baseline-dependent defences Phases 5 and 8 apply to the workspace repository, applied
-    to a Tier 2 target in a repository outside the workspace, against that repository's
-    session-start snapshot. Returns a halt message, or None when the repository is clean.
-    """
-    repo_root = target["repo_root"]
-    baseline = target["baseline"]
-
+def check_repo_lineage_and_stash(repo_root: str, baseline: str, conv_id: str) -> Optional[str]:
+    """Phase 5 against a session-start snapshot: HEAD must descend from it and refs/stash
+    must be what it was at session start. Returns a halt message or None."""
     rc, _ = _git_out(repo_root, ["merge-base", "--is-ancestor", baseline, "HEAD"], timeout=5.0)
     if rc != 0:
         return (f"🚨 HARDTRUTH GATE HALTED (EVASION E4 DETECTED): HEAD of {repo_root} is not a descendant of "
@@ -970,6 +1016,22 @@ def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str) -> Option
         return (f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): the git stash of {repo_root} changed during this "
                 "session. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed "
                 "changes and run tests before completing.")
+    return None
+
+
+def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str) -> Optional[str]:
+    """
+    The baseline-dependent defences Phases 5 and 8 apply to the workspace repository, applied
+    to a Tier 2 target against its repository's session-start snapshot (target["baseline"]).
+    Used for every target outside the workspace, and for in-workspace targets whose
+    repository has a snapshot. Returns a halt message, or None when the repository is clean.
+    """
+    repo_root = target["repo_root"]
+    baseline = target["baseline"]
+
+    violation = check_repo_lineage_and_stash(repo_root, baseline, conv_id)
+    if violation:
+        return violation
 
     if check_manifest_tampering is not None:
         tampered, files = check_manifest_tampering(target["root"], conv_id=conv_id, baseline_sha=baseline)
@@ -2736,8 +2798,18 @@ def handle_stop(payload: dict) -> dict:
     # Phase 5: Git Lineage & Stash Detection (Evasion E4 & E1)
     p5_wall = time.perf_counter()
     p5_cpu = time.process_time()
+    # The workspace repository's session-start snapshot, when there is one, is the baseline
+    # for Phases 5, 6 and 8 (see workspace_snapshot_baseline); otherwise the lazy baseline.
+    ws_repo, ws_snapshot = workspace_snapshot_baseline(workspace_dir, conv_id) if workspace_dir else (None, None)
+    if ws_repo and not ws_snapshot and require_session_snapshot():
+        return fail_halt(no_snapshot_message(ws_repo), remediable=False)
+    if ws_snapshot:
+        violation = check_repo_lineage_and_stash(ws_repo, ws_snapshot, conv_id)
+        if violation:
+            return fail_halt(violation)
+
     # Evasion E4 Check: Git History Lineage (merge-base ancestor check)
-    if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+    if not ws_snapshot and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
         ws_abs = os.path.abspath(workspace_dir)
         baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
         if baseline_sha:
@@ -2756,7 +2828,7 @@ def handle_stop(payload: dict) -> dict:
                 return fail_halt(f"🚨 HARDTRUTH UNDETERMINED: Git merge-base lineage check failed: {e}. HardTruth fails closed.", remediable=False)
 
     # Evasion E1 Check: Git Stash Detection
-    if workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+    if not ws_snapshot and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
         try:
             stash_res = subprocess.run(
                 ["git", "stash", "list", "--format=%gd %ct"],
@@ -2790,7 +2862,7 @@ def handle_stop(payload: dict) -> dict:
     # Phase 6: Rule 3: Polyglot Anti-Stubbing Linter on Modified Source Files
     p6_wall = time.perf_counter()
     p6_cpu = time.process_time()
-    baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id) if workspace_dir else None
+    baseline_sha = ws_snapshot or (get_or_set_session_baseline(workspace_dir, conv_id) if workspace_dir else None)
     for fpath in modified_paths:
         if os.path.exists(fpath):
             mod_lines = get_changed_lines(workspace_dir, fpath, baseline_sha)
@@ -2828,8 +2900,8 @@ def handle_stop(payload: dict) -> dict:
     p8_wall = time.perf_counter()
     p8_cpu = time.process_time()
     test_weakening_violations = []
-    baseline_sha = None
-    if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+    baseline_sha = ws_snapshot
+    if not baseline_sha and conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
         baseline_sha = get_or_set_session_baseline(workspace_dir, conv_id)
 
     for fpath in modified_paths:
@@ -2868,11 +2940,11 @@ def handle_stop(payload: dict) -> dict:
                         test_weakening_violations.append(f"{marker} found in {base_name}:{ln_idx}")
 
                 # Assertion count comparison against git baseline blob
-                if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
+                if conv_id and workspace_dir:
                     if baseline_sha:
                         rel_path = os.path.relpath(fpath, workspace_dir)
                         proc_base = subprocess.run(
-                            ["git", "show", f"{baseline_sha}:{rel_path}"],
+                            ["git", "show", f"{baseline_sha}:./{rel_path}"],
                             cwd=workspace_dir,
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
@@ -2940,13 +3012,25 @@ def handle_stop(payload: dict) -> dict:
             )
         resolved_targets = [t for t in resolution.get("targets", []) if t.get("root") and os.path.exists(t["root"])]
 
-        # Repositories outside the workspace get the same baseline-dependent defences the
-        # workspace repository gets in Phases 5 and 8, against their own session baseline.
+        # Every target's repository gets the baseline-dependent defences of Phases 5 and 8
+        # (plus the committed manifest/conftest tamper check) against its session-start
+        # snapshot: always for repositories outside the workspace (the resolver fails closed
+        # without one), and for in-workspace targets whose repository has one. Without one an
+        # in-workspace target keeps the lazy baseline of Phases 5/8 and Tier 2's own tamper
+        # check, unless HARDTRUTH_REQUIRE_SESSION_SNAPSHOT=1.
         for t in resolved_targets:
-            if t.get("outside"):
-                violation = check_outside_repo_integrity(t, conv_id)
-                if violation:
-                    return fail_halt(violation)
+            if not t.get("outside"):
+                top, snap = workspace_snapshot_baseline(t["root"], conv_id)
+                if not top:
+                    continue
+                if not snap:
+                    if require_session_snapshot():
+                        return fail_halt(no_snapshot_message(top), remediable=False)
+                    continue
+                t = dict(t, repo_root=top, baseline=snap)
+            violation = check_outside_repo_integrity(t, conv_id)
+            if violation:
+                return fail_halt(violation)
 
         # session_evidence: True only when the target was derived from this session's own
         # edits -- gates the approved scoped native-host policy
