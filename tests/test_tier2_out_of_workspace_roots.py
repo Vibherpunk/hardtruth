@@ -543,30 +543,56 @@ class TestStopHookOutsideRepos(unittest.TestCase):
         self.assertNotEqual(res.get("decision"), "allow", res)
         self.assertEqual(self.handed_off, [])
 
-    def test_snapshot_budget_cancels_queued_registrations(self):
-        """With a stalling daemon, registrations not started by the deadline are cancelled
-        (the SessionStart hook has a 10s timeout), and repos left without a snapshot fail
-        closed rather than being trusted."""
-        repos = [self._repo(f"r{i}") for i in range(20)]  # more than the 16 workers
+    def test_snapshot_is_one_daemon_call_regardless_of_repo_count(self):
+        """The daemon resolves each new key by scanning its whole ledger (~0.9s on this host),
+        so one registration per repository never fit the SessionStart budget. The snapshot
+        registers a single manifest digest."""
+        for i in range(12):
+            self._repo(f"r{i}")
         calls = []
 
-        def slow(endpoint, data, timeout=None):
-            time.sleep(0.6)
-            calls.append(data["workspace_path"])
+        def counting(endpoint, data, timeout=None):
+            calls.append(endpoint)
             return self._fake_call(endpoint, data, timeout)
 
-        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=slow):
-            t0 = time.time()
-            n = hardtruth_hook.snapshot_repos_at_session_start(self.conv, self.workspace, time_budget_sec=1.0)
-            elapsed = time.time() - t0
-            time.sleep(1.0)  # let in-flight calls finish; cancelled ones must never run
-        self.assertLess(elapsed, 2.0)
-        self.assertLess(n, len(repos))
-        self.assertLess(len(calls), 2 * len(repos))
-        missing = [r for r in repos if (self.conv, hardtruth_hook.SESSION_START_HEAD_NS + r) not in self.daemon]
-        self.assertTrue(missing)
-        _write(os.path.join(missing[0], "app.py"), "def f():\n    return 2\n")
-        res = self._stop([os.path.join(missing[0], "app.py")])
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=counting):
+            n = hardtruth_hook.snapshot_repos_at_session_start(self.conv, self.workspace)
+        self.assertEqual(n, 12)
+        self.assertEqual(calls, ["v1/session/baseline"])
+
+    def test_daemon_down_at_session_start_fails_closed(self):
+        repo = self._repo("r")
+        self.daemon_up = False
+        self._session_start()
+        self.daemon_up = True
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("no session-start snapshot", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_edited_snapshot_manifest_is_not_trusted(self):
+        """The manifest lives in the agent-writable halt dir; rewriting it to bless a tampered
+        HEAD breaks its digest, and the repository fails closed."""
+        repo = self._repo("r")
+        self._session_start()
+        tampered = self._tamper_conftest(repo)
+        path = hardtruth_hook.session_snapshot_file(self.conv)
+        with open(path) as f:
+            snap = json.load(f)
+        snap["repos"][repo]["head"] = tampered
+        with open(path, "w") as f:
+            json.dump(snap, f)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("no session-start snapshot", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_deleted_snapshot_manifest_fails_closed(self):
+        repo = self._repo("r")
+        self._session_start()
+        os.remove(hardtruth_hook.session_snapshot_file(self.conv))
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(repo, "app.py")])
         self.assertIn("no session-start snapshot", res.get("reason", ""))
 
     def test_outside_repo_invisible_to_verifier_halts(self):
@@ -578,6 +604,152 @@ class TestStopHookOutsideRepos(unittest.TestCase):
         with mock.patch.object(hardtruth_hook, "run_independent_verification", None):
             res = self._stop([os.path.join(repo, "app.py")])
         self.assertIn("could not see", res.get("reason", ""))
+
+
+class TestLinkedWorktreeBaselines(unittest.TestCase):
+    """One git store, several linked worktrees on different branches (the 2026-10-12
+    builders): no worktree may be held to another worktree's HEAD."""
+
+    def setUp(self):
+        self.test_dir = _real(tempfile.mkdtemp(prefix="hardtruth-wt-"))
+        self.halt_dir = os.path.join(self.test_dir, "halts")
+        os.makedirs(self.halt_dir, mode=0o700)
+        self._env = {
+            "HARDTRUTH_HALT_DIR": self.halt_dir,
+            "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key"),
+            "HARDTRUTH_URL": "http://127.0.0.1:9",
+            "HARDTRUTH_BASELINE_ROOTS": "",
+        }
+        self._old = {k: os.environ.get(k) for k in list(self._env) + ["HARDTRUTH_SKIP_TIER2", "HARDTRUTH_LEDGER_PATH"]}
+        os.environ.update(self._env)
+        os.environ["HARDTRUTH_SKIP_TIER2"] = "1"
+        os.environ.pop("HARDTRUTH_LEDGER_PATH", None)
+        self.conv = f"wt-{uuid.uuid4().hex}"
+        self.daemon = {}
+        self.daemon_up = False
+
+        self.main = os.path.join(self.test_dir, "anton-go")
+        _git_init(self.main)
+        _write(os.path.join(self.main, "pytest.ini"), "[pytest]\n")
+        _write(os.path.join(self.main, "tests", "test_app.py"), TEST_BODY)
+        _write(os.path.join(self.main, "app.py"), "def f():\n    return 1\n")
+        self.root_commit = _commit(self.main)
+        self.wt = {}
+        for name in ("TT-sales", "V2-D2S0"):
+            path = os.path.join(self.test_dir, "worktrees", name)
+            subprocess.run(["git", "worktree", "add", "-q", "-b", f"build/{name}", path], cwd=self.main, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _write(os.path.join(path, f"{name}.py"), f"NAME = {name!r}\n")
+            self.wt[name] = (_real(path), _commit(path, name))
+
+    def tearDown(self):
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _fake_call(self, endpoint, data, timeout=None):
+        if not self.daemon_up:
+            return None
+        if endpoint == "v1/session/baseline":
+            key = (data["conversationId"], data["workspace_path"])
+            if key not in self.daemon and data.get("commit_sha"):
+                self.daemon[key] = data["commit_sha"]
+            return {"baseline_sha": self.daemon.get(key)}
+        return None
+
+    def _baseline(self, path, conv=None):
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            return hardtruth_hook.get_or_set_session_baseline(path, conv or self.conv)
+
+    def test_each_worktree_gets_its_own_head_via_the_ref_layer(self):
+        """Daemon down: the ref layer is what persists. Refs are shared by linked worktrees,
+        so before the fix the second worktree read the first one's ref."""
+        sales, sales_head = self.wt["TT-sales"]
+        v2, v2_head = self.wt["V2-D2S0"]
+        self.assertEqual(self._baseline(v2), v2_head)
+        self.assertEqual(self._baseline(sales), sales_head)
+        self.assertEqual(self._baseline(v2), v2_head)  # stable on re-read
+
+    def test_session_cache_file_is_not_reused_for_another_worktree(self):
+        sales, sales_head = self.wt["TT-sales"]
+        v2, v2_head = self.wt["V2-D2S0"]
+        with open(hardtruth_hook.get_session_start_baseline_file(self.conv), "w") as f:
+            json.dump({"baseline_sha": v2_head, "workspace_path": v2}, f)
+        self.assertEqual(self._baseline(sales), sales_head)
+
+    def test_legacy_shared_ref_is_ignored(self):
+        """refs/hardtruth/baseline/<conv_hash> (pre-fix name) pointing at a sibling's HEAD."""
+        sales, sales_head = self.wt["TT-sales"]
+        _, v2_head = self.wt["V2-D2S0"]
+        conv_hash = hashlib.sha256(self.conv.encode("utf-8")).hexdigest()[:16]
+        subprocess.run(["git", "update-ref", f"refs/hardtruth/baseline/{conv_hash}", v2_head], cwd=self.main, check=True)
+        self.assertEqual(self._baseline(sales), sales_head)
+
+    def test_sessions_without_an_id_get_no_baseline(self):
+        sales, _ = self.wt["TT-sales"]
+        v2, _ = self.wt["V2-D2S0"]
+        self.assertIsNone(self._baseline(v2, conv="unknown"))
+        self.assertIsNone(self._baseline(sales, conv="unknown"))
+        refs = subprocess.run(["git", "for-each-ref", "refs/hardtruth"], cwd=self.main, stdout=subprocess.PIPE, text=True).stdout
+        self.assertEqual(refs.strip(), "")
+
+    def test_tamper_check_does_not_use_a_sibling_worktree_baseline(self):
+        """check_manifest_tampering must not diff one worktree against another's baseline:
+        a legacy shared ref at the root commit would flag TT-sales' own committed history."""
+        sales, _ = self.wt["TT-sales"]
+        _write(os.path.join(sales, "pytest.ini"), "[pytest]\naddopts = -q\n")
+        _commit(sales, "pre-session pytest.ini change on this branch")
+        conv_hash = hashlib.sha256(self.conv.encode("utf-8")).hexdigest()[:16]
+        subprocess.run(["git", "update-ref", f"refs/hardtruth/baseline/{conv_hash}", self.root_commit], cwd=self.main, check=True)
+        self.assertEqual(check_manifest_tampering(sales, conv_id=self.conv), (False, []))
+
+    def test_stop_in_one_worktree_is_not_held_to_a_sibling_head(self):
+        """End to end: a session that touched V2-D2S0 first and then stops in TT-sales is not
+        halted with E4 against V2-D2S0's HEAD."""
+        sales, _ = self.wt["TT-sales"]
+        v2, _ = self.wt["V2-D2S0"]
+        self._baseline(v2)
+        res = self._stop(sales)
+        self.assertNotIn("EVASION E4", res.get("reason", ""), res)
+
+    def test_e4_message_tells_agents_not_to_merge_other_branches(self):
+        sales, _ = self.wt["TT-sales"]
+        _, v2_head = self.wt["V2-D2S0"]
+        subprocess.run(["git", "update-ref", hardtruth_hook.baseline_ref_name(self.conv, sales), v2_head], cwd=sales, check=True)
+        res = self._stop(sales)
+        self.assertIn("EVASION E4", res.get("reason", ""))
+        self.assertIn("Do not merge", res.get("reason", ""))
+
+    def test_snapshot_records_every_linked_worktree_with_its_own_head(self):
+        """A session started in the main checkout snapshots each linked worktree's HEAD."""
+        self.daemon_up = True
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            hardtruth_hook.handle_session_start({"conversationId": self.conv, "cwd": self.main, "source": "startup"})
+            for name, (path, head) in self.wt.items():
+                self.assertEqual(hardtruth_hook.trusted_repo_baseline(path, self.conv), head, name)
+
+    def _stop(self, workspace):
+        transcript = os.path.join(self.test_dir, "t.jsonl")
+        with open(transcript, "w") as f:
+            f.write(json.dumps({"type": "assistant", "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": "Done."}]}}) + "\n")
+        premise = {
+            "tampered": False, "conversationId": self.conv, "premise": "MODIFIED FILES: x.py.",
+            "source_files_modified": 1, "doc_files_modified": 0,
+            "modified_file_paths": [os.path.join(workspace, "TT-sales.py")],
+            "verification_commands_executed": 1, "test_commands_executed": 1,
+            "last_source_mod_step": 1, "last_test_step": 2, "unresolved_failures": [],
+        }
+        payload = {"conversationId": self.conv, "transcriptPath": transcript, "cwd": workspace,
+                   "workspace_path": workspace, "executionNum": 1}
+        with mock.patch.object(hardtruth_hook, "HARNESS", "claude_code"), \
+             mock.patch.object(hardtruth_hook, "get_local_ledger", return_value=_FakeLedger(premise)), \
+             mock.patch.object(hardtruth_hook, "get_git_modified_source_files", return_value=([], [], [])), \
+             mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            return hardtruth_hook.handle_stop(payload)
 
 
 class _FakeLedger:

@@ -146,6 +146,30 @@ def _manifest_patterns_for(repo_root: str, workspace_path: str) -> List[str]:
     return patterns
 
 
+INVALID_CONVERSATION_IDS = {"", "unknown", "default", "none", "null"}
+
+
+def is_valid_conversation_id(conv_id: Optional[str]) -> bool:
+    """A hook payload without a session id is normalised to "unknown"; every such
+    invocation would share one baseline key, ref and cache file, so baselines are never
+    recorded or read for it."""
+    return bool(conv_id) and str(conv_id).strip().lower() not in INVALID_CONVERSATION_IDS
+
+
+def baseline_ref_name(conv_id: str, repo_root: str) -> str:
+    """Git ref holding the session baseline for one working tree. Refs live in the git
+    common dir, which every linked worktree of a repository shares, so the name carries the
+    worktree's own top-level as well as the session; a ref recorded in one worktree is never
+    read as the baseline of another."""
+    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
+    wt_hash = hashlib.sha256(os.path.realpath(repo_root).encode("utf-8")).hexdigest()[:12]
+    return f"refs/hardtruth/baseline/{conv_hash}-{wt_hash}"
+
+
+def _same_path(a: Optional[str], b: Optional[str]) -> bool:
+    return bool(a) and bool(b) and os.path.realpath(a) == os.path.realpath(b)
+
+
 def check_manifest_tampering(
     workspace_path: str,
     conv_id: Optional[str] = None,
@@ -198,7 +222,7 @@ def check_manifest_tampering(
         return True, [f"<git-exception: {str(e)[:200]}>"]
 
     # 2. Check committed modifications against session baseline commit
-    if not baseline_sha and conv_id:
+    if not baseline_sha and is_valid_conversation_id(conv_id):
         safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
         conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
 
@@ -216,11 +240,11 @@ def check_manifest_tampering(
                 except Exception:
                     pass
 
-        # Check git ref refs/hardtruth/baseline/<conv_hash>
+        # Check this worktree's git ref (see baseline_ref_name)
         if not baseline_sha:
             try:
                 proc_ref = subprocess.run(
-                    git_base + ["rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+                    git_base + ["rev-parse", "--verify", "-q", baseline_ref_name(conv_id, repo_root)],
                     cwd=repo_root,
                     env=env,
                     stdout=subprocess.PIPE,
@@ -240,7 +264,12 @@ def check_manifest_tampering(
             if os.path.exists(baseline_file):
                 try:
                     with open(baseline_file, "r") as f:
-                        baseline_sha = json.load(f).get("baseline_sha")
+                        cached = json.load(f)
+                    # The session file holds ONE baseline; use it only for the tree it was
+                    # recorded for (any commit of a shared object store would pass cat-file).
+                    if _same_path(cached.get("workspace_path"), repo_root) or \
+                            _same_path(cached.get("workspace_path"), workspace_path):
+                        baseline_sha = cached.get("baseline_sha")
                 except Exception:
                     pass
 
