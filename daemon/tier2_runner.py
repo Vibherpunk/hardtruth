@@ -15,7 +15,7 @@ import re
 import hashlib
 import shlex
 import signal
-from typing import Optional, Dict, Any, Tuple, List, Set
+from typing import Optional, Dict, Any, Tuple, List, Set, Callable
 
 
 _pinned_runners: Dict[Tuple[str, str], str] = {}
@@ -116,22 +116,69 @@ def is_actual_manifest_tampering(workspace_path: str, fname: str, baseline_sha: 
     return True
 
 
-def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None) -> Tuple[bool, List[str]]:
+def _git_env() -> Dict[str, str]:
+    """Environment for git subprocesses with every GIT_* variable removed, so the caller's
+    environment cannot redirect git at a different repository, index or object store."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _repo_root_for_dir(path: str) -> Optional[str]:
+    """The git top-level containing directory `path`, or None if it is in no repository."""
+    if not path:
+        return None
+    if os.path.exists(os.path.join(path, ".git")):
+        return os.path.abspath(path)
+    return git_toplevel_for_file(os.path.join(path, "__hardtruth_probe__"))
+
+
+def _manifest_patterns_for(repo_root: str, workspace_path: str) -> List[str]:
+    """MANIFEST_PATTERNS relative to repo_root, plus the same patterns scoped to
+    workspace_path when it is a subdirectory of the repository (a monorepo subproject)."""
+    patterns = list(MANIFEST_PATTERNS)
+    try:
+        rel = os.path.relpath(os.path.realpath(workspace_path), os.path.realpath(repo_root))
+    except ValueError:
+        rel = "."
+    if rel not in (".", "") and not rel.startswith(".."):
+        rel = rel.replace(os.sep, "/")
+        patterns += [f"{rel}/{m}" for m in MANIFEST_FILES]
+        patterns += [f":(glob){rel}/**/conftest.py", f":(glob){rel}/*.mk", f":(glob){rel}/Makefile.*"]
+    return patterns
+
+
+def check_manifest_tampering(
+    workspace_path: str,
+    conv_id: Optional[str] = None,
+    baseline_sha: Optional[str] = None
+) -> Tuple[bool, List[str]]:
     """
     Detects if build/test manifests have uncommitted modifications OR were modified in commits during this session.
     Prevents an agent from editing Makefile (e.g. test: exit 0) or package.json scripts and committing them to spoof Tier 2.
+
+    The check is anchored at the git top-level containing workspace_path, so a project root
+    that is a subdirectory of a repository (a monorepo subproject) is checked too: manifests
+    at the repository root, manifests in the subproject, and every conftest.py. When the
+    caller already holds a trusted session baseline for the repository it passes
+    baseline_sha; otherwise the baseline is looked up (daemon ledger, git ref, cache file).
     """
-    if not workspace_path or not os.path.exists(os.path.join(workspace_path, ".git")):
+    if not workspace_path or not os.path.isdir(workspace_path):
+        return False, []
+    repo_root = _repo_root_for_dir(workspace_path)
+    if not repo_root:
         return False, []
 
-    ws_abs = os.path.abspath(workspace_path)
+    ws_abs = os.path.abspath(repo_root)
+    git_base = ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"]
+    env = _git_env()
+    patterns = _manifest_patterns_for(repo_root, workspace_path)
     modified = set()
 
     # 1. Check working tree for uncommitted manifest edits
     try:
         proc = subprocess.run(
-            ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "status", "--porcelain", "--"] + MANIFEST_PATTERNS,
-            cwd=workspace_path,
+            git_base + ["status", "--porcelain", "--"] + patterns,
+            cwd=repo_root,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=2.0,
@@ -151,28 +198,31 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
         return True, [f"<git-exception: {str(e)[:200]}>"]
 
     # 2. Check committed modifications against session baseline commit
-    baseline_sha = None
-    if conv_id:
+    if not baseline_sha and conv_id:
         safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
         conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
 
-        # Check daemon ledger immutable baseline
-        try:
-            from ledger import _ledger
-            baseline_sha = _ledger.get_session_baseline(conv_id, workspace_path)
-        except Exception:
+        # Check daemon ledger immutable baseline (keyed by the repository, then the project path)
+        for key in dict.fromkeys([ws_abs, os.path.abspath(workspace_path)]):
+            if baseline_sha:
+                break
             try:
-                from daemon.ledger import _ledger
-                baseline_sha = _ledger.get_session_baseline(conv_id, workspace_path)
+                from ledger import _ledger
+                baseline_sha = _ledger.get_session_baseline(conv_id, key)
             except Exception:
-                pass
+                try:
+                    from daemon.ledger import _ledger
+                    baseline_sha = _ledger.get_session_baseline(conv_id, key)
+                except Exception:
+                    pass
 
         # Check git ref refs/hardtruth/baseline/<conv_hash>
         if not baseline_sha:
             try:
                 proc_ref = subprocess.run(
-                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
-                    cwd=workspace_path,
+                    git_base + ["rev-parse", f"refs/hardtruth/baseline/{conv_hash}"],
+                    cwd=repo_root,
+                    env=env,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     timeout=1.0,
@@ -194,46 +244,48 @@ def check_manifest_tampering(workspace_path: str, conv_id: Optional[str] = None)
                 except Exception:
                     pass
 
-        if baseline_sha:
-            try:
-                chk = subprocess.run(
-                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{baseline_sha}^{{commit}}"],
-                    cwd=workspace_path,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=1.0
-                )
-                if chk.returncode != 0:
-                    baseline_sha = None
-            except Exception:
+    if baseline_sha:
+        try:
+            chk = subprocess.run(
+                git_base + ["cat-file", "-e", f"{baseline_sha}^{{commit}}"],
+                cwd=repo_root,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0
+            )
+            if chk.returncode != 0:
                 baseline_sha = None
+        except Exception:
+            baseline_sha = None
 
-        if baseline_sha:
-            try:
-                proc_diff = subprocess.run(
-                    ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "diff", "--name-only", baseline_sha, "HEAD", "--"] + MANIFEST_PATTERNS,
-                    cwd=workspace_path,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=2.0,
-                    text=True
-                )
-                if proc_diff.returncode == 0 and proc_diff.stdout.strip():
-                    for line in proc_diff.stdout.splitlines():
-                        fname = line.strip()
-                        if fname:
-                            modified.add(fname)
-                elif proc_diff.returncode != 0:
-                    return True, [f"<git-diff-error: {(proc_diff.stderr or '').strip()[:200]}>"]
-            except Exception as e:
-                return True, [f"<git-diff-exception: {str(e)[:200]}>"]
+    if baseline_sha:
+        try:
+            proc_diff = subprocess.run(
+                git_base + ["diff", "--name-only", baseline_sha, "HEAD", "--"] + patterns,
+                cwd=repo_root,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=2.0,
+                text=True
+            )
+            if proc_diff.returncode == 0 and proc_diff.stdout.strip():
+                for line in proc_diff.stdout.splitlines():
+                    fname = line.strip()
+                    if fname:
+                        modified.add(fname)
+            elif proc_diff.returncode != 0:
+                return True, [f"<git-diff-error: {(proc_diff.stderr or '').strip()[:200]}>"]
+        except Exception as e:
+            return True, [f"<git-diff-exception: {str(e)[:200]}>"]
 
     # Filter modified manifests to actual tampering vs normal dependency additions
     tampered = []
     for f in modified:
         if f.startswith("<git-"):
             tampered.append(f)
-        elif is_actual_manifest_tampering(workspace_path, f, baseline_sha):
+        elif is_actual_manifest_tampering(repo_root, f, baseline_sha):
             tampered.append(f)
 
     if tampered:
@@ -365,16 +417,105 @@ def find_project_root_for_file(fpath: str, boundary: Optional[str] = None) -> Op
     return None
 
 
-def resolve_target_project_dir(
+# Mirrors client/hardtruth_hook.py SOURCE_CODE_EXTENSIONS: only edited source files outside
+# the workspace pull their own project into Tier 2 (notes, memory files, etc. do not).
+_TIER2_SOURCE_EXTENSIONS = {
+    ".py", ".ts", ".js", ".tsx", ".jsx", ".rs", ".go", ".c", ".cpp",
+    ".cc", ".cxx", ".h", ".hpp", ".java", ".rb", ".sh", ".bash",
+    ".zsh", ".cs", ".php", ".swift", ".kt", ".scala", ".lua", ".zig",
+    ".mjs", ".cjs"
+}
+
+
+def _path_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _is_within_workspace(f_abs: str, ws_norm: str) -> bool:
+    """True if f_abs lies under ws_norm, comparing both lexical and symlink-resolved paths
+    (macOS /tmp -> /private/tmp, /var -> /private/var)."""
+    return (_path_within(os.path.abspath(f_abs), ws_norm)
+            or _path_within(os.path.realpath(f_abs), os.path.realpath(ws_norm)))
+
+
+def git_toplevel_for_file(fpath: str) -> Optional[str]:
+    """
+    Returns the top-level directory of the git repository containing fpath
+    (`git rev-parse --show-toplevel`), or None if fpath is in no git repository.
+    Symlinks are resolved first, so an edit made through a link lands in the repository
+    that actually holds the file. Walks up to the nearest existing directory, so an
+    edited-then-deleted file still resolves. Every GIT_* variable is stripped from the
+    environment so the caller's environment cannot redirect the lookup.
+    """
+    d = os.path.dirname(os.path.realpath(fpath))
+    while d and not os.path.isdir(d):
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null", "rev-parse", "--show-toplevel"],
+            cwd=d, env=_git_env(), capture_output=True, text=True, timeout=2.0
+        )
+    except Exception:
+        return None
+    top = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not top or not os.path.isdir(top):
+        return None
+    return os.path.realpath(top)
+
+
+def find_project_root_in_commit(repo_root: str, commit_sha: str, fpath: str) -> Optional[str]:
+    """
+    Like find_project_root_for_file, but decided from the tree of commit_sha (the session
+    baseline) rather than the working tree: walks up from fpath's directory to repo_root and
+    returns the first directory that, AT THE BASELINE, held a project manifest or a
+    tests/ or test/ directory; repo_root itself is the last resort. A project root the agent
+    created during the session (a fresh pytest.ini plus a trivial tests/ next to the edited
+    file) therefore cannot be chosen as the verification target.
+    """
+    repo_root = os.path.realpath(repo_root)
+    curr = os.path.dirname(os.path.realpath(fpath))
+    if not _path_within(curr, repo_root):
+        return None
+    markers = {os.path.basename(m) for m in MANIFEST_FILES if "/" not in m} | {"tests", "test"}
+    while True:
+        rel = os.path.relpath(curr, repo_root)
+        treeish = f"{commit_sha}:" if rel == "." else f"{commit_sha}:{rel.replace(os.sep, '/')}"
+        try:
+            proc = subprocess.run(
+                ["git", "-c", f"safe.directory={repo_root}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                 "ls-tree", "--name-only", treeish],
+                cwd=repo_root, env=_git_env(), capture_output=True, text=True, timeout=2.0
+            )
+            entries = set(proc.stdout.split("\n")) if proc.returncode == 0 else set()
+        except Exception:
+            entries = set()
+        if entries & markers:
+            return curr
+        if curr == repo_root:
+            return repo_root
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            return None
+        curr = parent
+
+
+def resolve_tier2_targets(
     workspace_dir: Optional[str],
     modified_files: Optional[List[str]] = None,
-    conv_id: Optional[str] = None
-) -> Optional[str]:
+    conv_id: Optional[str] = None,
+    baseline_lookup: Optional[Callable[[str], Optional[str]]] = None
+) -> Dict[str, Any]:
     """
-    Resolves the actual project directory to run Tier 2 verification in, deriving the
-    target EXCLUSIVELY from files this session is known to have edited: the `modified_files`
-    the caller passes (from the session's own transcript / git-diff-against-baseline) and
-    the session's own ledger-recorded modified file paths.
+    Resolves EVERY project Tier 2 must verify for this session, deriving targets
+    EXCLUSIVELY from files this session is known to have edited: the `modified_files` the
+    caller passes (from the session's own transcript / git-diff-against-baseline) and the
+    session's own ledger-recorded modified file paths.
 
     This intentionally does NOT fall back to scanning `git status` across the workspace or
     its subdirectories for "some project with uncommitted changes" -- that picks up
@@ -383,12 +524,34 @@ def resolve_target_project_dir(
     vibehard/apps/reachyd, just because they happened to have local changes sitting under
     the same parent directory as the actual workspace).
 
-    Returns None when no file this session actually edited can be attributed to a project
-    with a detectable test runner -- callers must treat that as "there is nothing here for
-    Tier 2 to verify", not as license to guess at an unrelated project.
+    Returns {"targets": [...], "unresolved": [...]}. Each target is
+    {"root", "outside", "repo_root", "baseline"}; each unresolved entry is {"file", "reason"}.
+
+    - An edited file inside the workspace resolves to its nearest project root, bounded by
+      the workspace (unchanged behaviour; never reported as unresolved).
+    - An edited SOURCE file outside the workspace (a session started in one directory that
+      edits a repo elsewhere) belongs to its git repository (`git rev-parse --show-toplevel`).
+      With `baseline_lookup` (repo_root -> trusted session baseline SHA or None), which the
+      Stop hook always passes (the repository's HEAD snapshotted at session start):
+        * no trusted baseline for that repository -> unresolved (callers fail closed);
+        * the project root is decided from the BASELINE tree (find_project_root_in_commit),
+          so a root fabricated during the session cannot be chosen;
+        * a root with no detectable test runner -> unresolved, never silently dropped, so a
+          decoy repository cannot mask edits that cannot be verified.
+      Without `baseline_lookup` the root is found in the working tree, bounded by the
+      top-level, and roots without a runner are skipped.
+    - An edited file outside the workspace in NO git repository contributes nothing; a
+      session whose only edits are such files still fails closed (no target resolves and
+      the workspace has no runner). Non-source files outside the workspace are ignored.
+    - If nothing resolves (and nothing is unresolved), the workspace itself is the target
+      when it has a runner and the session edited something.
+
+    Callers must verify ALL targets, require every one to pass, and treat any unresolved
+    entry as a failure.
     """
+    result: Dict[str, Any] = {"targets": [], "unresolved": []}
     if not workspace_dir or not os.path.exists(workspace_dir):
-        return None
+        return result
     ws_norm = os.path.abspath(workspace_dir)
 
     candidate_files: List[str] = list(modified_files) if modified_files else []
@@ -403,20 +566,92 @@ def resolve_target_project_dir(
         except Exception:
             pass
 
-    # 1. Check each session-edited file for its nearest project root with a runner.
+    targets: List[Dict[str, Any]] = result["targets"]
+    unresolved: List[Dict[str, str]] = result["unresolved"]
+    seen_roots: Set[str] = set()
+    seen_unresolved: Set[str] = set()
+
+    def _add(root: Optional[str], outside: bool, repo_root: Optional[str], baseline: Optional[str]) -> bool:
+        if not root or detect_test_runner(root) is None:
+            return False
+        if root not in seen_roots:
+            seen_roots.add(root)
+            targets.append({"root": root, "outside": outside, "repo_root": repo_root, "baseline": baseline})
+        return True
+
+    def _unresolved(f: str, reason: str) -> None:
+        if f not in seen_unresolved:
+            seen_unresolved.add(f)
+            unresolved.append({"file": f, "reason": reason})
+
+    baselines: Dict[str, Optional[str]] = {}
+
+    # 1. Each session-edited file -> its nearest project root with a runner.
     for f in candidate_files:
+        if not f:
+            continue
         f_abs = f if os.path.isabs(f) else os.path.join(ws_norm, f)
-        root = find_project_root_for_file(f_abs, boundary=ws_norm)
-        if root and detect_test_runner(root) is not None:
-            return root
+        if _is_within_workspace(f_abs, ws_norm):
+            _add(find_project_root_for_file(f_abs, boundary=ws_norm), False, None, None)
+            continue
+        # Outside the workspace: bounded by the file's own git repository, never beyond.
+        if os.path.splitext(f_abs)[1].lower() not in _TIER2_SOURCE_EXTENSIONS:
+            continue
+        toplevel = git_toplevel_for_file(f_abs)
+        if not toplevel:
+            continue
+        f_real = os.path.realpath(f_abs)
+        if not _path_within(f_real, toplevel):
+            _unresolved(f_abs, f"resolves outside its git repository {toplevel}")
+            continue
+        if baseline_lookup is None:
+            _add(find_project_root_for_file(f_real, boundary=toplevel), True, toplevel, None)
+            continue
+        if toplevel not in baselines:
+            try:
+                baselines[toplevel] = baseline_lookup(toplevel)
+            except Exception:
+                baselines[toplevel] = None
+        baseline = baselines[toplevel]
+        if not baseline:
+            _unresolved(f_abs, f"its repository {toplevel} has no session-start snapshot")
+            continue
+        root = find_project_root_in_commit(toplevel, baseline, f_real)
+        if not _add(root, True, toplevel, baseline):
+            _unresolved(f_abs, f"no test runner detected for its project {root or toplevel}")
 
     # 2. workspace_dir itself has a runner. Safe to use even without a resolved per-file
     #    root because it's the session's own workspace (never an unrelated sibling
     #    project) -- but only when there is SOME evidence this session touched something.
-    if candidate_files and detect_test_runner(ws_norm) is not None:
-        return ws_norm
+    if not targets and not unresolved and candidate_files and detect_test_runner(ws_norm) is not None:
+        targets.append({"root": ws_norm, "outside": False, "repo_root": None, "baseline": None})
 
-    return None
+    return result
+
+
+def resolve_target_project_dirs(
+    workspace_dir: Optional[str],
+    modified_files: Optional[List[str]] = None,
+    conv_id: Optional[str] = None
+) -> List[str]:
+    """Roots from resolve_tier2_targets without a baseline lookup (no unresolved reporting).
+    The Stop hook uses resolve_tier2_targets directly."""
+    return [t["root"] for t in resolve_tier2_targets(workspace_dir, modified_files, conv_id)["targets"]]
+
+
+def resolve_target_project_dir(
+    workspace_dir: Optional[str],
+    modified_files: Optional[List[str]] = None,
+    conv_id: Optional[str] = None
+) -> Optional[str]:
+    """
+    Single-target form of resolve_target_project_dirs: the first resolved root, or None
+    when no file this session actually edited can be attributed to a project with a
+    detectable test runner. Callers that gate on the result must use
+    resolve_target_project_dirs and verify every root.
+    """
+    roots = resolve_target_project_dirs(workspace_dir, modified_files, conv_id)
+    return roots[0] if roots else None
 
 
 def is_macos_native_project(workspace_path: str) -> bool:

@@ -76,6 +76,22 @@ except ImportError:
             is_macos_native_project = lambda ws: False
             run_independent_verification = None
 
+try:
+    from daemon.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
+except ImportError:
+    try:
+        from tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
+    except ImportError:
+        try:
+            from hardtruth.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
+        except ImportError:
+            def resolve_tier2_targets(ws, mod=None, cid=None, baseline_lookup=None):
+                r = resolve_target_project_dir(ws, mod, cid)
+                return {"targets": [{"root": r, "outside": False, "repo_root": None, "baseline": None}] if r else [],
+                        "unresolved": []}
+            git_toplevel_for_file = None
+            check_manifest_tampering = None
+
 
 def get_canonical_hook_path() -> Optional[str]:
     env_path = os.environ.get("HARDTRUTH_CANONICAL_HOOK")
@@ -525,8 +541,10 @@ def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
         return False
     try:
         chk = subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{sha}^{{commit}}"],
+            ["git", "-c", f"safe.directory={os.path.abspath(workspace_dir)}", "-c", "core.fsmonitor=",
+             "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{sha}^{{commit}}"],
             cwd=workspace_dir,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=1.0
@@ -775,6 +793,220 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
     except Exception:
         pass
 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Session-start snapshots for repositories outside the workspace
+#
+# get_or_set_session_baseline() records a baseline only for the session's working
+# directory. A session that edits a git repository elsewhere (started in a non-repo
+# directory, editing ~/dev/<repo>) needs that repository's state from BEFORE the agent
+# could act, or every baseline-dependent defence (committed manifest/conftest tamper,
+# assertion deletion, lineage and stash checks) has nothing to compare against.
+#
+# Everything local -- the reflog, refs, cache files in the halt dir -- is writable by the
+# agent, and anything recorded lazily (at first edit, or after a tool ran in the repo) can
+# be chosen by it. So the only trusted baseline is the one SessionStart registers in the
+# daemon, before the agent's first tool call, under a key namespace no other code path
+# writes: HEAD and refs/stash of each candidate repository (the session's directory, its
+# child repositories, and repositories directly under HARDTRUTH_BASELINE_ROOTS). The daemon
+# keeps the first value written per key. At Stop, an edited repository outside the
+# workspace without such a snapshot fails closed.
+# ---------------------------------------------------------------------------
+
+SESSION_START_HEAD_NS = "/__hardtruth_session_start_head__"
+SESSION_START_STASH_NS = "/__hardtruth_session_start_stash__"
+DEFAULT_BASELINE_ROOTS = ("~/dev", "~/workspace", "~/code", "~/src", "~/projects", "~/repos")
+
+
+def _git_env_clean() -> Dict[str, str]:
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _git_out(repo_root: str, args: List[str], timeout: float = 2.0) -> Tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            ["git", "-c", f"safe.directory={repo_root}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null"] + args,
+            cwd=repo_root, env=_git_env_clean(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout, text=True
+        )
+        return proc.returncode, proc.stdout
+    except Exception:
+        return 1, ""
+
+
+def get_baseline_roots() -> List[str]:
+    """Directories whose immediate child repositories are snapshotted at session start
+    (HARDTRUTH_BASELINE_ROOTS, os.pathsep-separated; defaults to common code folders)."""
+    raw = os.environ.get("HARDTRUTH_BASELINE_ROOTS")
+    roots = raw.split(os.pathsep) if raw is not None else list(DEFAULT_BASELINE_ROOTS)
+    out = []
+    for r in roots:
+        r = os.path.expanduser(r.strip())
+        if r and os.path.isdir(r):
+            out.append(os.path.abspath(r))
+    return out
+
+
+def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: float = 5.0, max_repos: int = 200) -> int:
+    """Registers HEAD and refs/stash of every candidate repository in the daemon under the
+    session-start namespace, session directory first. Returns the number of repositories
+    snapshotted by the deadline. Registrations not started by then are cancelled, so the hook
+    outlives the budget by at most one in-flight call (1.5s timeout) and stays inside the
+    SessionStart hook timeout; a repository left without a snapshot fails closed at Stop.
+    Values are read before the agent's first tool call, so an in-flight registration that
+    lands after the deadline still records the session-start state."""
+    import concurrent.futures
+    deadline = time.time() + time_budget_sec
+    seen: Set[str] = set()
+    candidates: List[str] = []
+    for base in [cwd] + get_baseline_roots():
+        for repo in _discover_relevant_git_repos(base, max_repos=max_repos, time_budget_sec=time_budget_sec / 3):
+            top = os.path.realpath(repo)
+            if top not in seen:
+                seen.add(top)
+                candidates.append(top)
+
+    states: List[Tuple[str, str, str]] = []
+    for top in candidates[:max_repos]:
+        if time.time() > deadline:
+            break
+        rc, head = _git_out(top, ["rev-parse", "--verify", "HEAD"], timeout=1.0)
+        head = head.strip()
+        if rc != 0 or not head:
+            continue  # no commits yet: nothing to anchor, edits there fail closed
+        rc, stash = _git_out(top, ["rev-parse", "-q", "--verify", "refs/stash"], timeout=1.0)
+        states.append((top, head, stash.strip() if rc == 0 and stash.strip() else "none"))
+
+    def _register(state: Tuple[str, str, str]) -> bool:
+        top, head, stash = state
+        r1 = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": SESSION_START_HEAD_NS + top, "commit_sha": head
+        }, timeout=1.5)
+        r2 = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": SESSION_START_STASH_NS + top, "commit_sha": stash
+        }, timeout=1.5)
+        return bool(r1 and r2)
+
+    if not states:
+        return 0
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(states)))
+    futures = [pool.submit(_register, st) for st in states]
+    done, _ = concurrent.futures.wait(futures, timeout=max(0.5, deadline - time.time()))
+    pool.shutdown(wait=False, cancel_futures=True)
+    return sum(1 for f in done if not f.exception() and f.result())
+
+
+def _session_start_value(ns: str, repo_root: str, conv_id: str) -> Optional[str]:
+    try:
+        resp = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": ns + os.path.realpath(repo_root)
+        }, timeout=1.0)
+        return (resp or {}).get("baseline_sha") or None
+    except Exception:
+        return None
+
+
+def trusted_repo_baseline(repo_root: str, conv_id: str) -> Optional[str]:
+    """HEAD of repo_root as snapshotted in the daemon at session start, or None. Never
+    records anything and never consults agent-writable stores."""
+    if not repo_root or not conv_id:
+        return None
+    sha = _session_start_value(SESSION_START_HEAD_NS, repo_root, conv_id)
+    if sha and is_valid_commit(sha, repo_root):
+        return sha
+    return None
+
+
+def _test_weakening_marker(line_str: str) -> Optional[str]:
+    """Label of the tautological assertion or skip marker on this test-source line, or None."""
+    if re.search(r"^\s*assert\s+(?:True|1\s*==\s*1)\b", line_str):
+        return "Tautological assertion ('assert True')"
+    if re.search(r"^\s*(?:self\.)?assertTrue\s*\(\s*(?:True|1)\s*\)", line_str):
+        return "Tautological assertion ('assertTrue(True)')"
+    if re.search(r"^\s*(?:self\.)?assertEqual\s*\(\s*(?:True|1)\s*,\s*(?:True|1)\s*\)", line_str):
+        return "Tautological assertion ('assertEqual(True, True)')"
+    if re.search(r"^\s*(?:self\.)?assertFalse\s*\(\s*(?:False|0)\s*\)", line_str):
+        return "Tautological assertion ('assertFalse(False)')"
+    if re.search(r"^\s*@pytest\.mark\.(?:skip|xfail)\b", line_str):
+        return "Skip marker ('@pytest.mark.skip')"
+    if re.search(r"^\s*(?:test\.skip|it\.skip|xit\()\b", line_str):
+        return "Test skipping marker ('test.skip')"
+    if re.search(r"^\s*expect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+        return "Tautological assertion ('expect(true).toBe(true)')"
+    if re.search(r"^\s*assert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
+        return "Tautological assertion ('assert.equal(true, true)')"
+    if re.search(r"^\s*assert!\s*\(\s*true\s*\)", line_str):
+        return "Tautological assertion ('assert!(true)')"
+    if re.search(r"^\s*t\.(?:Skip|SkipNow|Skipf)\s*\(", line_str):
+        return "Test skipping call ('t.Skip()')"
+    return None
+
+
+_ASSERTION_RE = re.compile(r"\b(?:assert|expect|self\.assert)\b")
+
+
+def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str) -> Optional[str]:
+    """
+    The baseline-dependent defences Phases 5 and 8 apply to the workspace repository, applied
+    to a Tier 2 target in a repository outside the workspace, against that repository's
+    session-start snapshot. Returns a halt message, or None when the repository is clean.
+    """
+    repo_root = target["repo_root"]
+    baseline = target["baseline"]
+
+    rc, _ = _git_out(repo_root, ["merge-base", "--is-ancestor", baseline, "HEAD"], timeout=5.0)
+    if rc != 0:
+        return (f"🚨 HARDTRUTH GATE HALTED (EVASION E4 DETECTED): HEAD of {repo_root} is not a descendant of "
+                f"session baseline commit {baseline[:10]}. Branch switching or history rewrites to hide changes are forbidden.")
+
+    start_stash = _session_start_value(SESSION_START_STASH_NS, repo_root, conv_id)
+    if not start_stash:
+        return f"🚨 HARDTRUTH UNDETERMINED: no session-start stash snapshot for {repo_root}. HardTruth fails closed."
+    rc, stash = _git_out(repo_root, ["rev-parse", "-q", "--verify", "refs/stash"], timeout=1.0)
+    stash = stash.strip() if rc == 0 and stash.strip() else "none"
+    if stash != start_stash:
+        return (f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): the git stash of {repo_root} changed during this "
+                "session. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed "
+                "changes and run tests before completing.")
+
+    if check_manifest_tampering is not None:
+        tampered, files = check_manifest_tampering(target["root"], conv_id=conv_id, baseline_sha=baseline)
+        if tampered:
+            return (f"🚨 TIER 2 HARD GATE REJECTED: Test manifest or configuration file(s) [{', '.join(files)}] in "
+                    f"{repo_root} were modified during this session. Tier 2 refuses to execute tests with "
+                    "agent-modified test configurations to prevent manifest poisoning.")
+
+    rc, changed = _git_out(repo_root, ["diff", "--name-only", baseline, "--"], timeout=5.0)
+    if rc != 0:
+        return f"🚨 HARDTRUTH UNDETERMINED: could not diff {repo_root} against session baseline {baseline[:10]}. HardTruth fails closed."
+    for rel in changed.splitlines():
+        rel = rel.strip()
+        base_name = os.path.basename(rel).lower()
+        if not rel or not ("test" in base_name or "spec" in base_name):
+            continue
+        rc, diff_u0 = _git_out(repo_root, ["diff", "-U0", baseline, "--", rel])
+        for dline in diff_u0.splitlines():
+            if dline.startswith("+") and not dline.startswith("+++"):
+                marker = _test_weakening_marker(dline[1:])
+                if marker:
+                    return (f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): {marker} found in "
+                            f"{os.path.join(repo_root, rel)}. Weakening test assertions or skipping tests to pass the gate is forbidden.")
+        rc, base_content = _git_out(repo_root, ["show", f"{baseline}:{rel}"])
+        if rc != 0:
+            continue
+        try:
+            with open(os.path.join(repo_root, rel), "r", encoding="utf-8", errors="ignore") as f:
+                curr_content = f.read()
+        except Exception:
+            curr_content = ""
+        base_asserts = len(_ASSERTION_RE.findall(base_content))
+        curr_asserts = len(_ASSERTION_RE.findall(curr_content))
+        if base_asserts >= 4 and curr_asserts < (base_asserts // 2):
+            return (f"🚨 HARDTRUTH REJECTED (TEST WEAKENING DETECTED): Severe assertion deletion detected in "
+                    f"{os.path.join(repo_root, rel)} ({curr_asserts} assertions remaining vs {base_asserts} in baseline). "
+                    "Weakening test assertions or skipping tests to pass the gate is forbidden.")
     return None
 
 
@@ -1033,6 +1265,11 @@ def handle_session_start(payload: dict) -> dict:
             if repo_root == cwd_abs:
                 primary_sha = head_sha
                 primary_dirty = list(dirty_files)
+
+        try:
+            data["repos_snapshotted"] = snapshot_repos_at_session_start(conv_id, cwd_abs)
+        except Exception:
+            data["repos_snapshotted"] = 0
 
         data["session_start_recorded"] = True
         data["session_start_source"] = source
@@ -2626,26 +2863,9 @@ def handle_stop(payload: dict) -> dict:
 
                     if changed_lines is not None and ln_idx not in changed_lines:
                         continue
-                    if re.search(r"^\s*assert\s+(?:True|1\s*==\s*1)\b", line_str):
-                        test_weakening_violations.append(f"Tautological assertion ('assert True') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*(?:self\.)?assertTrue\s*\(\s*(?:True|1)\s*\)", line_str):
-                        test_weakening_violations.append(f"Tautological assertion ('assertTrue(True)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*(?:self\.)?assertEqual\s*\(\s*(?:True|1)\s*,\s*(?:True|1)\s*\)", line_str):
-                        test_weakening_violations.append(f"Tautological assertion ('assertEqual(True, True)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*(?:self\.)?assertFalse\s*\(\s*(?:False|0)\s*\)", line_str):
-                        test_weakening_violations.append(f"Tautological assertion ('assertFalse(False)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*@pytest\.mark\.(?:skip|xfail)\b", line_str):
-                        test_weakening_violations.append(f"Skip marker ('@pytest.mark.skip') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*(?:test\.skip|it\.skip|xit\()\b", line_str):
-                        test_weakening_violations.append(f"Test skipping marker ('test.skip') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*expect\s*\(\s*(?:true|1)\s*\)\.to(?:Be|Equal)\s*\(\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
-                        test_weakening_violations.append(f"Tautological assertion ('expect(true).toBe(true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*assert(?:ion)?\s*\.\s*(?:equal|strictEqual|deepEqual)\s*\(\s*(?:true|1)\s*,\s*(?:true|1)\s*\)", line_str, re.IGNORECASE):
-                        test_weakening_violations.append(f"Tautological assertion ('assert.equal(true, true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*assert!\s*\(\s*true\s*\)", line_str):
-                        test_weakening_violations.append(f"Tautological assertion ('assert!(true)') found in {base_name}:{ln_idx}")
-                    elif re.search(r"^\s*t\.(?:Skip|SkipNow|Skipf)\s*\(", line_str):
-                        test_weakening_violations.append(f"Test skipping call ('t.Skip()') found in {base_name}:{ln_idx}")
+                    marker = _test_weakening_marker(line_str)
+                    if marker:
+                        test_weakening_violations.append(f"{marker} found in {base_name}:{ln_idx}")
 
                 # Assertion count comparison against git baseline blob
                 if conv_id and workspace_dir and os.path.exists(os.path.join(workspace_dir, ".git")):
@@ -2696,64 +2916,105 @@ def handle_stop(payload: dict) -> dict:
         # Dynamic Target Path Resolution: derived exclusively from files this session
         # actually edited (modified_paths / the session's own ledger) -- never from an
         # unrelated sibling project that merely has uncommitted changes lying around.
-        resolved_ws = resolve_target_project_dir(workspace_dir, modified_paths, conv_id)
-        # session_evidence: True only when resolve_target_project_dir actually returned a
-        # target derived from this session's own edits -- gates the approved scoped
-        # native-host policy (daemon/tier2_runner.scoped_native_host_permitted). If it
-        # returned None, workspace_dir stays the original, unresolved value and that
+        # Edits outside workspace_dir (a session started in one directory that edits a
+        # repo elsewhere) resolve to that file's own project, decided from the repository's
+        # trusted session baseline. Every resolved project is verified and every one must
+        # pass; an edited file that cannot be attributed to a verifiable project fails closed.
+        resolution = resolve_tier2_targets(
+            workspace_dir, modified_paths, conv_id,
+            baseline_lookup=lambda repo_root: trusted_repo_baseline(repo_root, conv_id)
+        )
+        if resolution.get("unresolved"):
+            details = "; ".join(f"{u['file']}: {u['reason']}" for u in resolution["unresolved"][:5])
+            how = ""
+            if any("session-start snapshot" in u["reason"] for u in resolution["unresolved"]):
+                how = (" A repository outside the workspace can only be verified against its state at session "
+                       "start, which is snapshotted for the session's directory, its child repositories, and "
+                       "repositories directly under HARDTRUTH_BASELINE_ROOTS (default: ~/dev, ~/workspace, ~/code, "
+                       "~/src, ~/projects, ~/repos), and only when the repository already had a commit. Start a new "
+                       "session inside that repository (or a configured root) to work on it.")
+            return fail_halt(
+                "🚨 HARDTRUTH UNDETERMINED: This session edited source file(s) outside the workspace that "
+                f"Tier 2 cannot verify: {details}.{how} HardTruth never fails open.",
+                remediable=False
+            )
+        resolved_targets = [t for t in resolution.get("targets", []) if t.get("root") and os.path.exists(t["root"])]
+
+        # Repositories outside the workspace get the same baseline-dependent defences the
+        # workspace repository gets in Phases 5 and 8, against their own session baseline.
+        for t in resolved_targets:
+            if t.get("outside"):
+                violation = check_outside_repo_integrity(t, conv_id)
+                if violation:
+                    return fail_halt(violation)
+
+        # session_evidence: True only when the target was derived from this session's own
+        # edits -- gates the approved scoped native-host policy
+        # (daemon/tier2_runner.scoped_native_host_permitted). With no resolved root,
+        # workspace_dir is verified as-is (and fails closed if it has no runner); that
         # policy must not apply.
-        session_evidence = bool(resolved_ws and os.path.exists(resolved_ws))
-        if session_evidence:
-            workspace_dir = resolved_ws
-
-        tier2_result = None
-        if is_macos_native_project(workspace_dir):
-            if run_independent_verification is not None:
-                try:
-                    tier2_result = run_independent_verification(
-                        workspace_path=workspace_dir,
-                        timeout_sec=30,
-                        conv_id=conv_id,
-                        session_evidence=session_evidence
-                    )
-                except Exception:
-                    pass
+        if resolved_targets:
+            tier2_targets = [(t["root"], True, bool(t.get("outside"))) for t in resolved_targets]
+            workspace_dir = resolved_targets[0]["root"]
         else:
-            tier2_result = call_system_one("v1/verify/handoff", {
-                "workspace_path": workspace_dir,
-                "conversationId": conv_id,
-                "timeout_sec": 30
-            }, timeout=35.0)
+            tier2_targets = [(workspace_dir, False, False)]
 
-            # Fallback to host tier2_runner if daemon container cannot see workspace or has no runner inside container
-            if tier2_result is None or tier2_result.get("status") in ("unverified_no_workspace", "unverified_no_runner"):
+        for target_dir, session_evidence, outside in tier2_targets:
+            tier2_result = None
+            if is_macos_native_project(target_dir):
                 if run_independent_verification is not None:
                     try:
-                        host_res = run_independent_verification(
-                            workspace_path=workspace_dir,
+                        tier2_result = run_independent_verification(
+                            workspace_path=target_dir,
                             timeout_sec=30,
                             conv_id=conv_id,
                             session_evidence=session_evidence
                         )
-                        if host_res is not None:
-                            tier2_result = host_res
                     except Exception:
                         pass
+            else:
+                tier2_result = call_system_one("v1/verify/handoff", {
+                    "workspace_path": target_dir,
+                    "conversationId": conv_id,
+                    "timeout_sec": 30
+                }, timeout=35.0)
 
-        if tier2_result is None:
-            return fail_halt(
-                f"🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier daemon at {SYSTEM_ONE_URL} is unreachable. "
-                "HardTruth will not execute untrusted workspace test code inside the host agent process. "
-                "Ensure the HardTruth verification daemon is running.",
-                remediable=False
-            )
+                # Fallback to host tier2_runner if daemon container cannot see workspace or has no runner inside container
+                if tier2_result is None or tier2_result.get("status") in ("unverified_no_workspace", "unverified_no_runner"):
+                    if run_independent_verification is not None:
+                        try:
+                            host_res = run_independent_verification(
+                                workspace_path=target_dir,
+                                timeout_sec=30,
+                                conv_id=conv_id,
+                                session_evidence=session_evidence
+                            )
+                            if host_res is not None:
+                                tier2_result = host_res
+                        except Exception:
+                            pass
 
-        if not tier2_result.get("success"):
-            if tier2_result.get("status") != "unverified_no_workspace":
-                runner = tier2_result.get("runner", "external runner")
-                ec = tier2_result.get("exit_code")
-                out_tail = (tier2_result.get("output", "") or "")[:600]
-                return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
+            if tier2_result is None:
+                return fail_halt(
+                    f"🚨 HARDTRUTH UNDETERMINED: Tier 2 verifier daemon at {SYSTEM_ONE_URL} is unreachable. "
+                    "HardTruth will not execute untrusted workspace test code inside the host agent process. "
+                    "Ensure the HardTruth verification daemon is running.",
+                    remediable=False
+                )
+
+            if not tier2_result.get("success"):
+                if tier2_result.get("status") == "unverified_no_workspace" and outside:
+                    return fail_halt(
+                        f"🚨 HARDTRUTH UNDETERMINED: Tier 2 could not see {target_dir} (edited outside the "
+                        "workspace) in either the daemon or the host verifier. HardTruth never fails open.",
+                        remediable=False
+                    )
+                if tier2_result.get("status") != "unverified_no_workspace":
+                    runner = tier2_result.get("runner", "external runner")
+                    ec = tier2_result.get("exit_code")
+                    out_tail = (tier2_result.get("output", "") or "")[:600]
+                    where = f" in {target_dir}" if len(tier2_targets) > 1 else ""
+                    return fail_halt(f"🚨 TIER 2 HARD GATE FAILED: The external deterministic runner '{runner}' failed in a clean environment{where} (exit {ec}). Fix the following issues before completing:\n\n{out_tail}")
 
     _log_phase(conv_id, "phase9_tier2_gate", time.perf_counter() - p9_wall, time.process_time() - p9_cpu, {
         "tier2_ran": tier2_ran
