@@ -849,11 +849,14 @@ def get_baseline_roots() -> List[str]:
     return out
 
 
-def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: float = 6.0, max_repos: int = 200) -> int:
+def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: float = 5.0, max_repos: int = 200) -> int:
     """Registers HEAD and refs/stash of every candidate repository in the daemon under the
-    session-start namespace. Returns the number of repositories snapshotted within the time
-    budget. Values are read before the agent's first tool call, so a registration still in
-    flight when the budget runs out records the session-start state too."""
+    session-start namespace, session directory first. Returns the number of repositories
+    snapshotted by the deadline. Registrations not started by then are cancelled, so the hook
+    outlives the budget by at most one in-flight call (1.5s timeout) and stays inside the
+    SessionStart hook timeout; a repository left without a snapshot fails closed at Stop.
+    Values are read before the agent's first tool call, so an in-flight registration that
+    lands after the deadline still records the session-start state."""
     import concurrent.futures
     deadline = time.time() + time_budget_sec
     seen: Set[str] = set()
@@ -880,10 +883,10 @@ def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: flo
         top, head, stash = state
         r1 = call_system_one("v1/session/baseline", {
             "conversationId": conv_id, "workspace_path": SESSION_START_HEAD_NS + top, "commit_sha": head
-        }, timeout=2.0)
+        }, timeout=1.5)
         r2 = call_system_one("v1/session/baseline", {
             "conversationId": conv_id, "workspace_path": SESSION_START_STASH_NS + top, "commit_sha": stash
-        }, timeout=2.0)
+        }, timeout=1.5)
         return bool(r1 and r2)
 
     if not states:
@@ -891,7 +894,7 @@ def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: flo
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(states)))
     futures = [pool.submit(_register, st) for st in states]
     done, _ = concurrent.futures.wait(futures, timeout=max(0.5, deadline - time.time()))
-    pool.shutdown(wait=False)
+    pool.shutdown(wait=False, cancel_futures=True)
     return sum(1 for f in done if not f.exception() and f.result())
 
 

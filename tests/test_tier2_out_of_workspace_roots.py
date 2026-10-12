@@ -543,6 +543,32 @@ class TestStopHookOutsideRepos(unittest.TestCase):
         self.assertNotEqual(res.get("decision"), "allow", res)
         self.assertEqual(self.handed_off, [])
 
+    def test_snapshot_budget_cancels_queued_registrations(self):
+        """With a stalling daemon, registrations not started by the deadline are cancelled
+        (the SessionStart hook has a 10s timeout), and repos left without a snapshot fail
+        closed rather than being trusted."""
+        repos = [self._repo(f"r{i}") for i in range(20)]  # more than the 16 workers
+        calls = []
+
+        def slow(endpoint, data, timeout=None):
+            time.sleep(0.6)
+            calls.append(data["workspace_path"])
+            return self._fake_call(endpoint, data, timeout)
+
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=slow):
+            t0 = time.time()
+            n = hardtruth_hook.snapshot_repos_at_session_start(self.conv, self.workspace, time_budget_sec=1.0)
+            elapsed = time.time() - t0
+            time.sleep(1.0)  # let in-flight calls finish; cancelled ones must never run
+        self.assertLess(elapsed, 2.0)
+        self.assertLess(n, len(repos))
+        self.assertLess(len(calls), 2 * len(repos))
+        missing = [r for r in repos if (self.conv, hardtruth_hook.SESSION_START_HEAD_NS + r) not in self.daemon]
+        self.assertTrue(missing)
+        _write(os.path.join(missing[0], "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(missing[0], "app.py")])
+        self.assertIn("no session-start snapshot", res.get("reason", ""))
+
     def test_outside_repo_invisible_to_verifier_halts(self):
         """M2: unverified_no_workspace for an outside target is a failure, not a pass."""
         repo = self._repo("r")
