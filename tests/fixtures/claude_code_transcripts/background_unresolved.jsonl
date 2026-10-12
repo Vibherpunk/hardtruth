@@ -1,0 +1,2 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_bg1", "name": "Bash", "input": {"command": "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests", "run_in_background": true}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_bg1", "content": "Command running in background with ID bash_9f31a2"}]}}

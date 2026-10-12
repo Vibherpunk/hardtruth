@@ -1,0 +1,4 @@
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_bg2", "name": "Bash", "input": {"command": "python3 -m pytest /Users/ai/dev/hardtruth-fix/tests", "run_in_background": true}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_bg2", "content": "Command running in background with ID bash_9f31a2"}]}}
+{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_bgout2", "name": "BashOutput", "input": {"bash_id": "bash_9f31a2"}}]}}
+{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_bgout2", "content": "bash_9f31a2 status: completed\n116 passed in 12.3s"}]}}

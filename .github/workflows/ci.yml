@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, fix/truthful-gate ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+
+      - name: Run test suite with daemon UNREACHABLE (fail-closed verification)
+        run: |
+          SYSTEM_ONE_URL=http://127.0.0.1:9 pytest tests/
+
+      - name: Start HardTruth Daemon in background
+        run: |
+          HARDTRUTH_API_TOKEN=dummy-ci-token python3 daemon/app.py &
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8000/health | grep -q "healthy"; then
+              echo "Daemon is healthy"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run test suite with daemon UP (live NLI verification)
+        run: |
+          SYSTEM_ONE_URL=http://127.0.0.1:8000 HARDTRUTH_API_TOKEN=dummy-ci-token pytest tests/
+
+      - name: Stop Host Daemon
+        run: |
+          curl -X POST http://127.0.0.1:8000/shutdown || true
+          pkill -f "daemon/app.py" || true
+          sleep 2
+
+      - name: Run test suite with Live Containerized Daemon
+        run: |
+          docker build -t hardtruth-daemon -f docker/Dockerfile .
+          docker volume create hardtruth_state
+          docker run -d -p 127.0.0.1:8000:8000 \
+            -v hardtruth_state:/root/.hardtruth \
+            -e HARDTRUTH_API_TOKEN=dummy-ci-token \
+            -e HARDTRUTH_WORKSPACE_MAP="{\"$GITHUB_WORKSPACE\": \"/workspace\"}" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            --name hardtruth-daemon-container hardtruth-daemon
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:8000/health | grep -q "healthy"; then
+              echo "Container Daemon is healthy"
+              break
+            fi
+            sleep 1
+          done
+          SYSTEM_ONE_URL=http://127.0.0.1:8000 HARDTRUTH_API_TOKEN=dummy-ci-token pytest tests/

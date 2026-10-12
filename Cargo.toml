@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Adam Matar <adam@skidnir.io>"]
 description = "High-performance resident anti-hallucination and integrity daemon and thin-client CLI gate"
+license = "MIT"
 
 [lib]
 name = "hardtruth"

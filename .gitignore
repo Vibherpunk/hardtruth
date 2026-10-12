@@ -7,4 +7,15 @@ __pycache__/
 .venv/
 env/
 .pytest_cache/
+
+# Handoff and audit battery documents
+HANDOFF_PROMPT.md
+*audit_findings*.md
+round*_audit_findings.md
+
+scratch/
+benchmarks/
+goose-plugin-hardtruth/
+
+# Rust build output (hardtruthd / hardtruth-gate v0.2.0, Cargo.toml at root)
 target/
