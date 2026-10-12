@@ -723,6 +723,28 @@ class TestLinkedWorktreeBaselines(unittest.TestCase):
         self.assertIn("EVASION E4", res.get("reason", ""))
         self.assertIn("Do not merge", res.get("reason", ""))
 
+    def test_stop_without_a_session_id_fails_closed(self):
+        """An id-less Stop (e.g. Antigravity `agy -p`, whose hook payload has no session_id)
+        cannot have its lineage verified; it halts instead of skipping the checks."""
+        sales, _ = self.wt["TT-sales"]
+        for conv in ("unknown", "default", ""):
+            self.conv = conv
+            res = self._stop(sales)
+            self.assertEqual(res.get("decision"), "block", (conv, res))
+            self.assertIn("no session id", res.get("reason", ""), conv)
+            self.assertIn("do NOT merge, rebase or cherry-pick", res.get("reason", ""), conv)
+
+    def test_stop_without_a_session_id_through_the_cli_payload_fails_closed(self):
+        """The real entry point: normalize_payload turns a payload with no session_id into
+        conversationId "unknown"."""
+        sales, _ = self.wt["TT-sales"]
+        payload = hardtruth_hook.normalize_payload({"cwd": sales, "hook_event_name": "Stop"})
+        self.assertEqual(payload.get("conversationId"), "unknown")
+        with mock.patch.object(hardtruth_hook, "HARNESS", "claude_code"), \
+             mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            res = hardtruth_hook.handle_stop(payload)
+        self.assertIn("no session id", res.get("reason", ""), res)
+
     def test_snapshot_records_every_linked_worktree_with_its_own_head(self):
         """A session started in the main checkout snapshots each linked worktree's HEAD."""
         self.daemon_up = True

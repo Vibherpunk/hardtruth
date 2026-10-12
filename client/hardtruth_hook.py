@@ -2502,6 +2502,17 @@ def handle_stop(payload: dict) -> dict:
     if _IMPORT_DEGRADED:
         return fail_halt(f"🚨 HARDTRUTH INTEGRITY ERROR: {_IMPORT_DEGRADED}. Install layout degraded, cannot verify truth safely. HardTruth fails closed.", remediable=False)
 
+    # Without a session id there is no session-scoped baseline (see get_or_set_session_baseline)
+    # and every id-less call would share one ledger premise, so lineage, stash and tamper checks
+    # cannot run against this session's own history. Skipping them would fail open.
+    if not is_valid_conversation_id(conv_id):
+        return fail_halt(
+            "🚨 HARDTRUTH UNDETERMINED: this session has no session id; HardTruth cannot verify lineage "
+            "(the hook payload carried no session_id). Ask the operator; do NOT merge, rebase or "
+            "cherry-pick to work around this.",
+            remediable=False
+        )
+
     # Phase 1: Extract agent's final text from transcript (fail closed on unreadable or empty transcript)
     p1_wall = time.perf_counter()
     p1_cpu = time.process_time()
