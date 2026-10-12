@@ -217,6 +217,15 @@ HardTruth is designed to live harmoniously on machines running multiple develope
 
 ---
 
+## Repository Layout
+
+This repository carries two code lines:
+
+- **Python v2 (installed by `install.sh`):** `client/` (hooks, AST checker, harness adapters), `daemon/` (`app.py`, `ledger.py`, `tier2_runner.py`), `docker/` (daemon image), and `hardtruth-gate/` (Rust thin client for the Python daemon). This is the code everything in this README describes, and what runs under `~/.hardtruth/lib`.
+- **Rust v0.2.0 (`hardtruthd` / `hardtruth-gate`):** `Cargo.toml` and `src/` at the root. `install.sh` does not build or install it. Its design and build notes are in [docs/RUST_V0_2_0.md](./docs/RUST_V0_2_0.md).
+
+---
+
 ## Quickstart
 
 ### 1. Install Dependencies

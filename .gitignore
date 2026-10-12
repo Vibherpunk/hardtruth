@@ -17,3 +17,5 @@ scratch/
 benchmarks/
 goose-plugin-hardtruth/
 
+# Rust build output (hardtruthd / hardtruth-gate v0.2.0, Cargo.toml at root)
+target/
