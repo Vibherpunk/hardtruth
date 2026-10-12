@@ -194,7 +194,7 @@ IGNORED_BUILD_DIRS = {
 def get_file_repo_root(fpath: str) -> Optional[str]:
     curr = os.path.dirname(os.path.abspath(fpath))
     while curr and curr != "/":
-        if os.path.isdir(os.path.join(curr, ".git")):
+        if os.path.exists(os.path.join(curr, ".git")):
             return curr
         parent = os.path.dirname(curr)
         if parent == curr:
@@ -278,7 +278,7 @@ def get_changed_lines(workspace_dir: Optional[str], fpath: str, baseline_sha: Op
     If file is tracked and has no changes, returns set() (0 modified lines).
     """
     fpath_abs = os.path.abspath(fpath)
-    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")) or not fpath_abs.startswith(os.path.abspath(workspace_dir)):
+    if not workspace_dir or not os.path.exists(os.path.join(workspace_dir, ".git")) or not fpath_abs.startswith(os.path.abspath(workspace_dir)):
         repo = get_file_repo_root(fpath)
         if repo:
             workspace_dir = repo
@@ -498,7 +498,7 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
                 p_abs = os.path.abspath(p)
                 if p_abs == os.path.expanduser("~") or p_abs == "/":
                     cwd = os.getcwd()
-                    if os.path.isdir(os.path.join(cwd, ".git")):
+                    if os.path.exists(os.path.join(cwd, ".git")):
                         return os.path.abspath(cwd)
                 return p_abs
     for k in ["cwd", "workspace", "workspace_dir", "workspaceDir", "projectDir", "project_dir", "root"]:
@@ -512,13 +512,16 @@ def get_workspace_dir(payload: dict) -> Optional[str]:
                     return os.path.abspath(candidate)
         elif isinstance(v, str) and os.path.isdir(v):
             return os.path.abspath(v)
+    cwd = os.getcwd()
+    if os.path.exists(os.path.join(cwd, ".git")):
+        return os.path.abspath(cwd)
     return None
 
 
 
 
 def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
-    if not sha or not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+    if not sha or not workspace_dir or not os.path.exists(os.path.join(workspace_dir, ".git")):
         return False
     try:
         chk = subprocess.run(
@@ -536,7 +539,7 @@ def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
 def get_dirty_files(workspace_dir: str) -> Set[str]:
     """Returns set of relative paths of currently modified/untracked files."""
     dirty = set()
-    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+    if not workspace_dir or not os.path.exists(os.path.join(workspace_dir, ".git")):
         return dirty
     ws_abs = os.path.abspath(workspace_dir)
     git_safe_flags = [
@@ -614,7 +617,7 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
     3. Local cache file (~/.hardtruth/halts/baseline_*.json)
     Defeats the 'commit & run' and baseline reset exploits completely.
     """
-    if not workspace_dir or not os.path.isdir(os.path.join(workspace_dir, ".git")):
+    if not workspace_dir or not os.path.exists(os.path.join(workspace_dir, ".git")):
         return None
 
     safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", str(conv_id))[:32]
@@ -834,7 +837,7 @@ def _discover_relevant_git_repos(cwd: str, max_repos: int = 25, time_budget_sec:
     if not cwd or not os.path.isdir(cwd):
         return repos
     cwd_abs = os.path.abspath(cwd)
-    if os.path.isdir(os.path.join(cwd_abs, ".git")):
+    if os.path.exists(os.path.join(cwd_abs, ".git")):
         repos.append(cwd_abs)
     try:
         with os.scandir(cwd_abs) as it:
@@ -851,7 +854,7 @@ def _discover_relevant_git_repos(cwd: str, max_repos: int = 25, time_budget_sec:
                 if entry.name.startswith(".") or entry.name in IGNORED_BUILD_DIRS:
                     continue
                 try:
-                    child_is_repo = os.path.isdir(os.path.join(entry.path, ".git"))
+                    child_is_repo = os.path.exists(os.path.join(entry.path, ".git"))
                 except Exception:
                     child_is_repo = False
                 if child_is_repo:
@@ -1250,7 +1253,7 @@ def get_git_modified_source_files(
         has_sub_repos = False
         try:
             for entry in os.listdir(workspace_dir):
-                if os.path.isdir(os.path.join(workspace_dir, entry, ".git")):
+                if os.path.exists(os.path.join(workspace_dir, entry, ".git")):
                     has_sub_repos = True
                     break
         except Exception:
@@ -1299,7 +1302,7 @@ def get_git_modified_source_files(
         full_p = os.path.join(workspace_dir, filepath_rel)
         if os.path.isdir(full_p):
             # Check for nested git repository (git init nested)
-            if os.path.isdir(os.path.join(full_p, ".git")):
+            if os.path.exists(os.path.join(full_p, ".git")):
                 try:
                     nested_res = subprocess.run(
                         ["git", "status", "--porcelain", "-uall"],
@@ -1500,18 +1503,25 @@ def parse_claude_code_transcript_commands(transcript_path: str) -> List[Dict[str
 
 def extract_claude_code_edited_files(transcript_path: str) -> Set[str]:
     """
-    Scans a Claude Code transcript for Edit/Write/NotebookEdit tool_use blocks and returns
-    the set of file paths (input.file_path) the agent edited during THIS session.
+    Scans a Claude Code transcript for Edit/Write/NotebookEdit/MultiEdit tool_use blocks and
+    returns the set of file paths the agent SUCCESSFULLY edited during THIS session.
 
-    This is an independent signal from git: Rule 1 (source modified without verification)
-    must fire based on what the session's own transcript shows it touched, or on git
-    changes relative to the SESSION BASELINE -- never on pre-existing uncommitted changes
-    that predate the session (a plain `git status` / diff-against-HEAD would wrongly
-    include those too).
+    A tool_use whose matching tool_result has is_error=true (permission denied, string not
+    found, must-read-first guard, ...) did NOT modify the file and is excluded. Counting
+    refused edits as modifications caused false Rule-1 halts (2026-10-11: a scoped builder
+    whose edits were all denied was halted for "modified without tests", then hit the
+    permanent 3-halt stop).
+
+    Fail-safe direction kept: a tool_use with NO matching tool_result in the transcript
+    (result not yet flushed / truncated transcript) is still counted as edited.
+    Git-baseline tracking (step 2a in the caller) is unchanged and still catches any real
+    disk mutation made by any route.
     """
     edited: Set[str] = set()
     if not transcript_path or not os.path.exists(transcript_path):
         return edited
+    attempts: List[Tuple[str, str]] = []
+    failed_ids: Set[str] = set()
     try:
         with open(transcript_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -1522,23 +1532,32 @@ def extract_claude_code_edited_files(transcript_path: str) -> Set[str]:
                     d = json.loads(line_s)
                 except Exception:
                     continue
-                if d.get("type") != "assistant":
-                    continue
                 msg = d.get("message") if isinstance(d.get("message"), dict) else d
                 content = msg.get("content") if isinstance(msg, dict) else None
                 if not isinstance(content, list):
                     continue
+                dtype = d.get("type")
                 for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    if not isinstance(block, dict):
                         continue
-                    if block.get("name") not in ("Edit", "Write", "NotebookEdit"):
-                        continue
-                    tinput = block.get("input") or {}
-                    fp = tinput.get("file_path") or tinput.get("notebook_path")
-                    if fp:
-                        edited.add(str(fp))
+                    btype = block.get("type")
+                    if dtype == "assistant" and btype == "tool_use":
+                        if block.get("name") not in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
+                            continue
+                        tinput = block.get("input") or {}
+                        fp = tinput.get("file_path") or tinput.get("notebook_path")
+                        if fp:
+                            attempts.append((str(block.get("id") or ""), str(fp)))
+                    elif btype == "tool_result" and block.get("is_error") is True:
+                        tid = block.get("tool_use_id")
+                        if tid:
+                            failed_ids.add(str(tid))
     except Exception:
         pass
+    for tid, fp in attempts:
+        if tid and tid in failed_ids:
+            continue
+        edited.add(fp)
     return edited
 
 
