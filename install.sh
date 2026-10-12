@@ -159,12 +159,18 @@ try:
 except Exception:
     data = {}
 hooks = data.setdefault('hooks', {})
+start_hooks = hooks.setdefault('SessionStart', [])
 post_hooks = hooks.setdefault('PostToolUse', [])
 stop_hooks = hooks.setdefault('Stop', [])
 
+# SessionStart records a per-file baseline so files already dirty before the
+# session aren't attributed to it (handle_session_start in hardtruth_hook.py).
+ht_start = {'matcher': 'startup|resume|clear|compact', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py session_start', 'timeout': 10}]}
 ht_post = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]}
 ht_stop = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 180}]}
 
+if not any('hardtruth_hook.py' in str(h) for h in start_hooks):
+    start_hooks.append(ht_start)
 if not any('hardtruth_hook.py' in str(h) for h in post_hooks):
     post_hooks.append(ht_post)
 if not any('hardtruth_hook.py' in str(h) for h in stop_hooks):
