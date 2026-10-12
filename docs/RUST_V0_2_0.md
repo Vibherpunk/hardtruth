@@ -1,10 +1,11 @@
 > **Preserved from `main@30d9582` (2026-09-25).** This was the repository README after main was
 > force-pushed from the Python v2 line (`ec37706`) to the Rust v0.2.0 rewrite. The Rust sources it
-> describes (`Cargo.toml`, `src/`) are kept at the repo root, unchanged. The Python v2 line is what
+> describes (`Cargo.toml`, `src/`) are kept at the repo root. The Python v2 line is what
 > `install.sh` installs; see the top-level README.
 >
-> **Licensing is unresolved:** this document cites PolyForm Noncommercial 1.0.0 (`LICENSE.md`), while
-> PR #1 replaced that file with the MIT `LICENSE` now at the repo root.
+> **License: MIT.** The Rust v0.2.0 code is licensed under the MIT `LICENSE` at the repo root,
+> like the rest of the repository. The PolyForm Noncommercial 1.0.0 text below (and its
+> `LICENSE.md` links) is historical and superseded.
 
 # HardTruth (`hardtruthd` & `hardtruth-gate`)
 
