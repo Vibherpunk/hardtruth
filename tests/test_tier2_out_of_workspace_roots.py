@@ -21,6 +21,7 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -35,6 +36,8 @@ if DAEMON_DIR not in sys.path:
 from daemon.tier2_runner import (
     resolve_target_project_dirs,
     resolve_target_project_dir,
+    resolve_tier2_targets,
+    check_manifest_tampering,
     run_independent_verification,
 )
 import client.hardtruth_hook as hardtruth_hook
@@ -201,16 +204,124 @@ class TestOutOfWorkspaceResolution(unittest.TestCase):
             self.assertEqual(resolve_target_project_dirs(self.workspace, modified_files=[edited]), [])
 
 
-class _FakeLedger:
-    def __init__(self, premise):
-        self._premise = premise
+def _commit(repo, msg="c", when=None):
+    env = dict(os.environ)
+    for k in [k for k in env if k.startswith("GIT_")]:
+        env.pop(k)
+    if when is not None:
+        env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = f"{int(when)} +0000"
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, env=env, stdout=subprocess.PIPE)
+    subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", msg], cwd=repo, check=True, env=env,
+                   stdout=subprocess.PIPE)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, env=env,
+                          stdout=subprocess.PIPE, text=True).stdout.strip()
 
-    def get_premise(self, conv_id):
-        return dict(self._premise)
+
+TEST_BODY = "def test_a():\n" + "".join(f"    assert {i} == {i}\n" for i in range(8))
 
 
-class TestStopHookVerifiesEveryProject(unittest.TestCase):
-    """handle_stop must hand off EVERY resolved project and halt if any one fails."""
+class TestBaselineAwareResolution(unittest.TestCase):
+    """resolve_tier2_targets with a baseline lookup, as the Stop hook calls it."""
+
+    def setUp(self):
+        self.test_dir = _real(tempfile.mkdtemp(prefix="hardtruth-oow-bl-"))
+        self.workspace = os.path.join(self.test_dir, "ws")
+        os.makedirs(self.workspace)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _repo(self, name):
+        repo = os.path.join(self.test_dir, name)
+        _git_init(repo)
+        _make_pytest_project(repo)
+        _write(os.path.join(repo, "app.py"), "x = 1\n")
+        return repo, _commit(repo)
+
+    def test_outside_repo_without_baseline_is_unresolved(self):
+        repo, _ = self._repo("r")
+        res = resolve_tier2_targets(self.workspace, [os.path.join(repo, "app.py")], baseline_lookup=lambda top: None)
+        self.assertEqual(res["targets"], [])
+        self.assertEqual(len(res["unresolved"]), 1)
+        self.assertIn("no trusted session baseline", res["unresolved"][0]["reason"])
+
+    def test_outside_target_carries_repo_and_baseline(self):
+        repo, sha = self._repo("r")
+        res = resolve_tier2_targets(self.workspace, [os.path.join(repo, "app.py")], baseline_lookup=lambda top: sha)
+        self.assertEqual(res["unresolved"], [])
+        self.assertEqual(res["targets"], [{"root": _real(repo), "outside": True, "repo_root": _real(repo), "baseline": sha}])
+
+    def test_root_fabricated_during_session_is_not_chosen(self):
+        """A pytest.ini + trivial tests/ created next to the edited file after the baseline
+        cannot become the verification root; the root existing at baseline is used."""
+        repo, sha = self._repo("r")
+        sub = os.path.join(repo, "pkg")
+        _write(os.path.join(sub, "core.py"), "y = 1\n")
+        _commit(repo)
+        _make_pytest_project(sub)  # fabricated after the baseline
+        res = resolve_tier2_targets(self.workspace, [os.path.join(sub, "core.py")], baseline_lookup=lambda top: sha)
+        self.assertEqual([t["root"] for t in res["targets"]], [_real(repo)])
+
+    def test_repo_without_runner_is_unresolved_even_with_a_decoy(self):
+        """M3: an edited repo with no runner is reported, not masked by a passing decoy."""
+        real = os.path.join(self.test_dir, "norunner")
+        _git_init(real)
+        _write(os.path.join(real, "lib.py"), "z = 1\n")
+        real_sha = _commit(real)
+        decoy, decoy_sha = self._repo("decoy")
+        shas = {_real(real): real_sha, _real(decoy): decoy_sha}
+        res = resolve_tier2_targets(self.workspace, [os.path.join(real, "lib.py"), os.path.join(decoy, "app.py")],
+                                    baseline_lookup=lambda top: shas.get(top))
+        self.assertEqual([u["file"] for u in res["unresolved"]], [os.path.join(real, "lib.py")])
+        self.assertIn("no test runner", res["unresolved"][0]["reason"])
+
+    def test_edit_through_symlink_resolves_to_the_real_repo(self):
+        """M4: an edit made through a symlink is attributed to the repository holding the file."""
+        b, b_sha = self._repo("b")
+        a = os.path.join(self.test_dir, "a")
+        _git_init(a)
+        os.symlink(os.path.join(b, "app.py"), os.path.join(a, "link.py"))
+        res = resolve_tier2_targets(self.workspace, [os.path.join(a, "link.py")],
+                                    baseline_lookup=lambda top: b_sha if top == _real(b) else None)
+        self.assertEqual(res["unresolved"], [])
+        self.assertEqual([t["root"] for t in res["targets"]], [_real(b)])
+
+
+class TestTamperCheckAnchoredAtToplevel(unittest.TestCase):
+    """M1: a project root that is a subdirectory of its repository is tamper-checked."""
+
+    def setUp(self):
+        self.test_dir = _real(tempfile.mkdtemp(prefix="hardtruth-oow-tamper-"))
+        self.repo = os.path.join(self.test_dir, "mono")
+        _git_init(self.repo)
+        self.sub = os.path.join(self.repo, "apps", "svc")
+        _make_pytest_project(self.sub)
+        _write(os.path.join(self.sub, "main.py"), "x = 1\n")
+        self.baseline = _commit(self.repo)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_clean_subproject_is_not_tampered(self):
+        self.assertEqual(check_manifest_tampering(self.sub, baseline_sha=self.baseline), (False, []))
+
+    def test_uncommitted_conftest_in_subproject_is_tampered(self):
+        _write(os.path.join(self.sub, "conftest.py"), "import pytest\n")
+        tampered, files = check_manifest_tampering(self.sub, baseline_sha=self.baseline)
+        self.assertTrue(tampered)
+        self.assertIn("apps/svc/conftest.py", files)
+
+    def test_committed_pytest_ini_change_in_subproject_is_tampered(self):
+        _write(os.path.join(self.sub, "pytest.ini"), "[pytest]\naddopts = -k nothing\n")
+        _commit(self.repo)
+        tampered, files = check_manifest_tampering(self.sub, baseline_sha=self.baseline)
+        self.assertTrue(tampered)
+        self.assertIn("apps/svc/pytest.ini", files)
+
+
+class TestStopHookOutsideRepos(unittest.TestCase):
+    """End-to-end through handle_stop with the real resolver: per-repository baselines,
+    integrity checks, and every project verified."""
 
     def setUp(self):
         self.test_dir = _real(tempfile.mkdtemp(prefix="hardtruth-oow-hook-"))
@@ -218,8 +329,6 @@ class TestStopHookVerifiesEveryProject(unittest.TestCase):
         os.makedirs(self.halt_dir, mode=0o700)
         self.workspace = os.path.join(self.test_dir, "ws")
         os.makedirs(self.workspace)
-        self.repo_a = os.path.join(self.test_dir, "a")
-        self.repo_b = os.path.join(self.test_dir, "b")
         self._env = {
             "HARDTRUTH_HALT_DIR": self.halt_dir,
             "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key"),
@@ -229,6 +338,10 @@ class TestStopHookVerifiesEveryProject(unittest.TestCase):
         os.environ.update(self._env)
         os.environ.pop("HARDTRUTH_SKIP_TIER2", None)
         os.environ.pop("HARDTRUTH_LEDGER_PATH", None)
+        self.conv = f"oow-{uuid.uuid4().hex}"
+        self.start = time.time()
+        self.handed_off = []
+        self.handoff_status = {}
 
     def tearDown(self):
         for k, v in self._old.items():
@@ -238,67 +351,133 @@ class TestStopHookVerifiesEveryProject(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _run_stop(self, handoff_results):
-        conv = f"oow-{uuid.uuid4().hex}"
+    def _repo(self, name):
+        """An outside repo whose history predates the session (reflog time < session start)."""
+        repo = os.path.join(self.test_dir, name)
+        _git_init(repo)
+        _write(os.path.join(repo, "pytest.ini"), "[pytest]\n")
+        _write(os.path.join(repo, "tests", "test_app.py"), TEST_BODY)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 1\n")
+        _commit(repo, when=self.start - 100)
+        return repo
+
+    def _session_start(self):
+        with open(hardtruth_hook.get_session_start_baseline_file(self.conv), "w") as f:
+            json.dump({"session_start_recorded": True, "created_at": self.start, "repos": {}}, f)
+
+    def _fake_call(self, endpoint, data, timeout=None):
+        if endpoint == "v1/verify/handoff":
+            self.handed_off.append(data["workspace_path"])
+            return self.handoff_status.get(data["workspace_path"],
+                                           {"success": True, "status": "verified", "exit_code": 0, "runner": "pytest"})
+        return None  # daemon baseline API unavailable: git ref / cache file layers are used
+
+    def _edit(self, path, content):
+        """An editor-tool edit: PostToolUse records the repository baseline, then the write lands."""
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            hardtruth_hook.record_repo_baseline_for_file(path, self.conv)
+        _write(path, content)
+
+    def _stop(self, modified):
         transcript = os.path.join(self.test_dir, "t.jsonl")
         with open(transcript, "w") as f:
             f.write(json.dumps({"type": "assistant", "message": {"role": "assistant",
                                 "content": [{"type": "text", "text": "Done."}]}}) + "\n")
         premise = {
-            "tampered": False,
-            "conversationId": conv,
-            "premise": "MODIFIED FILES: a.py, b.py.",
-            "source_files_modified": 2,
-            "doc_files_modified": 0,
-            "modified_file_paths": [os.path.join(self.repo_a, "a.py"), os.path.join(self.repo_b, "b.py")],
-            "verification_commands_executed": 1,
-            "test_commands_executed": 1,
-            "last_source_mod_step": 1,
-            "last_test_step": 2,
-            "unresolved_failures": [],
+            "tampered": False, "conversationId": self.conv, "premise": "MODIFIED FILES: app.py.",
+            "source_files_modified": len(modified), "doc_files_modified": 0, "modified_file_paths": modified,
+            "verification_commands_executed": 1, "test_commands_executed": 1,
+            "last_source_mod_step": 1, "last_test_step": 2, "unresolved_failures": [],
         }
-        handed_off = []
-
-        def fake_call(endpoint, data, timeout=None):
-            if endpoint == "v1/verify/handoff":
-                handed_off.append(data["workspace_path"])
-                return handoff_results[data["workspace_path"]]
-            return None
-
-        payload = {"conversationId": conv, "transcriptPath": transcript, "cwd": self.workspace,
+        payload = {"conversationId": self.conv, "transcriptPath": transcript, "cwd": self.workspace,
                    "workspace_path": self.workspace, "executionNum": 1}
         with mock.patch.object(hardtruth_hook, "HARNESS", "claude_code"), \
              mock.patch.object(hardtruth_hook, "get_local_ledger", return_value=_FakeLedger(premise)), \
              mock.patch.object(hardtruth_hook, "get_git_modified_source_files", return_value=([], [], [])), \
-             mock.patch.object(hardtruth_hook, "resolve_target_project_dirs", return_value=[self.repo_a, self.repo_b]), \
              mock.patch.object(hardtruth_hook, "is_macos_native_project", return_value=False), \
-             mock.patch.object(hardtruth_hook, "call_system_one", side_effect=fake_call):
-            res = hardtruth_hook.handle_stop(payload)
-        return res, handed_off
+             mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            return hardtruth_hook.handle_stop(payload)
 
-    def _setup_repos(self):
-        for r in (self.repo_a, self.repo_b):
-            _git_init(r)
-            _make_pytest_project(r)
-        _write(os.path.join(self.repo_a, "a.py"), "a = 1\n")
-        _write(os.path.join(self.repo_b, "b.py"), "b = 1\n")
+    def test_clean_outside_repo_is_verified_and_allowed(self):
+        self._session_start()
+        repo = self._repo("r")
+        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertEqual(res.get("decision"), "allow", res)
+        self.assertEqual(self.handed_off, [repo])
 
-    def test_all_projects_pass_allows(self):
-        self._setup_repos()
-        ok = {"success": True, "status": "verified", "exit_code": 0, "runner": "pytest"}
-        res, handed_off = self._run_stop({self.repo_a: ok, self.repo_b: ok})
-        self.assertEqual(handed_off, [self.repo_a, self.repo_b])
-        self.assertNotIn("TIER 2 HARD GATE FAILED", json.dumps(res))
+    def test_all_outside_projects_verified_and_one_failure_halts(self):
+        self._session_start()
+        a, b = self._repo("a"), self._repo("b")
+        self._edit(os.path.join(a, "app.py"), "def f():\n    return 2\n")
+        self._edit(os.path.join(b, "app.py"), "def f():\n    return 3\n")
+        self.handoff_status[b] = {"success": False, "status": "failed", "exit_code": 1, "runner": "pytest", "output": "1 failed"}
+        res = self._stop([os.path.join(a, "app.py"), os.path.join(b, "app.py")])
+        self.assertEqual(self.handed_off, [a, b])
+        self.assertIn("TIER 2 HARD GATE FAILED", res.get("reason", ""))
+        self.assertIn(b, res.get("reason", ""))
 
-    def test_one_failing_project_halts(self):
-        self._setup_repos()
-        ok = {"success": True, "status": "verified", "exit_code": 0, "runner": "pytest"}
-        bad = {"success": False, "status": "failed", "exit_code": 1, "runner": "pytest", "output": "1 failed"}
-        res, handed_off = self._run_stop({self.repo_a: ok, self.repo_b: bad})
-        self.assertEqual(handed_off, [self.repo_a, self.repo_b])
-        dumped = json.dumps(res, ensure_ascii=False)
-        self.assertIn("TIER 2 HARD GATE FAILED", dumped)
-        self.assertIn(self.repo_b, dumped)
+    def test_committed_conftest_tamper_in_outside_repo_halts(self):
+        """The H1 exploit: break app.py, add a conftest hookwrapper forcing passes, commit."""
+        self._session_start()
+        repo = self._repo("r")
+        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        _write(os.path.join(repo, "conftest.py"),
+               "import pytest\n@pytest.hookimpl(hookwrapper=True)\ndef pytest_runtest_makereport(item, call):\n"
+               "    out = yield\n    out.get_result().outcome = 'passed'\n")
+        _commit(repo, "x", when=self.start + 100)
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("conftest.py", res.get("reason", ""))
+        self.assertIn("REJECTED", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_committed_assertion_deletion_in_outside_repo_halts(self):
+        self._session_start()
+        repo = self._repo("r")
+        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        _write(os.path.join(repo, "tests", "test_app.py"), "def test_a():\n    assert f() is not None\n")
+        _commit(repo, "x", when=self.start + 100)
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("Severe assertion deletion", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_outside_repo_without_baseline_halts(self):
+        """Edited through the shell only (no editor-tool touch): no baseline was recorded."""
+        self._session_start()
+        repo = self._repo("r")
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("no trusted session baseline", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_commits_before_first_editor_touch_are_still_checked(self):
+        """The baseline is HEAD at session start (from the reflog), not HEAD at first touch, so a
+        conftest committed through the shell before the first edit is still caught."""
+        self._session_start()
+        repo = self._repo("r")
+        _write(os.path.join(repo, "conftest.py"), "import pytest\n")
+        _commit(repo, "sneak", when=self.start + 50)
+        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("conftest.py", res.get("reason", ""))
+
+    def test_outside_repo_invisible_to_verifier_halts(self):
+        """M2: unverified_no_workspace for an outside target is a failure, not a pass."""
+        self._session_start()
+        repo = self._repo("r")
+        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        self.handoff_status[repo] = {"success": False, "status": "unverified_no_workspace", "exit_code": 1}
+        with mock.patch.object(hardtruth_hook, "run_independent_verification", None):
+            res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("could not see", res.get("reason", ""))
+
+
+class _FakeLedger:
+    def __init__(self, premise):
+        self._premise = premise
+
+    def get_premise(self, conv_id):
+        return dict(self._premise)
 
 
 if __name__ == "__main__":
