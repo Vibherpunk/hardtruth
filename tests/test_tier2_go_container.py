@@ -79,9 +79,17 @@ class TestNeedsTestDatabase(unittest.TestCase):
         _write(os.path.join(self.d, "internal", "x", "x_test.go"), 'package x\nvar u = os.Getenv("TEST_DATABASE_URL")\n')
         self.assertTrue(t2.needs_test_database(self.d))
 
-    def test_ignores_non_test_files_and_vendor(self):
-        _write(os.path.join(self.d, "main.go"), 'var u = os.Getenv("TEST_DATABASE_URL")\n')
+    def test_detects_shared_helper_package(self):
+        # Regression: the marker lived only in internal/testdb/testdb.go (not a _test file),
+        # so no database was provided and the DB-backed tests failed in the gate.
+        _write(os.path.join(self.d, "internal", "testdb", "testdb.go"), 'package testdb\nvar u = os.Getenv("TEST_DATABASE_URL")\n')
+        _write(os.path.join(self.d, "internal", "x", "x_test.go"), 'package x\nfunc TestX(t *testing.T) { testdb.New(t) }\n')
+        self.assertTrue(t2.needs_test_database(self.d))
+
+    def test_ignores_vendor_and_non_source(self):
+        _write(os.path.join(self.d, "README.md"), 'TEST_DATABASE_URL\n')
         _write(os.path.join(self.d, "vendor", "y", "y_test.go"), 'os.Getenv("TEST_DATABASE_URL")\n')
+        _write(os.path.join(self.d, "node_modules", "z", "z.js"), 'process.env.TEST_DATABASE_URL\n')
         self.assertFalse(t2.needs_test_database(self.d))
 
     def test_opt_out(self):

@@ -531,7 +531,7 @@ def find_cargo_workspace_root(crate_dir: str) -> str:
 
 GO_IMAGE_FALLBACK = "golang:alpine"
 TEST_DB_ENV_MARKERS = ("TEST_DATABASE_URL",)
-_TEST_FILE_RE = re.compile(r"(_test\.go|^test_.*\.py|_test\.py|\.test\.[cm]?[jt]sx?|\.spec\.[cm]?[jt]sx?)$")
+_SOURCE_FILE_RE = re.compile(r"\.(go|py|[cm]?[jt]sx?|rs|rb|java|kt|ex|exs)$")
 _SCAN_SKIP_DIRS = {".git", "node_modules", "vendor", "target", "dist", "build", "__pycache__", ".venv", "venv"}
 
 
@@ -592,8 +592,10 @@ def prefetch_go_modules(workspace_path: str, timeout_sec: int = 30) -> None:
 
 
 def needs_test_database(workspace_path: str, max_files: int = 5000) -> bool:
-    """True when the project's tests read TEST_DATABASE_URL. The container then gets a
-    throwaway Postgres on a private, internet-less network instead of --network none.
+    """True when the project's source reads TEST_DATABASE_URL -- in test files or in a
+    shared test helper package (e.g. internal/testdb), so all source files are scanned.
+    The container then gets a throwaway Postgres on a private, internet-less network
+    instead of --network none (a false positive costs only an unused database).
     Disable with HARDTRUTH_TIER2_DB=0."""
     if os.environ.get("HARDTRUTH_TIER2_DB") == "0":
         return False
@@ -601,7 +603,7 @@ def needs_test_database(workspace_path: str, max_files: int = 5000) -> bool:
     for root, dirs, files in os.walk(workspace_path):
         dirs[:] = [d for d in dirs if d not in _SCAN_SKIP_DIRS]
         for name in files:
-            if not _TEST_FILE_RE.search(name):
+            if not _SOURCE_FILE_RE.search(name):
                 continue
             seen += 1
             if seen > max_files:
