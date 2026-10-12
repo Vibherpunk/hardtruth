@@ -18,6 +18,7 @@ No docker, network, or live daemon required.
 import os
 import sys
 import json
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -243,7 +244,7 @@ class TestBaselineAwareResolution(unittest.TestCase):
         res = resolve_tier2_targets(self.workspace, [os.path.join(repo, "app.py")], baseline_lookup=lambda top: None)
         self.assertEqual(res["targets"], [])
         self.assertEqual(len(res["unresolved"]), 1)
-        self.assertIn("no trusted session baseline", res["unresolved"][0]["reason"])
+        self.assertIn("no session-start snapshot", res["unresolved"][0]["reason"])
 
     def test_outside_target_carries_repo_and_baseline(self):
         repo, sha = self._repo("r")
@@ -320,8 +321,9 @@ class TestTamperCheckAnchoredAtToplevel(unittest.TestCase):
 
 
 class TestStopHookOutsideRepos(unittest.TestCase):
-    """End-to-end through handle_stop with the real resolver: per-repository baselines,
-    integrity checks, and every project verified."""
+    """End-to-end through handle_session_start and handle_stop with the real resolver.
+    The daemon is a fake first-write-wins store (as daemon/ledger.py set_session_baseline);
+    every probe from the PR #3 round-2 review is a test here and must halt."""
 
     def setUp(self):
         self.test_dir = _real(tempfile.mkdtemp(prefix="hardtruth-oow-hook-"))
@@ -329,17 +331,21 @@ class TestStopHookOutsideRepos(unittest.TestCase):
         os.makedirs(self.halt_dir, mode=0o700)
         self.workspace = os.path.join(self.test_dir, "ws")
         os.makedirs(self.workspace)
+        self.code_root = os.path.join(self.test_dir, "dev")  # a HARDTRUTH_BASELINE_ROOTS entry
+        os.makedirs(self.code_root)
         self._env = {
             "HARDTRUTH_HALT_DIR": self.halt_dir,
             "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key"),
             "HARDTRUTH_URL": "http://127.0.0.1:9",
+            "HARDTRUTH_BASELINE_ROOTS": self.code_root,
         }
         self._old = {k: os.environ.get(k) for k in list(self._env) + ["HARDTRUTH_SKIP_TIER2", "HARDTRUTH_LEDGER_PATH"]}
         os.environ.update(self._env)
         os.environ.pop("HARDTRUTH_SKIP_TIER2", None)
         os.environ.pop("HARDTRUTH_LEDGER_PATH", None)
         self.conv = f"oow-{uuid.uuid4().hex}"
-        self.start = time.time()
+        self.daemon = {}
+        self.daemon_up = True
         self.handed_off = []
         self.handoff_status = {}
 
@@ -351,32 +357,38 @@ class TestStopHookOutsideRepos(unittest.TestCase):
                 os.environ[k] = v
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def _repo(self, name):
-        """An outside repo whose history predates the session (reflog time < session start)."""
-        repo = os.path.join(self.test_dir, name)
-        _git_init(repo)
-        _write(os.path.join(repo, "pytest.ini"), "[pytest]\n")
-        _write(os.path.join(repo, "tests", "test_app.py"), TEST_BODY)
-        _write(os.path.join(repo, "app.py"), "def f():\n    return 1\n")
-        _commit(repo, when=self.start - 100)
-        return repo
-
-    def _session_start(self):
-        with open(hardtruth_hook.get_session_start_baseline_file(self.conv), "w") as f:
-            json.dump({"session_start_recorded": True, "created_at": self.start, "repos": {}}, f)
-
     def _fake_call(self, endpoint, data, timeout=None):
+        if not self.daemon_up:
+            return None
+        if endpoint == "v1/session/baseline":
+            key = (data["conversationId"], data["workspace_path"])
+            if key not in self.daemon and data.get("commit_sha"):
+                self.daemon[key] = data["commit_sha"]
+            return {"baseline_sha": self.daemon.get(key)}
         if endpoint == "v1/verify/handoff":
             self.handed_off.append(data["workspace_path"])
             return self.handoff_status.get(data["workspace_path"],
                                            {"success": True, "status": "verified", "exit_code": 0, "runner": "pytest"})
-        return None  # daemon baseline API unavailable: git ref / cache file layers are used
+        return None
 
-    def _edit(self, path, content):
-        """An editor-tool edit: PostToolUse records the repository baseline, then the write lands."""
+    def _repo(self, name, parent=None):
+        repo = os.path.join(parent or self.code_root, name)
+        _git_init(repo)
+        _write(os.path.join(repo, "pytest.ini"), "[pytest]\n")
+        _write(os.path.join(repo, "tests", "test_app.py"), TEST_BODY)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 1\n")
+        _commit(repo)
+        return repo
+
+    def _session_start(self):
         with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
-            hardtruth_hook.record_repo_baseline_for_file(path, self.conv)
-        _write(path, content)
+            hardtruth_hook.handle_session_start({"conversationId": self.conv, "cwd": self.workspace, "source": "startup"})
+
+    def _tamper_conftest(self, repo, when=None):
+        _write(os.path.join(repo, "conftest.py"),
+               "import pytest\n@pytest.hookimpl(hookwrapper=True)\ndef pytest_runtest_makereport(item, call):\n"
+               "    out = yield\n    out.get_result().outcome = 'passed'\n")
+        return _commit(repo, "wip", when=when)
 
     def _stop(self, modified):
         transcript = os.path.join(self.test_dir, "t.jsonl")
@@ -398,74 +410,144 @@ class TestStopHookOutsideRepos(unittest.TestCase):
              mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
             return hardtruth_hook.handle_stop(payload)
 
+    def _assert_halted_on_conftest(self, res):
+        self.assertIn("conftest.py", res.get("reason", ""), res)
+        self.assertIn("REJECTED", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    # --- passing and failing projects -------------------------------------------------
+
     def test_clean_outside_repo_is_verified_and_allowed(self):
-        self._session_start()
         repo = self._repo("r")
-        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
         res = self._stop([os.path.join(repo, "app.py")])
         self.assertEqual(res.get("decision"), "allow", res)
         self.assertEqual(self.handed_off, [repo])
 
     def test_all_outside_projects_verified_and_one_failure_halts(self):
-        self._session_start()
         a, b = self._repo("a"), self._repo("b")
-        self._edit(os.path.join(a, "app.py"), "def f():\n    return 2\n")
-        self._edit(os.path.join(b, "app.py"), "def f():\n    return 3\n")
+        self._session_start()
+        _write(os.path.join(a, "app.py"), "def f():\n    return 2\n")
+        _write(os.path.join(b, "app.py"), "def f():\n    return 3\n")
         self.handoff_status[b] = {"success": False, "status": "failed", "exit_code": 1, "runner": "pytest", "output": "1 failed"}
         res = self._stop([os.path.join(a, "app.py"), os.path.join(b, "app.py")])
         self.assertEqual(self.handed_off, [a, b])
         self.assertIn("TIER 2 HARD GATE FAILED", res.get("reason", ""))
         self.assertIn(b, res.get("reason", ""))
 
+    # --- round-1 H1 and its tests ------------------------------------------------------
+
     def test_committed_conftest_tamper_in_outside_repo_halts(self):
-        """The H1 exploit: break app.py, add a conftest hookwrapper forcing passes, commit."""
-        self._session_start()
         repo = self._repo("r")
-        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
-        _write(os.path.join(repo, "conftest.py"),
-               "import pytest\n@pytest.hookimpl(hookwrapper=True)\ndef pytest_runtest_makereport(item, call):\n"
-               "    out = yield\n    out.get_result().outcome = 'passed'\n")
-        _commit(repo, "x", when=self.start + 100)
-        res = self._stop([os.path.join(repo, "app.py")])
-        self.assertIn("conftest.py", res.get("reason", ""))
-        self.assertIn("REJECTED", res.get("reason", ""))
-        self.assertEqual(self.handed_off, [])
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        self._tamper_conftest(repo)
+        self._assert_halted_on_conftest(self._stop([os.path.join(repo, "app.py")]))
 
     def test_committed_assertion_deletion_in_outside_repo_halts(self):
-        self._session_start()
         repo = self._repo("r")
-        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
         _write(os.path.join(repo, "tests", "test_app.py"), "def test_a():\n    assert f() is not None\n")
-        _commit(repo, "x", when=self.start + 100)
+        _commit(repo, "x")
         res = self._stop([os.path.join(repo, "app.py")])
         self.assertIn("Severe assertion deletion", res.get("reason", ""))
         self.assertEqual(self.handed_off, [])
 
-    def test_outside_repo_without_baseline_halts(self):
-        """Edited through the shell only (no editor-tool touch): no baseline was recorded."""
-        self._session_start()
+    # --- round-2 probes: the agent must not be able to choose the baseline -------------
+
+    def test_shell_commit_from_inside_outside_repo_before_first_edit_halts(self):
+        """Round-2 H1 / P11: a shell commit run with Cwd = the outside repo makes PostToolUse
+        baseline that repo at the post-tamper HEAD (get_or_set_session_baseline). The
+        session-start snapshot must still be what Stop compares against."""
         repo = self._repo("r")
+        self._session_start()
+        self._tamper_conftest(repo)
+        with mock.patch.object(hardtruth_hook, "call_system_one", side_effect=self._fake_call):
+            hardtruth_hook.get_or_set_session_baseline(repo, self.conv)  # what PostToolUse does for tool_cwd
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        self._assert_halted_on_conftest(self._stop([os.path.join(repo, "app.py")]))
+
+    def test_backdated_tamper_commit_halts(self):
+        """P1: a GIT_COMMITTER_DATE before session start doesn't move the baseline."""
+        repo = self._repo("r")
+        self._session_start()
+        self._tamper_conftest(repo, when=time.time() - 3600)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        self._assert_halted_on_conftest(self._stop([os.path.join(repo, "app.py")]))
+
+    def test_planted_baseline_ref_and_cache_files_are_ignored(self):
+        """P2/P3: refs/hardtruth/baseline/<conv_hash> and halt-dir files set to the tampered HEAD."""
+        repo = self._repo("r")
+        self._session_start()
+        tampered = self._tamper_conftest(repo)
+        conv_hash = hashlib.sha256(self.conv.encode("utf-8")).hexdigest()[:16]
+        subprocess.run(["git", "update-ref", f"refs/hardtruth/baseline/{conv_hash}", tampered], cwd=repo, check=True)
+        for name in os.listdir(self.halt_dir):
+            if name.startswith("baseline_"):
+                with open(os.path.join(self.halt_dir, name), "w") as f:
+                    json.dump({"baseline_sha": tampered}, f)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        self._assert_halted_on_conftest(self._stop([os.path.join(repo, "app.py")]))
+
+    def test_deleted_session_start_file_does_not_weaken_baseline(self):
+        """P4: removing the halt-dir session file changes nothing; the snapshot is in the daemon."""
+        repo = self._repo("r")
+        self._session_start()
+        os.remove(hardtruth_hook.get_session_start_baseline_file(self.conv))
+        self._tamper_conftest(repo)
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 'broken'\n")
+        self._assert_halted_on_conftest(self._stop([os.path.join(repo, "app.py")]))
+
+    def test_repo_without_session_start_snapshot_halts_with_guidance(self):
+        """P5/L6: a repository outside every snapshot root (or created mid-session) fails
+        closed, and the message says why and what to do."""
+        elsewhere = os.path.join(self.test_dir, "elsewhere")
+        os.makedirs(elsewhere)
+        repo = self._repo("r", parent=elsewhere)
+        self._session_start()
         _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
         res = self._stop([os.path.join(repo, "app.py")])
-        self.assertIn("no trusted session baseline", res.get("reason", ""))
+        self.assertIn("no session-start snapshot", res.get("reason", ""))
+        self.assertIn("HARDTRUTH_BASELINE_ROOTS", res.get("reason", ""))
         self.assertEqual(self.handed_off, [])
 
-    def test_commits_before_first_editor_touch_are_still_checked(self):
-        """The baseline is HEAD at session start (from the reflog), not HEAD at first touch, so a
-        conftest committed through the shell before the first edit is still caught."""
+    def test_repo_created_mid_session_halts(self):
         self._session_start()
-        repo = self._repo("r")
-        _write(os.path.join(repo, "conftest.py"), "import pytest\n")
-        _commit(repo, "sneak", when=self.start + 50)
-        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        repo = self._repo("late")
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
         res = self._stop([os.path.join(repo, "app.py")])
-        self.assertIn("conftest.py", res.get("reason", ""))
+        self.assertIn("no session-start snapshot", res.get("reason", ""))
+
+    def test_stash_created_during_session_halts_even_backdated(self):
+        """L4: the stash check compares refs/stash with its session-start value, not %ct."""
+        repo = self._repo("r")
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        _write(os.path.join(repo, "tests", "test_app.py"), "def test_a():\n    pass\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"] = f"{int(time.time()) - 3600} +0000"
+        subprocess.run(["git", "stash", "push", "--", "tests/test_app.py"], cwd=repo, env=env, check=True,
+                       stdout=subprocess.PIPE)
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertIn("stash", res.get("reason", ""))
+        self.assertEqual(self.handed_off, [])
+
+    def test_daemon_unreachable_at_stop_halts(self):
+        repo = self._repo("r")
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        self.daemon_up = False
+        res = self._stop([os.path.join(repo, "app.py")])
+        self.assertNotEqual(res.get("decision"), "allow", res)
+        self.assertEqual(self.handed_off, [])
 
     def test_outside_repo_invisible_to_verifier_halts(self):
         """M2: unverified_no_workspace for an outside target is a failure, not a pass."""
-        self._session_start()
         repo = self._repo("r")
-        self._edit(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
+        self._session_start()
+        _write(os.path.join(repo, "app.py"), "def f():\n    return 2\n")
         self.handoff_status[repo] = {"success": False, "status": "unverified_no_workspace", "exit_code": 1}
         with mock.patch.object(hardtruth_hook, "run_independent_verification", None):
             res = self._stop([os.path.join(repo, "app.py")])

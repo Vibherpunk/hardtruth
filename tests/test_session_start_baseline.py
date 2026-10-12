@@ -54,6 +54,8 @@ class TestSessionStartBaseline(unittest.TestCase):
             "SYSTEM_ONE_URL": "http://127.0.0.1:1",
             "HARDTRUTH_SKIP_TIER2": "1",
             "HARDTRUTH_API_KEY": os.path.join(self.test_dir, "no-such-key"),
+            # Don't snapshot the host's real code folders (~/dev, ~/workspace, ...).
+            "HARDTRUTH_BASELINE_ROOTS": "",
         }
 
     def tearDown(self):

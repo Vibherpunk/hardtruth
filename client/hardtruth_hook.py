@@ -77,13 +77,13 @@ except ImportError:
             run_independent_verification = None
 
 try:
-    from daemon.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering, repo_baseline_cache_path
+    from daemon.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
 except ImportError:
     try:
-        from tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering, repo_baseline_cache_path
+        from tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
     except ImportError:
         try:
-            from hardtruth.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering, repo_baseline_cache_path
+            from hardtruth.tier2_runner import resolve_tier2_targets, git_toplevel_for_file, check_manifest_tampering
         except ImportError:
             def resolve_tier2_targets(ws, mod=None, cid=None, baseline_lookup=None):
                 r = resolve_target_project_dir(ws, mod, cid)
@@ -91,7 +91,6 @@ except ImportError:
                         "unresolved": []}
             git_toplevel_for_file = None
             check_manifest_tampering = None
-            repo_baseline_cache_path = None
 
 
 def get_canonical_hook_path() -> Optional[str]:
@@ -542,8 +541,10 @@ def is_valid_commit(sha: Optional[str], workspace_dir: str) -> bool:
         return False
     try:
         chk = subprocess.run(
-            ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{sha}^{{commit}}"],
+            ["git", "-c", f"safe.directory={os.path.abspath(workspace_dir)}", "-c", "core.fsmonitor=",
+             "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{sha}^{{commit}}"],
             cwd=workspace_dir,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=1.0
@@ -796,19 +797,28 @@ def get_or_set_session_baseline(workspace_dir: str, conv_id: str) -> Optional[st
 
 
 # ---------------------------------------------------------------------------
-# Per-repository session baselines for repositories outside the workspace
+# Session-start snapshots for repositories outside the workspace
 #
 # get_or_set_session_baseline() records a baseline only for the session's working
 # directory. A session that edits a git repository elsewhere (started in a non-repo
-# directory, editing ~/dev/<repo>) would otherwise reach Tier 2 with no baseline for that
-# repository, and every baseline-dependent defence (committed manifest/conftest tamper,
-# assertion deletion, lineage and stash checks) would silently skip. The first time an
-# editor tool touches a file, the baseline for that file's git top-level is recorded as
-# HEAD *at session start* -- taken from SessionStart when it saw the repository, else
-# rebuilt from the HEAD reflog -- in the daemon ledger, a git ref, and a per-repository
-# cache file. At Stop, a repository outside the workspace with no such baseline fails
-# closed.
+# directory, editing ~/dev/<repo>) needs that repository's state from BEFORE the agent
+# could act, or every baseline-dependent defence (committed manifest/conftest tamper,
+# assertion deletion, lineage and stash checks) has nothing to compare against.
+#
+# Everything local -- the reflog, refs, cache files in the halt dir -- is writable by the
+# agent, and anything recorded lazily (at first edit, or after a tool ran in the repo) can
+# be chosen by it. So the only trusted baseline is the one SessionStart registers in the
+# daemon, before the agent's first tool call, under a key namespace no other code path
+# writes: HEAD and refs/stash of each candidate repository (the session's directory, its
+# child repositories, and repositories directly under HARDTRUTH_BASELINE_ROOTS). The daemon
+# keeps the first value written per key. At Stop, an edited repository outside the
+# workspace without such a snapshot fails closed.
 # ---------------------------------------------------------------------------
+
+SESSION_START_HEAD_NS = "/__hardtruth_session_start_head__"
+SESSION_START_STASH_NS = "/__hardtruth_session_start_stash__"
+DEFAULT_BASELINE_ROOTS = ("~/dev", "~/workspace", "~/code", "~/src", "~/projects", "~/repos")
+
 
 def _git_env_clean() -> Dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -826,109 +836,84 @@ def _git_out(repo_root: str, args: List[str], timeout: float = 2.0) -> Tuple[int
         return 1, ""
 
 
-def _session_start_record(conv_id: str) -> Dict[str, Any]:
+def get_baseline_roots() -> List[str]:
+    """Directories whose immediate child repositories are snapshotted at session start
+    (HARDTRUTH_BASELINE_ROOTS, os.pathsep-separated; defaults to common code folders)."""
+    raw = os.environ.get("HARDTRUTH_BASELINE_ROOTS")
+    roots = raw.split(os.pathsep) if raw is not None else list(DEFAULT_BASELINE_ROOTS)
+    out = []
+    for r in roots:
+        r = os.path.expanduser(r.strip())
+        if r and os.path.isdir(r):
+            out.append(os.path.abspath(r))
+    return out
+
+
+def snapshot_repos_at_session_start(conv_id: str, cwd: str, time_budget_sec: float = 6.0, max_repos: int = 200) -> int:
+    """Registers HEAD and refs/stash of every candidate repository in the daemon under the
+    session-start namespace. Returns the number of repositories snapshotted within the time
+    budget. Values are read before the agent's first tool call, so a registration still in
+    flight when the budget runs out records the session-start state too."""
+    import concurrent.futures
+    deadline = time.time() + time_budget_sec
+    seen: Set[str] = set()
+    candidates: List[str] = []
+    for base in [cwd] + get_baseline_roots():
+        for repo in _discover_relevant_git_repos(base, max_repos=max_repos, time_budget_sec=time_budget_sec / 3):
+            top = os.path.realpath(repo)
+            if top not in seen:
+                seen.add(top)
+                candidates.append(top)
+
+    states: List[Tuple[str, str, str]] = []
+    for top in candidates[:max_repos]:
+        if time.time() > deadline:
+            break
+        rc, head = _git_out(top, ["rev-parse", "--verify", "HEAD"], timeout=1.0)
+        head = head.strip()
+        if rc != 0 or not head:
+            continue  # no commits yet: nothing to anchor, edits there fail closed
+        rc, stash = _git_out(top, ["rev-parse", "-q", "--verify", "refs/stash"], timeout=1.0)
+        states.append((top, head, stash.strip() if rc == 0 and stash.strip() else "none"))
+
+    def _register(state: Tuple[str, str, str]) -> bool:
+        top, head, stash = state
+        r1 = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": SESSION_START_HEAD_NS + top, "commit_sha": head
+        }, timeout=2.0)
+        r2 = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": SESSION_START_STASH_NS + top, "commit_sha": stash
+        }, timeout=2.0)
+        return bool(r1 and r2)
+
+    if not states:
+        return 0
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(states)))
+    futures = [pool.submit(_register, st) for st in states]
+    done, _ = concurrent.futures.wait(futures, timeout=max(0.5, deadline - time.time()))
+    pool.shutdown(wait=False)
+    return sum(1 for f in done if not f.exception() and f.result())
+
+
+def _session_start_value(ns: str, repo_root: str, conv_id: str) -> Optional[str]:
     try:
-        with open(get_session_start_baseline_file(conv_id), "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
+        resp = call_system_one("v1/session/baseline", {
+            "conversationId": conv_id, "workspace_path": ns + os.path.realpath(repo_root)
+        }, timeout=1.0)
+        return (resp or {}).get("baseline_sha") or None
     except Exception:
-        return {}
-
-
-def _head_at_session_start(repo_root: str, conv_id: str) -> Optional[str]:
-    """
-    HEAD of repo_root as it was when this session started, or None when that cannot be
-    established (no commits yet, or the HEAD reflog does not reach back to session start).
-    Using HEAD at session start rather than HEAD at first touch means commits the agent made
-    in the repository through the shell BEFORE its first editor-tool edit there are still
-    inside the verified range.
-    """
-    record = _session_start_record(conv_id)
-    repo_entry = (record.get("repos") or {}).get(repo_root) or {}
-    if repo_entry.get("head_sha"):
-        return repo_entry["head_sha"]
-
-    rc, head = _git_out(repo_root, ["rev-parse", "--verify", "HEAD"])
-    head = head.strip()
-    if rc != 0 or not head:
         return None
-    start_ts = record.get("created_at")
-    if not start_ts:
-        # No session-start time is known (harness without SessionStart): best effort.
-        return head
-
-    rc, log = _git_out(repo_root, ["log", "-g", "--date=unix", "--format=%H %gd", "HEAD"], timeout=3.0)
-    entries = []
-    if rc == 0:
-        for line in log.splitlines():
-            m = re.match(r"^([0-9a-f]{7,64}) \S*@\{(\d+)\}$", line.strip())
-            if m:
-                entries.append((m.group(1), int(m.group(2))))
-    if not entries:
-        return None
-    for sha, ts in entries:  # newest first: HEAD's value after each move
-        if ts <= float(start_ts):
-            return sha
-    return None  # the reflog begins after session start: no trustworthy baseline
 
 
-def lookup_repo_baseline(repo_root: str, conv_id: str) -> Optional[str]:
-    """The recorded session baseline for repo_root (daemon ledger, then git ref, then the
-    per-repository cache file), or None. Never records one."""
+def trusted_repo_baseline(repo_root: str, conv_id: str) -> Optional[str]:
+    """HEAD of repo_root as snapshotted in the daemon at session start, or None. Never
+    records anything and never consults agent-writable stores."""
     if not repo_root or not conv_id:
         return None
-    try:
-        resp = call_system_one("v1/session/baseline", {"conversationId": conv_id, "workspace_path": repo_root}, timeout=1.0)
-        sha = (resp or {}).get("baseline_sha")
-        if sha and is_valid_commit(sha, repo_root):
-            return sha
-    except Exception:
-        pass
-    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-    rc, out = _git_out(repo_root, ["rev-parse", "--verify", f"refs/hardtruth/baseline/{conv_hash}"], timeout=1.0)
-    if rc == 0 and out.strip() and is_valid_commit(out.strip(), repo_root):
-        return out.strip()
-    if repo_baseline_cache_path is not None:
-        try:
-            with open(repo_baseline_cache_path(conv_id, repo_root), "r") as f:
-                sha = json.load(f).get("baseline_sha")
-            if sha and is_valid_commit(sha, repo_root):
-                return sha
-        except Exception:
-            pass
-    return None
-
-
-def record_repo_baseline_for_file(fpath: str, conv_id: str) -> Optional[str]:
-    """Records (once) the session baseline for the git repository holding fpath."""
-    if not fpath or not conv_id or conv_id == "unknown" or git_toplevel_for_file is None:
-        return None
-    try:
-        repo_root = git_toplevel_for_file(fpath)
-        if not repo_root:
-            return None
-        existing = lookup_repo_baseline(repo_root, conv_id)
-        if existing:
-            return existing
-        sha = _head_at_session_start(repo_root, conv_id)
-        if not sha:
-            return None
-        resp = call_system_one("v1/session/baseline", {
-            "conversationId": conv_id, "workspace_path": repo_root, "commit_sha": sha
-        }, timeout=1.0)
-        if resp and resp.get("baseline_sha") and is_valid_commit(resp["baseline_sha"], repo_root):
-            sha = resp["baseline_sha"]
-        conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-        _git_out(repo_root, ["update-ref", f"refs/hardtruth/baseline/{conv_hash}", sha, ""], timeout=1.0)
-        if repo_baseline_cache_path is not None:
-            cache = repo_baseline_cache_path(conv_id, repo_root)
-            os.makedirs(os.path.dirname(cache), mode=0o700, exist_ok=True)
-            if not os.path.exists(cache):
-                with open(cache, "w") as f:
-                    json.dump({"baseline_sha": sha, "repo_root": repo_root, "created_at": time.time()}, f)
+    sha = _session_start_value(SESSION_START_HEAD_NS, repo_root, conv_id)
+    if sha and is_valid_commit(sha, repo_root):
         return sha
-    except Exception:
-        return None
+    return None
 
 
 def _test_weakening_marker(line_str: str) -> Optional[str]:
@@ -959,11 +944,11 @@ def _test_weakening_marker(line_str: str) -> Optional[str]:
 _ASSERTION_RE = re.compile(r"\b(?:assert|expect|self\.assert)\b")
 
 
-def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str, session_start: float) -> Optional[str]:
+def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str) -> Optional[str]:
     """
     The baseline-dependent defences Phases 5 and 8 apply to the workspace repository, applied
     to a Tier 2 target in a repository outside the workspace, against that repository's
-    trusted session baseline. Returns a halt message, or None when the repository is clean.
+    session-start snapshot. Returns a halt message, or None when the repository is clean.
     """
     repo_root = target["repo_root"]
     baseline = target["baseline"]
@@ -973,15 +958,15 @@ def check_outside_repo_integrity(target: Dict[str, Any], conv_id: str, session_s
         return (f"🚨 HARDTRUTH GATE HALTED (EVASION E4 DETECTED): HEAD of {repo_root} is not a descendant of "
                 f"session baseline commit {baseline[:10]}. Branch switching or history rewrites to hide changes are forbidden.")
 
-    rc, stash = _git_out(repo_root, ["stash", "list", "--format=%gd %ct"])
-    if rc == 0:
-        for line in stash.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                st = int(parts[1])
-                if (session_start > 0 and st >= session_start - 5) or (session_start <= 0 and time.time() - st < 60):
-                    return (f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): Active git stash ('{parts[0]}') created "
-                            f"during this session in {repo_root}. Restore it with 'git stash pop' and run tests before completing.")
+    start_stash = _session_start_value(SESSION_START_STASH_NS, repo_root, conv_id)
+    if not start_stash:
+        return f"🚨 HARDTRUTH UNDETERMINED: no session-start stash snapshot for {repo_root}. HardTruth fails closed."
+    rc, stash = _git_out(repo_root, ["rev-parse", "-q", "--verify", "refs/stash"], timeout=1.0)
+    stash = stash.strip() if rc == 0 and stash.strip() else "none"
+    if stash != start_stash:
+        return (f"🚨 HARDTRUTH GATE HALTED (EVASION DETECTED): the git stash of {repo_root} changed during this "
+                "session. Stashing changes to bypass dirty-tree verification is forbidden. Restore your stashed "
+                "changes and run tests before completing.")
 
     if check_manifest_tampering is not None:
         tampered, files = check_manifest_tampering(target["root"], conv_id=conv_id, baseline_sha=baseline)
@@ -1277,6 +1262,11 @@ def handle_session_start(payload: dict) -> dict:
             if repo_root == cwd_abs:
                 primary_sha = head_sha
                 primary_dirty = list(dirty_files)
+
+        try:
+            data["repos_snapshotted"] = snapshot_repos_at_session_start(conv_id, cwd_abs)
+        except Exception:
+            data["repos_snapshotted"] = 0
 
         data["session_start_recorded"] = True
         data["session_start_source"] = source
@@ -2008,7 +1998,6 @@ def handle_pre_tool_use(payload: dict) -> dict:
                 msg = f"🚨 HARDTRUTH G2 MUTATION GATE BLOCKED: {reason}"
                 sys.stderr.write(msg + "\n")
                 return {"decision": "deny", "reason": msg}
-            record_repo_baseline_for_file(target_file, payload.get("conversationId", "unknown"))
 
     return {"decision": "allow"}
 
@@ -2138,7 +2127,6 @@ def handle_post_tool_use(payload: dict) -> dict:
 
     elif tool_name in ["write_to_file", "replace_file_content"]:
         cmd_or_file = tool_args.get("TargetFile", "")
-        record_repo_baseline_for_file(cmd_or_file, conv_id)
         diff_stat = get_git_diff_stat(cmd_or_file)
         harness_status = "no_error" if not error_msg else "error"
 
@@ -2931,23 +2919,29 @@ def handle_stop(payload: dict) -> dict:
         # pass; an edited file that cannot be attributed to a verifiable project fails closed.
         resolution = resolve_tier2_targets(
             workspace_dir, modified_paths, conv_id,
-            baseline_lookup=lambda repo_root: lookup_repo_baseline(repo_root, conv_id)
+            baseline_lookup=lambda repo_root: trusted_repo_baseline(repo_root, conv_id)
         )
         if resolution.get("unresolved"):
             details = "; ".join(f"{u['file']}: {u['reason']}" for u in resolution["unresolved"][:5])
+            how = ""
+            if any("session-start snapshot" in u["reason"] for u in resolution["unresolved"]):
+                how = (" A repository outside the workspace can only be verified against its state at session "
+                       "start, which is snapshotted for the session's directory, its child repositories, and "
+                       "repositories directly under HARDTRUTH_BASELINE_ROOTS (default: ~/dev, ~/workspace, ~/code, "
+                       "~/src, ~/projects, ~/repos), and only when the repository already had a commit. Start a new "
+                       "session inside that repository (or a configured root) to work on it.")
             return fail_halt(
                 "🚨 HARDTRUTH UNDETERMINED: This session edited source file(s) outside the workspace that "
-                f"Tier 2 cannot verify: {details}. HardTruth never fails open.",
+                f"Tier 2 cannot verify: {details}.{how} HardTruth never fails open.",
                 remediable=False
             )
         resolved_targets = [t for t in resolution.get("targets", []) if t.get("root") and os.path.exists(t["root"])]
 
         # Repositories outside the workspace get the same baseline-dependent defences the
         # workspace repository gets in Phases 5 and 8, against their own session baseline.
-        session_start = premise_data.get("created_at", 0) or _session_start_record(conv_id).get("created_at", 0) or 0
         for t in resolved_targets:
             if t.get("outside"):
-                violation = check_outside_repo_integrity(t, conv_id, float(session_start))
+                violation = check_outside_repo_integrity(t, conv_id)
                 if violation:
                     return fail_halt(violation)
 

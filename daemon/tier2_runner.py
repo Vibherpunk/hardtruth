@@ -146,15 +146,6 @@ def _manifest_patterns_for(repo_root: str, workspace_path: str) -> List[str]:
     return patterns
 
 
-def repo_baseline_cache_path(conv_id: str, repo_root: str) -> str:
-    """Per-(session, repository) baseline cache file. Distinct from the session-keyed
-    baseline file so recording one repository's baseline never overwrites another's."""
-    halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
-    conv_hash = hashlib.sha256(str(conv_id).encode("utf-8")).hexdigest()[:16]
-    repo_hash = hashlib.sha256(os.path.realpath(repo_root).encode("utf-8")).hexdigest()[:16]
-    return os.path.join(halt_dir, f"baseline_repo_{conv_hash}_{repo_hash}.json")
-
-
 def check_manifest_tampering(
     workspace_path: str,
     conv_id: Optional[str] = None,
@@ -168,7 +159,7 @@ def check_manifest_tampering(
     that is a subdirectory of a repository (a monorepo subproject) is checked too: manifests
     at the repository root, manifests in the subproject, and every conftest.py. When the
     caller already holds a trusted session baseline for the repository it passes
-    baseline_sha; otherwise the baseline is looked up (daemon ledger, git ref, cache files).
+    baseline_sha; otherwise the baseline is looked up (daemon ledger, git ref, cache file).
     """
     if not workspace_path or not os.path.isdir(workspace_path):
         return False, []
@@ -242,19 +233,16 @@ def check_manifest_tampering(
             except Exception:
                 pass
 
-        # Check halt dir local fallbacks: per-repository file, then the session file
+        # Check halt dir local fallback
         if not baseline_sha:
             halt_dir = os.environ.get("HARDTRUTH_HALT_DIR", os.path.expanduser("~/.hardtruth/halts"))
-            for baseline_file in (repo_baseline_cache_path(conv_id, repo_root),
-                                  os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")):
-                if baseline_sha:
-                    break
-                if os.path.exists(baseline_file):
-                    try:
-                        with open(baseline_file, "r") as f:
-                            baseline_sha = json.load(f).get("baseline_sha")
-                    except Exception:
-                        pass
+            baseline_file = os.path.join(halt_dir, f"baseline_{safe_slug}_{conv_hash}.json")
+            if os.path.exists(baseline_file):
+                try:
+                    with open(baseline_file, "r") as f:
+                        baseline_sha = json.load(f).get("baseline_sha")
+                except Exception:
+                    pass
 
     if baseline_sha:
         try:
@@ -544,7 +532,7 @@ def resolve_tier2_targets(
     - An edited SOURCE file outside the workspace (a session started in one directory that
       edits a repo elsewhere) belongs to its git repository (`git rev-parse --show-toplevel`).
       With `baseline_lookup` (repo_root -> trusted session baseline SHA or None), which the
-      Stop hook always passes:
+      Stop hook always passes (the repository's HEAD snapshotted at session start):
         * no trusted baseline for that repository -> unresolved (callers fail closed);
         * the project root is decided from the BASELINE tree (find_project_root_in_commit),
           so a root fabricated during the session cannot be chosen;
@@ -626,7 +614,7 @@ def resolve_tier2_targets(
                 baselines[toplevel] = None
         baseline = baselines[toplevel]
         if not baseline:
-            _unresolved(f_abs, f"no trusted session baseline was recorded for its repository {toplevel}")
+            _unresolved(f_abs, f"its repository {toplevel} has no session-start snapshot")
             continue
         root = find_project_root_in_commit(toplevel, baseline, f_real)
         if not _add(root, True, toplevel, baseline):
