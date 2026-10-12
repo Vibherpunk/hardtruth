@@ -529,6 +529,155 @@ def find_cargo_workspace_root(crate_dir: str) -> str:
         return crate_dir
 
 
+GO_IMAGE_FALLBACK = "golang:alpine"
+TEST_DB_ENV_MARKERS = ("TEST_DATABASE_URL",)
+_TEST_FILE_RE = re.compile(r"(_test\.go|^test_.*\.py|_test\.py|\.test\.[cm]?[jt]sx?|\.spec\.[cm]?[jt]sx?)$")
+_SCAN_SKIP_DIRS = {".git", "node_modules", "vendor", "target", "dist", "build", "__pycache__", ".venv", "venv"}
+
+
+def go_container_image(workspace_path: str) -> str:
+    """golang:<major.minor>-alpine matching go.mod's toolchain/go directive, so the
+    sealed container compiles with the toolchain the module declares (GOTOOLCHAIN=local
+    forbids an in-container toolchain download). Falls back to golang:alpine."""
+    try:
+        with open(os.path.join(workspace_path, "go.mod"), "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return GO_IMAGE_FALLBACK
+    m = re.search(r"^toolchain\s+go(\d+)\.(\d+)", text, re.M) or re.search(r"^go\s+(\d+)\.(\d+)", text, re.M)
+    return f"golang:{m.group(1)}.{m.group(2)}-alpine" if m else GO_IMAGE_FALLBACK
+
+
+def host_go_modcache() -> Optional[str]:
+    """The host's Go module cache (GOMODCACHE, `go env GOMODCACHE`, $GOPATH/pkg/mod,
+    ~/go/pkg/mod), or None. Mounted read-only so a --network none container can build
+    modules the host already has."""
+    candidates: List[str] = []
+    if os.environ.get("GOMODCACHE"):
+        candidates.append(os.environ["GOMODCACHE"])
+    go_bin = shutil.which("go")
+    if go_bin:
+        try:
+            out = subprocess.run([go_bin, "env", "GOMODCACHE"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, text=True, timeout=10).stdout.strip()
+            if out:
+                candidates.append(out)
+        except Exception:
+            pass
+    if os.environ.get("GOPATH"):
+        candidates.append(os.path.join(os.environ["GOPATH"].split(os.pathsep)[0], "pkg", "mod"))
+    candidates.append(os.path.expanduser("~/go/pkg/mod"))
+    for c in candidates:
+        if c and os.path.isdir(c):
+            return os.path.abspath(c)
+    return None
+
+
+def prefetch_go_modules(workspace_path: str, timeout_sec: int = 30) -> None:
+    """Best-effort `go mod download` on the host so the module cache holds everything
+    go.mod/go.sum pin. Downloads checksummed module sources only -- it builds and runs no
+    repository code. Disable with HARDTRUTH_TIER2_GO_PREFETCH=0."""
+    if os.environ.get("HARDTRUTH_TIER2_GO_PREFETCH") == "0":
+        return
+    go_bin = shutil.which("go")
+    if not go_bin or not os.path.isfile(os.path.join(workspace_path, "go.mod")):
+        return
+    env = dict(os.environ)
+    env.pop("GOFLAGS", None)
+    try:
+        subprocess.run([go_bin, "mod", "download"], cwd=workspace_path, env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout_sec)
+    except Exception:
+        pass
+
+
+def needs_test_database(workspace_path: str, max_files: int = 5000) -> bool:
+    """True when the project's tests read TEST_DATABASE_URL. The container then gets a
+    throwaway Postgres on a private, internet-less network instead of --network none.
+    Disable with HARDTRUTH_TIER2_DB=0."""
+    if os.environ.get("HARDTRUTH_TIER2_DB") == "0":
+        return False
+    seen = 0
+    for root, dirs, files in os.walk(workspace_path):
+        dirs[:] = [d for d in dirs if d not in _SCAN_SKIP_DIRS]
+        for name in files:
+            if not _TEST_FILE_RE.search(name):
+                continue
+            seen += 1
+            if seen > max_files:
+                return False
+            try:
+                with open(os.path.join(root, name), "r", encoding="utf-8", errors="replace") as f:
+                    body = f.read(512 * 1024)
+            except OSError:
+                continue
+            if any(marker in body for marker in TEST_DB_ENV_MARKERS):
+                return True
+    return False
+
+
+def ensure_docker_image(docker_bin: str, image: str, timeout_sec: int = 60) -> None:
+    """Pull an image up front so pull time never counts against the test timeout."""
+    try:
+        present = subprocess.run([docker_bin, "image", "inspect", image], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+        if not present:
+            subprocess.run([docker_bin, "pull", "-q", image], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout_sec)
+    except Exception:
+        pass
+
+
+def start_test_database(docker_bin: str, ready_timeout_sec: int = 30) -> Optional[Dict[str, str]]:
+    """Starts a throwaway Postgres (tmpfs data, no published ports) on a fresh
+    `docker network create --internal` network: reachable only from the test container,
+    with no route to the internet. Returns {network, container, url} or None."""
+    image = os.environ.get("HARDTRUTH_TIER2_DB_IMAGE", "postgres:16-alpine")
+    ensure_docker_image(docker_bin, image)
+    tag = f"hardtruth-t2-{os.getpid()}-{hashlib.sha256(os.urandom(16)).hexdigest()[:10]}"
+    network, container = tag, f"{tag}-db"
+    try:
+        if subprocess.run([docker_bin, "network", "create", "--internal", network],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30).returncode != 0:
+            return None
+        run = subprocess.run([
+            docker_bin, "run", "-d", "--rm", "--name", container,
+            "--network", network, "--network-alias", "db",
+            "--tmpfs", "/var/lib/postgresql/data:rw,size=1g",
+            "-e", "POSTGRES_USER=hardtruth", "-e", "POSTGRES_PASSWORD=hardtruth", "-e", "POSTGRES_DB=hardtruth",
+            image
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        if run.returncode != 0:
+            stop_test_database(docker_bin, {"network": network, "container": container})
+            return None
+        # TCP readiness: the image's init-time temporary server listens on the unix
+        # socket only, so a TCP probe succeeds only once the real server is up.
+        import time
+        deadline = time.time() + ready_timeout_sec
+        while time.time() < deadline:
+            probe = subprocess.run([docker_bin, "exec", container, "pg_isready", "-h", "127.0.0.1", "-U", "hardtruth"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if probe.returncode == 0:
+                return {"network": network, "container": container,
+                        "url": "postgres://hardtruth:hardtruth@db:5432/hardtruth?sslmode=disable"}
+            time.sleep(0.5)
+        stop_test_database(docker_bin, {"network": network, "container": container})
+        return None
+    except Exception:
+        stop_test_database(docker_bin, {"network": network, "container": container})
+        return None
+
+
+def stop_test_database(docker_bin: str, db: Optional[Dict[str, str]]) -> None:
+    if not db:
+        return
+    for args in (["rm", "-f", db.get("container", "")], ["network", "rm", db.get("network", "")]):
+        try:
+            subprocess.run([docker_bin, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except Exception:
+            pass
+
+
 def run_container_verification(
     workspace_path: str,
     test_cmd: str,
@@ -557,7 +706,8 @@ def run_container_verification(
     elif "cargo" in test_cmd:
         image = "rust:alpine"
     elif "go test" in test_cmd:
-        image = "golang:alpine"
+        image = go_container_image(workspace_path)
+    is_go = "go test" in test_cmd
 
     actual_cmd = test_cmd
     if actual_cmd.startswith("pytest") and "-o cache_dir" not in actual_cmd:
@@ -575,16 +725,46 @@ def run_container_verification(
             mount_root = ws_root
             container_workdir = f"/workspace/{rel}"
 
+    # Go: the container has no network, so it builds from the host's module cache
+    # (read-only) with the proxy off. The build cache stays in tmpfs -- a writable cache
+    # shared across runs could be poisoned by the code under test.
+    go_args: List[str] = []
+    if is_go:
+        prefetch_go_modules(mount_root)
+        modcache = host_go_modcache()
+        if modcache:
+            go_args += ["-v", f"{modcache}:/go/pkg/mod:ro", "-e", "GOMODCACHE=/go/pkg/mod"]
+        go_args += ["-e", "GOPROXY=off", "-e", "GOSUMDB=off", "-e", "GOTOOLCHAIN=local",
+                    "-e", "GOCACHE=/tmp/go-build", "-e", "CGO_ENABLED=0"]
+        try:
+            go_floor = int(os.environ.get("HARDTRUTH_TIER2_GO_TIMEOUT_SEC", "90"))
+        except (TypeError, ValueError):
+            go_floor = 90
+        timeout_sec = max(int(timeout_sec or 0), go_floor)
+
+    # Tests that read TEST_DATABASE_URL get a throwaway Postgres on a private internal
+    # network (no internet route) instead of --network none; it is torn down after.
+    test_db = None
+    network = "none"
+    db_args: List[str] = []
+    if needs_test_database(mount_root):
+        test_db = start_test_database(docker_bin)
+        if test_db:
+            network = test_db["network"]
+            db_args = ["-e", f"TEST_DATABASE_URL={test_db['url']}"]
+
+    ensure_docker_image(docker_bin, image)
+
     docker_args = [
         docker_bin, "run", "--rm",
-        "--network", "none",
+        "--network", network,
         "--security-opt", "no-new-privileges",
         "--cap-drop", "ALL",
         "--pids-limit", "256",
-        "--memory", "1024m",
+        "--memory", "3072m" if is_go else "1024m",
         "-v", f"{mount_root}:/workspace:ro",
         "-w", container_workdir,
-        "--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
+        "--tmpfs", f"/tmp:rw,exec,nosuid,size={'2g' if is_go else '512m'}",
         "--tmpfs", "/root/.cache:rw,exec,nosuid,size=512m",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-e", "PYTHONPYCACHEPREFIX=/tmp/pycache",
@@ -592,10 +772,19 @@ def run_container_verification(
         "-e", "npm_config_cache=/tmp/npm-cache",
         "-e", "TMPDIR=/tmp",
         "-e", "HARDTRUTH_TIER2_SANDBOX=1",
+        *go_args,
+        *db_args,
         image,
         "sh", "-c", actual_cmd
     ]
 
+    try:
+        return _run_container(docker_args, image, actual_cmd, timeout_sec)
+    finally:
+        stop_test_database(docker_bin, test_db)
+
+
+def _run_container(docker_args: List[str], image: str, actual_cmd: str, timeout_sec: int) -> Optional[Dict[str, Any]]:
     try:
         proc = subprocess.run(
             docker_args,

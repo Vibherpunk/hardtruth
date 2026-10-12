@@ -163,7 +163,7 @@ post_hooks = hooks.setdefault('PostToolUse', [])
 stop_hooks = hooks.setdefault('Stop', [])
 
 ht_post = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py post_tool', 'timeout': 20}]}
-ht_stop = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 90}]}
+ht_stop = {'matcher': '*', 'hooks': [{'type': 'command', 'command': 'HARDTRUTH_HARNESS=claude_code python3 ~/.hardtruth/lib/hardtruth_hook.py stop', 'timeout': 180}]}
 
 if not any('hardtruth_hook.py' in str(h) for h in post_hooks):
     post_hooks.append(ht_post)
