@@ -966,7 +966,7 @@ def run_container_verification(
         return None
 
     # Determine lightweight base image
-    image = "python:3.11-slim"
+    image = os.environ.get("HARDTRUTH_TIER2_PYTHON_IMAGE", "python:3.11-slim")
     if "npm" in test_cmd or "yarn" in test_cmd or "bun" in test_cmd:
         image = "node:20-alpine"
     elif "cargo" in test_cmd:
