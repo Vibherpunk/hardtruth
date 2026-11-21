@@ -88,9 +88,17 @@ mod hex {
     }
 }
 
-/// Helper to secure a Unix Domain Socket with mode 0600
+/// Helper to secure a Unix Domain Socket with mode 0600 (or 0666 for shared daemon sockets in /run)
 pub fn secure_socket_permissions(path: &Path) -> std::io::Result<()> {
-    let perms = std::fs::Permissions::from_mode(0o600);
+    let mode = if path.starts_with("/run/hardtruth")
+        || path.starts_with("/run")
+        || std::env::var("HARDTRUTH_SHARED").map(|v| v == "1" || v == "true").unwrap_or(false)
+    {
+        0o666
+    } else {
+        0o600
+    };
+    let perms = std::fs::Permissions::from_mode(mode);
     std::fs::set_permissions(path, perms)
 }
 

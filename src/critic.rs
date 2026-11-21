@@ -360,14 +360,11 @@ mod tests {
         );
         assert!(!res.passed);
         assert_eq!(res.gate_type, GateType::G1Plan);
-        assert_eq!(
-            res.reason,
-            "REJECT: Frontier Planning Invariant Violation: Flash models and Gemini 3.1 Pro are strictly forbidden from acting as lead architect or planner. Must use a frontier model (Claude Opus 5.5, Kimi Pro, Mimo Pro, DeepSeek Pro)."
-        );
+        assert_eq!(res.reason, crate::intent_stack::FRONTIER_PLANNING_VIOLATION);
     }
 
     #[test]
-    fn test_g1_rejects_gemini_3_1_pro_planner_model() {
+    fn test_g1_allows_gemini_3_1_pro_planner_model() {
         let critic = PhaseGateCritic::new();
         let mut stack = IntentStack::new(vec!["src/main.rs"]);
         let res = critic.evaluate_g1_plan(
@@ -375,14 +372,27 @@ mod tests {
             &[],
             0,
             &["src/new_file.rs"],
-            Some("gemini-3.1-pro"),
+            Some("gemini-3.1-pro-high"),
+        );
+        assert!(res.passed);
+        assert_eq!(res.gate_type, GateType::G1Plan);
+        assert!(stack.closure().contains(std::path::Path::new("src/new_file.rs")));
+    }
+
+    #[test]
+    fn test_g1_rejects_legacy_sonnet_planner_model() {
+        let critic = PhaseGateCritic::new();
+        let mut stack = IntentStack::new(vec!["src/main.rs"]);
+        let res = critic.evaluate_g1_plan(
+            &mut stack,
+            &[],
+            0,
+            &["src/new_file.rs"],
+            Some("claude-3-7-sonnet"),
         );
         assert!(!res.passed);
         assert_eq!(res.gate_type, GateType::G1Plan);
-        assert_eq!(
-            res.reason,
-            "REJECT: Frontier Planning Invariant Violation: Flash models and Gemini 3.1 Pro are strictly forbidden from acting as lead architect or planner. Must use a frontier model (Claude Opus 5.5, Kimi Pro, Mimo Pro, DeepSeek Pro)."
-        );
+        assert_eq!(res.reason, crate::intent_stack::FRONTIER_PLANNING_VIOLATION);
     }
 
     #[test]
