@@ -51,15 +51,18 @@ except ImportError:
 
 _IMPORT_DEGRADED = None
 try:
-    from daemon.ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, classify_file
+    from daemon.ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, get_taint_reason, is_taint_applicable_command, get_base_command, classify_file
 except ImportError:
     try:
-        from ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, classify_file
+        from ledger import DaemonLedger, is_verification_command, is_test_execution_command, is_tainted_shell_command, get_taint_reason, is_taint_applicable_command, get_base_command, classify_file
     except ImportError:
         DaemonLedger = None
         is_verification_command = lambda cmd: False
         is_test_execution_command = lambda cmd: False
         is_tainted_shell_command = lambda cmd: False
+        get_taint_reason = lambda cmd: None
+        is_taint_applicable_command = lambda cmd: False
+        get_base_command = lambda cmd: (cmd or "").strip()
         classify_file = lambda path, workspace_dir=None: "other"
         _IMPORT_DEGRADED = "daemon.ledger module unavailable"
 
@@ -2178,11 +2181,13 @@ def handle_post_tool_use(payload: dict) -> dict:
     if tool_name == "run_command":
         cmd_or_file = tool_args.get("CommandLine", "")
 
-        # Shell Operator Defense
-        if is_tainted_shell_command(cmd_or_file):
+        # Shell Operator / Env Override Defense (scoped to verification commands, no double prefix)
+        taint_msg = get_taint_reason(cmd_or_file) if is_taint_applicable_command(cmd_or_file) else None
+        if taint_msg:
             observed_exit_code = 1
             harness_status = "tainted_shell_operator"
-            error_msg = f"TAINTED: Chained shell operators detected: {error_msg or ''}".strip()
+            if not (error_msg and str(error_msg).startswith("TAINTED:")):
+                error_msg = f"{taint_msg}: {error_msg}".strip(": ") if error_msg else taint_msg
         elif payload.get("exitCode") is not None:
             # Direct exitCode provided in hook payload (e.g. Claude Code or explicit harness event)
             observed_exit_code = int(payload["exitCode"])
@@ -2318,7 +2323,7 @@ def handle_post_tool_use(payload: dict) -> dict:
 action_triggers = re.compile(
     r"(?:\b(?:i(?:'ve| have)?|we(?:'ve| have)?|agent(?: has)?)\s+(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored|completed|finished|wired up)\b|"
     r"(?:^|\n)\s*(?:[-*•]|\d+\.)\s*(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored|completed|finished)\b|"
-    r"\b(?:ran|run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored)\s+(?:the\s+)?(?:test|tests|suite|code|file|files|function|class|method|module|endpoint|feature|bug|patch|pipeline)\b|"
+    r"\b(?:ran|(?<!-)run|executed|tested|verified|fixed|modified|created|implemented|added|wrote|updated|built(?!-in)|refactored)\s+(?:the\s+)?(?:test|tests|suite|code|file|files|function|class|method|module|endpoint|feature|bug|patch|pipeline)\b|"
     r"\bran\s+(?:unit\s+)?tests?\b|"
     r"\b(?:all|all \d+|\d+)?\s*(?:unit\s+)?tests?(?:\s+[\w/]+){0,3}\s+passed\b|"
     r"\btests?\s+(?:have\s+)?passed\b|"
@@ -2333,7 +2338,7 @@ action_triggers = re.compile(
 )
 
 descriptive_filter = re.compile(
-    r"^\s*(?:quote:|example:|sample:|(?:when|if|for example|e\.g\.|every time|how |the system|the hook|this means|in order to|as an example|such as|to prevent|by default|instead of|note that|on x\b|on twitter|in our search|in research|search results|discussions across|discussions on|users report|practitioners note|engineers note|people are|the community|articles|papers|studies)\b)",
+    r"^\s*(?:quote:|example:|sample:|(?:when|if|for example|e\.g\.|every time|how |the system|the hook|the halt|the prompt|the gate|the error|the message|the daemon|the script|the config|hardtruth|this means|in order to|as an example|such as|to prevent|by default|instead of|note that|on x\b|on twitter|in our search|in research|search results|discussions across|discussions on|users report|practitioners note|engineers note|people are|the community|articles|papers|studies)\b)",
     re.IGNORECASE
 )
 
@@ -2525,6 +2530,8 @@ def handle_stop(payload: dict) -> dict:
             record_halt(counter_file, new_count, no_change_count, state_hash, reason)
 
         # Circuit Breaker: >3 consecutive verification attempts without state change
+        # Emit full diagnostic report to stderr + ledger and hand control back to the
+        # operator on all harnesses rather than trapping the agent in an infinite loop.
         if no_change_count > 3:
             breaker_msg = (
                 f"\n🚨 HARDTRUTH CIRCUIT BREAKER: Verification halted after {no_change_count} consecutive attempts without state change.\n"
@@ -2536,14 +2543,16 @@ def handle_stop(payload: dict) -> dict:
                 f"  • Remediation: Resolve failure by updating code/tests or reset halt counter: rm {counter_file}\n"
             )
             sys.stderr.write(breaker_msg + "\n")
-            if HARNESS in ("claude_code", "claude"):
-                # Break infinite loop in Claude Code by allowing turn completion with actionable error reported
-                return _allow()
-            return _halt(
-                f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts, {no_change_count} without state change). "
-                "HardTruth never fails open. Manual verification or human operator escalation required.\n\n"
-                f"Root Cause: {reason}"
-            )
+            try:
+                call_system_one("v1/gate/verdict", {
+                    "conversationId": conv_id,
+                    "verdict": "CIRCUIT_BREAKER_RELEASE",
+                    "reason": str(reason)[:300],
+                    "latency_ms": round(elapsed_w * 1000, 2)
+                }, timeout=1.0)
+            except Exception:
+                pass
+            return _allow()
 
         if new_count >= 3:
             sys.stderr.write(
@@ -2553,7 +2562,8 @@ def handle_stop(payload: dict) -> dict:
             )
             return _halt(
                 f"🚨 HARDTRUTH ESCALATION HALT: Gate halt limit reached ({new_count} consecutive halts). "
-                "HardTruth never fails open. Manual verification or human operator escalation required.\n\n"
+                "Final automated course-correction attempt before circuit-breaker handoff to the human operator. "
+                "Execute the corrective action in Root Cause now, or retract unverified claims and tell the operator clearly what remains unverified.\n\n"
                 f"Root Cause: {reason}"
             )
         return _halt(reason)
@@ -2865,13 +2875,16 @@ def handle_stop(payload: dict) -> dict:
         modified_paths = list(set(modified_paths) | set(git_paths))
         all_mod_names = sorted(list(set(os.path.basename(p) for p in modified_paths)))
         if all_mod_names:
+            mod_display = ", ".join(all_mod_names[:20])
+            if len(all_mod_names) > 20:
+                mod_display += f" (+{len(all_mod_names) - 20} more)"
             if "MODIFIED FILES: No files were modified." in premise_str:
                 premise_str = premise_str.replace(
                     "MODIFIED FILES: No files were modified.",
-                    f"MODIFIED FILES: {', '.join(all_mod_names)}."
+                    f"MODIFIED FILES: {mod_display}."
                 )
             elif "MODIFIED FILES:" not in premise_str:
-                premise_str += f" MODIFIED FILES: {', '.join(all_mod_names)}."
+                premise_str += f" MODIFIED FILES: {mod_display}."
 
     _log_phase(conv_id, "phase4_transcript_reconcile", time.perf_counter() - p4_wall, time.process_time() - p4_cpu, {
         "unresolved_failures_remaining": len(unresolved_failures),
@@ -2968,14 +2981,33 @@ def handle_stop(payload: dict) -> dict:
 
     if len(unresolved_failures) > 0:
         fails_summary_list = []
+        tainted_bare_cmds = []
+        has_tainted_failure = False
         for u in unresolved_failures:
-            cmd = u.get("command")
-            err = u.get("error")
+            cmd = u.get("command") or ""
+            err = u.get("error") or ""
             ec = u.get("observed_exit_code")
             desc = err if err else f"exit {ec}"
             fails_summary_list.append(f"'{cmd}' ({desc})")
+            if "TAINTED" in err or (u.get("harness_status") or "").startswith("tainted"):
+                has_tainted_failure = True
+                bare = get_base_command(cmd)
+                if bare and bare not in tainted_bare_cmds:
+                    tainted_bare_cmds.append(bare)
         fails_summary = "; ".join(fails_summary_list)
-        return fail_halt(f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. Fix the failures and re-run tests before stopping.")
+        if has_tainted_failure:
+            examples = ", ".join(f"`{c}`" for c in tainted_bare_cmds[:3]) if tainted_bare_cmds else "the bare test command"
+            remediation_hint = (
+                "Course-Correction: Re-run each tainted test command as a single bare invocation "
+                "with NO chained shell operators (||, &&, ;, |) and NO dangerous env overrides "
+                f"(PATH/PYTHONPATH/LD_PRELOAD) — e.g.: {examples}. "
+                "Fix any real test failures and re-run tests before stopping."
+            )
+        else:
+            remediation_hint = "Fix the failures and re-run tests before stopping."
+        return fail_halt(
+            f"🚨 HARDTRUTH GATE HALTED (CONTRADICTION DETECTED): Unresolved test failures exist in the ledger: [{fails_summary}]. {remediation_hint}"
+        )
     _log_phase(conv_id, "phase7_rule1_rule2_checks", time.perf_counter() - p7_wall, time.process_time() - p7_cpu)
 
     # -----------------------------------------------------------------------
@@ -3217,6 +3249,79 @@ def handle_stop(payload: dict) -> dict:
     # -----------------------------------------------------------------------
     p10_wall = time.perf_counter()
     p10_cpu = time.process_time()
+    session_start_ts = float(premise_data.get("created_at", 0) or 0)
+    session_committed_paths: set = set()
+    if workspace_dir and baseline_sha and baseline_sha != "HEAD" and os.path.exists(os.path.join(workspace_dir, ".git")):
+        try:
+            ws_abs = os.path.realpath(workspace_dir)
+            diff_names = subprocess.run(
+                ["git", "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                 "diff", "--name-only", baseline_sha, "HEAD"],
+                cwd=workspace_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3.0,
+            )
+            if diff_names.returncode == 0:
+                for ln in diff_names.stdout.splitlines():
+                    ln = ln.strip()
+                    if ln:
+                        session_committed_paths.add(ln)
+        except Exception:
+            pass
+
+    linked_abs_paths: list = []
+    for m in re.finditer(r"file://(/[^)\s\"'>]+)|(?<![A-Za-z0-9_./-])(/[^)\s\"'>`]+)", agent_text):
+        cand = (m.group(1) or m.group(2) or "").rstrip(".,:;!")
+        if cand and cand not in linked_abs_paths:
+            linked_abs_paths.append(cand)
+
+    def _matches_path_set(norm_ref: str, path_set) -> bool:
+        return any(
+            norm_ref == os.path.normpath(p)
+            or os.path.normpath(p).endswith(os.sep + norm_ref)
+            or norm_ref.endswith(os.sep + os.path.normpath(p))
+            or os.path.basename(norm_ref) == os.path.basename(p)
+            for p in path_set
+        )
+
+    def _external_path_grounded(abs_p: str) -> bool:
+        if not os.path.isfile(abs_p):
+            return False
+        try:
+            if os.path.getsize(abs_p) <= 0:
+                return False
+        except Exception:
+            return False
+        repo_top = git_toplevel_for_file(abs_p) if git_toplevel_for_file else None
+        if repo_top and os.path.isdir(repo_top):
+            try:
+                st = subprocess.run(
+                    ["git", "-C", repo_top, "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                     "status", "--porcelain", "--", abs_p],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0,
+                )
+                if st.returncode == 0 and st.stdout.strip():
+                    return True
+                if session_start_ts > 0:
+                    lg = subprocess.run(
+                        ["git", "-C", repo_top, "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                         "log", "-n", "1", f"--since=@{int(max(0, session_start_ts - 120))}", "--format=%H", "--", abs_p],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0,
+                    )
+                    if lg.returncode == 0 and lg.stdout.strip():
+                        return True
+            except Exception:
+                pass
+        elif session_start_ts > 0:
+            try:
+                if os.path.getmtime(abs_p) >= (session_start_ts - 120):
+                    return True
+            except Exception:
+                pass
+        return False
+
     claimed_file_refs = set(re.findall(r"(?:`|\b)((?:[a-zA-Z0-9_.-]+/)*[a-zA-Z0-9_.-]+\.[a-zA-Z0-9_-]+)(?:`|\b)", agent_text))
     clauses = re.split(r"(?<=[.!?])\s+|\n+|[,;]\s*(?:which|that|whereas|although|because|since)\b", agent_text, flags=re.IGNORECASE)
     for ref in claimed_file_refs:
@@ -3229,13 +3334,20 @@ def handle_stop(payload: dict) -> dict:
                 re.IGNORECASE
             )
             if any(pattern.search(clause) for clause in clauses):
-                is_modified = any(
-                    norm_ref == os.path.normpath(m)
-                    or os.path.normpath(m).endswith(os.sep + norm_ref)
-                    or norm_ref.endswith(os.sep + os.path.normpath(m))
-                    or os.path.basename(norm_ref) == os.path.basename(m)
-                    for m in modified_paths
-                )
+                is_modified = _matches_path_set(norm_ref, modified_paths) or _matches_path_set(norm_ref, session_committed_paths)
+                if not is_modified and workspace_dir and session_start_ts > 0 and os.path.exists(os.path.join(workspace_dir, ".git")):
+                    try:
+                        ws_abs = os.path.realpath(workspace_dir)
+                        pathspec = norm_ref if os.path.exists(os.path.join(workspace_dir, norm_ref)) else f"**/{os.path.basename(norm_ref)}"
+                        lg_ws = subprocess.run(
+                            ["git", "-C", ws_abs, "-c", f"safe.directory={ws_abs}", "-c", "core.fsmonitor=", "-c", "core.hooksPath=/dev/null",
+                             "log", "-n", "1", f"--since=@{int(session_start_ts)}", "--format=%H", "--", pathspec],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2.0,
+                        )
+                        if lg_ws.returncode == 0 and lg_ws.stdout.strip():
+                            is_modified = True
+                    except Exception:
+                        pass
                 has_real_content = False
                 if is_modified and workspace_dir:
                     full_fpath = os.path.join(workspace_dir, norm_ref) if not os.path.isabs(norm_ref) else norm_ref
@@ -3249,6 +3361,13 @@ def handle_stop(payload: dict) -> dict:
                         has_real_content = True
                 elif is_modified:
                     has_real_content = True
+
+                if not is_modified or not has_real_content:
+                    for abs_p in linked_abs_paths:
+                        if (abs_p == norm_ref or abs_p.endswith(os.sep + norm_ref)) and _external_path_grounded(abs_p):
+                            is_modified = True
+                            has_real_content = True
+                            break
 
                 if not is_modified or not has_real_content:
                     return fail_halt(f"🚨 HARDTRUTH REJECTED (UNVERIFIED CLAIM): You claimed to have created or modified '{ref}', but git and the ledger show no non-trivial modifications to this file in this session. Write and apply the code to disk before completing.")
@@ -3272,6 +3391,8 @@ def handle_stop(payload: dict) -> dict:
     claims_to_verify = []
     for s in sentences:
         s_clean = s.strip()
+        if s_clean.endswith("?"):
+            continue
         if len(s_clean) > 15 and action_triggers.search(s_clean):
             if imperative_filter.search(s_clean):
                 continue

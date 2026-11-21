@@ -228,20 +228,80 @@ DANGEROUS_ENV_OVERRIDE_PATTERN = re.compile(
 )
 
 
-def is_tainted_shell_command(cmd: str) -> bool:
-    """Detects any command chained with masking operators, subshells, conditionals, or dangerous env overrides."""
+def _strip_quoted_literals(cmd: str) -> str:
+    """
+    Replace single-quoted literals completely and double-quoted literals (except $( and `
+    command substitutions, which still execute in POSIX double quotes) with spaces.
+    Also replaces backslash-escaped single characters outside single quotes with spaces so
+    regex/literal arguments like `rg a\\|b` or `rg "TAINTED|Chained"` are not flagged.
+    """
+    if not cmd:
+        return ""
+    out: List[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(cmd)
+    while i < n:
+        ch = cmd[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            out.append(" ")
+            i += 1
+        elif in_double:
+            if ch == "\\" and i + 1 < n:
+                out.append("  ")
+                i += 2
+            elif ch == '"':
+                in_double = False
+                out.append(" ")
+                i += 1
+            elif ch == "`":
+                out.append("`")
+                i += 1
+            elif ch == "$" and i + 1 < n and cmd[i + 1] == "(":
+                out.append("$(")
+                i += 2
+            else:
+                out.append(" ")
+                i += 1
+        else:
+            if ch == "\\" and i + 1 < n:
+                out.append("  ")
+                i += 2
+            elif ch == "'":
+                in_single = True
+                out.append(" ")
+                i += 1
+            elif ch == '"':
+                in_double = True
+                out.append(" ")
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+    return "".join(out)
+
+
+def get_taint_reason(cmd: str) -> Optional[str]:
+    """
+    Returns a specific 'TAINTED: ...' diagnostic reason if cmd uses masking shell operators,
+    subshells, conditionals, multi-line chains, or dangerous env overrides, else None.
+    """
     raw_cmd = (cmd or "").strip()
     if not raw_cmd:
-        return False
+        return None
     # HT-SEC-04: Unicode NFKC normalization and zero-width character stripping
     raw_cmd = unicodedata.normalize("NFKC", raw_cmd)
     raw_cmd = re.sub(r"[\u200B-\u200D\uFEFF\u00A0]", "", raw_cmd)
-    if DANGEROUS_ENV_OVERRIDE_PATTERN.search(raw_cmd):
-        return True
     if "\n" in raw_cmd or "\r" in raw_cmd:
-        return True
-    if re.search(r"(?:^|[\s;&|])if\b", raw_cmd):
-        return True
+        return "TAINTED: Multi-line shell command detected"
+    unquoted_raw = _strip_quoted_literals(raw_cmd)
+    if DANGEROUS_ENV_OVERRIDE_PATTERN.search(unquoted_raw):
+        return "TAINTED: Dangerous environment override detected (PATH/PYTHONPATH/LD_PRELOAD/etc.)"
+    if re.search(r"(?:^|[\s;&|])if\b", unquoted_raw):
+        return "TAINTED: Shell conditional detected"
     check_cmd = raw_cmd
     while True:
         cd_m = re.match(r"^\s*cd\s+(?:'[^']*'|\"[^\"]*\"|\S+)\s*(?:&&|;)\s*", check_cmd)
@@ -249,9 +309,20 @@ def is_tainted_shell_command(cmd: str) -> bool:
             check_cmd = check_cmd[cd_m.end():].strip()
             continue
         break
-    if SHELL_OPERATOR_MASK_PATTERN.search(check_cmd):
-        return True
-    return False
+    unquoted = _strip_quoted_literals(check_cmd)
+    if SHELL_OPERATOR_MASK_PATTERN.search(unquoted):
+        return "TAINTED: Chained shell operators detected"
+    return None
+
+
+def is_tainted_shell_command(cmd: str) -> bool:
+    """Detects any command chained with masking operators, subshells, conditionals, or dangerous env overrides."""
+    return get_taint_reason(cmd) is not None
+
+
+def is_taint_applicable_command(cmd: str) -> bool:
+    """Returns True only for verification/test commands where shell-operator tainting applies."""
+    return is_verification_command(cmd) or bool(VERIFICATION_ANYWHERE_PATTERN.search(cmd or ""))
 
 
 def is_exploratory_command(cmd: str) -> bool:
@@ -734,12 +805,15 @@ class DaemonLedger:
                     index = 0
                     prev_hash = "0" * 64
 
-                # Check for shell operator taint
+                # Check for shell operator / env override taint on verification commands only (avoid double-prefixing)
                 is_tainted = False
-                if tool == "run_command" and is_tainted_shell_command(target):
-                    is_tainted = True
-                    error = f"TAINTED: Chained shell operators detected: {error or ''}".strip()
-                    harness_status = "tainted_shell_operator"
+                if tool == "run_command" and is_taint_applicable_command(target):
+                    taint_msg = get_taint_reason(target)
+                    if taint_msg:
+                        is_tainted = True
+                        if not (error and str(error).startswith("TAINTED:")):
+                            error = f"{taint_msg}: {error}".strip(": ") if error else taint_msg
+                        harness_status = "tainted_shell_operator"
 
                 # Monotonic Step Index Enforcement (defeats step backdating on indexed harnesses)
                 conv_str = str(conversation_id)
@@ -1117,14 +1191,24 @@ class DaemonLedger:
                 if is_verif:
                     failed = tainted or (exit_code is not None and exit_code != 0) or (error is not None) or (status == "unverified_timeout")
                     if failed:
-                        unresolved_failures[target] = {
-                            "command": target,
-                            "observed_exit_code": exit_code,
-                            "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else "UNVERIFIED_TIMEOUT" if status == "unverified_timeout" else None),
-                            "stdout_tail": e.get("stdout_tail"),
-                            "stepIdx": step_idx,
-                            "cwd": e.get("cwd")
-                        }
+                        tail_lc = f"{error or ''} {e.get('stdout_tail') or ''}".lower()
+                        is_exploratory_no_collect = (
+                            not tainted
+                            and "pytest" in target.lower()
+                            and (
+                                exit_code == 5
+                                or (exit_code == 4 and ("file or directory not found" in tail_lc or "not found:" in tail_lc))
+                            )
+                        )
+                        if not is_exploratory_no_collect:
+                            unresolved_failures[target] = {
+                                "command": target,
+                                "observed_exit_code": exit_code,
+                                "error": error or ("TAINTED_SHELL_OPERATOR" if tainted else "UNVERIFIED_TIMEOUT" if status == "unverified_timeout" else None),
+                                "stdout_tail": e.get("stdout_tail"),
+                                "stepIdx": step_idx,
+                                "cwd": e.get("cwd")
+                            }
                     else:
                         # Only confirmed success with exit_code == 0 or no_error can increment or resolve
                         if status != "unverified_timeout" and (exit_code == 0 or status == "no_error"):

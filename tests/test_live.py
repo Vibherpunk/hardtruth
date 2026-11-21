@@ -424,16 +424,31 @@ class TestSystemOneSentinel(unittest.TestCase):
             "transcriptPath": transcript_path,
             "executionNum": 1
         }
-        # First 3 attempts must be halted
-        for i in range(3):
-            res = self.run_hook("stop", payload)
-            self.assertEqual(res.get("decision"), "continue")
+        try:
+            # First 3 attempts must be halted; attempt 3 enters ESCALATION HALT without leaking 'rm '
+            for i in range(3):
+                res = self.run_hook("stop", payload)
+                self.assertEqual(res.get("decision"), "continue")
+                if i == 2:
+                    self.assertIn("ESCALATION HALT", res.get("reason", ""))
+                    self.assertNotIn("rm ", res.get("reason", ""))
 
-        # 4th attempt must trigger hard escalation halt (Never Fail Open)
-        res_4 = self.run_hook("stop", payload)
-        os.remove(transcript_path)
-        self.assertEqual(res_4.get("decision"), "continue")
-        self.assertIn("ESCALATION HALT", res_4.get("reason", ""))
+            # 4th attempt (>3 without state change) must trip CIRCUIT BREAKER and hand back to operator
+            proc_4 = subprocess.run(
+                ["python3", HOOK_SCRIPT, "stop"],
+                input=json.dumps(payload),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=os.environ.copy(),
+                check=True
+            )
+            res_4 = json.loads(proc_4.stdout.strip())
+            self.assertEqual(res_4.get("decision"), "allow")
+            self.assertIn("CIRCUIT BREAKER", proc_4.stderr)
+        finally:
+            if os.path.exists(transcript_path):
+                os.remove(transcript_path)
 
     def test_16_daemon_unreachable_fail_closed(self):
         # Claim that cannot be verified deterministically must fail closed if daemon unreachable
