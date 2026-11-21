@@ -6,7 +6,7 @@
 [![Physical Tests](https://img.shields.io/badge/physical%20tests-100%2F100%20(100%25)-success.svg)]()
 [![Frontier Tokens](https://img.shields.io/badge/frontier%20tokens-$0.00%20(100%25%20local)-blue.svg)]()
 [![Gate Latency](https://img.shields.io/badge/avg%20gate%20latency-~550ms-orange.svg)]()
-[![Model](https://img.shields.io/badge/model-DeBERTa--v3--small-orange.svg)]()
+[![Model](https://img.shields.io/badge/model-ModernBERT--base--nli-orange.svg)]()
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Status](https://img.shields.io/badge/repo-public-success.svg)](https://github.com/Vibherpunk/hardtruth)
 
@@ -39,7 +39,7 @@ When you ask an AI coding assistant (like Gemini, Claude, Cursor, or local open-
 HardTruth is a **two-tier fail-closed gate** built on a failure-biased execution ledger and local natural language inference (NLI):
 - **Tier 1 (Deterministic Gates):** Executes before any LLM inference. Intercepts agent tool calls (`post_tool`) and stop attempts (`stop`) via client lifecycle hooks. It inspects physical Git porcelain state against an immutable session baseline commit, analyzes shell command ASTs for exit-masking operators (`|| exit 0`, `; true`), checks language ASTs across Python, TypeScript, Rust, and Go for placeholder stubs, and verifies cryptographic HMAC-SHA256 ledger integrity.
 - **Tier 2 (Sandboxed Runner Handoff):** An external deterministic verifier that re-executes tests inside a clean subprocess or container, guaranteeing that agent environment tampering cannot fabricate passes.
-- **Semantic NLI Claim Adjudication (Rule 4B):** Runs an embedded cross-encoder (`cross-encoder/nli-deberta-v3-small`) on CPU/GPU to evaluate natural language completion statements against the compiled physical evidence ledger, operating at a calibrated threshold ($\tau^* = 0.70$).
+- **Semantic NLI Claim Adjudication (Rule 4B):** Runs an embedded cross-encoder (`tasksource/ModernBERT-base-nli` by default via `HARDTRUTH_NLI_MODEL`) on CPU/MPS/GPU to evaluate natural language completion statements against the compiled physical evidence ledger, operating at a calibrated threshold ($\tau^* = 0.70$).
 
 ---
 
@@ -76,7 +76,7 @@ flowchart TD
         D & E --> F[POST /v1/ledger/record]
     end
 
-    subgraph HardTruth Daemon Port 8000
+    subgraph HardTruth Daemon Port 49281
         F --> G[HMAC-SHA256 Hash Chain]
         G --> H[(Daemon-Owned Ledger: 0600)]
         H --> I[Verification Command State Engine]
@@ -88,7 +88,7 @@ flowchart TD
         K -->|AST Clean| L[Check Physical Ledger State]
         L -->|Source code modified & 0 tests run| M[HALT: No tests run]
         L -->|Unresolved test failures exist| P[HALT: Unresolved test failures]
-        L -->|Ledger clean & verified| Q[Adjudicate Claims via DeBERTa-v3]
+        L -->|Ledger clean & verified| Q[Adjudicate Claims via ModernBERT NLI]
         Q -->|Contradiction >= tau*| R[HALT: Contradiction]
         Q -->|Entailed / Clean / Meta-discussion| S[ALLOW Termination]
     end
@@ -97,8 +97,8 @@ flowchart TD
 ### Inverted Gate Rules (Language-Independent)
 1. **Rule 1 (Source Code Changes Require Proof):** If source code files (`.py`, `.ts`, `.rs`, `.go`, etc.) were modified but 0 verification commands were executed, the agent is halted immediately. Documentation-only edits (`.md`, `.txt`) are exempt. *Zero regex. Zero NLI. Completely language-independent.*
 2. **Rule 2 (Unresolved Failures Forbid Completion):** If unresolved test failures exist in the ledger, termination is blocked. Even if the agent speaks French, Chinese, or informal English, Rule 2 halts before NLI is evaluated.
-3. **Rule 3 (AST Anti-Stubbing Linter):** Modified Python files are parsed into an Abstract Syntax Tree to reject empty placeholders (`pass`, `NotImplementedError`, dummy returns).
-4. **Rule 4 (Targeted DeBERTa-v3 NLI Adjudication):** Evaluates agent statements against the physical premise using a calibrated threshold ($\tau^* = 0.70$) to prevent unsubstantiated assertions.
+3. **Rule 3 (AST Anti-Stubbing Linter):** Modified Python, TypeScript, JavaScript, Rust, and Go files are inspected to reject empty placeholders (`pass`, `NotImplementedError`, `todo!()`, `unimplemented!()`, `throw new Error("not implemented")`, dummy returns).
+4. **Rule 4 (Targeted ModernBERT NLI Adjudication):** Evaluates agent statements against the physical premise using `tasksource/ModernBERT-base-nli` at a calibrated threshold ($\tau^* = 0.70$) to prevent unsubstantiated assertions.
 5. **Never Fail Open (Hard Escalation Halt):** Replaces silent 3-strike releases. After 3 consecutive halts on conflicting claims, HardTruth issues a hard escalation halt that permanently blocks unverified escape.
 
 ---
@@ -207,7 +207,7 @@ Every test was executed against physical Git repositories on disk with live HTTP
 HardTruth is designed to live harmoniously on machines running multiple developer tools, agent harnesses, or workflow engines (such as **Antigravity**, **Claude Code**, **VibeHard**, or **Harbor**):
 
 1. **Machine-Wide Daemon Singleton:**
-   The HardTruth daemon runs as a single background service (bound by default to port `8000` locally, or remote port `8002`). Installing or invoking multiple developer frameworks does **not** launch competing or duplicate daemon instances. All tools and harnesses query the unified daemon via `SYSTEM_ONE_URL` or standard HTTP.
+   The HardTruth v2 daemon runs as a single background service bound to `127.0.0.1:49281` (either natively via LaunchAgent/`uvicorn app:app --host 127.0.0.1 --port 49281` or via Docker Compose `127.0.0.1:49281:8000`), alongside the Rust `hardtruthd` UDS daemon (`~/Library/Caches/skidnir/hardtruth.sock`). Installing or invoking multiple developer frameworks does **not** launch competing or duplicate daemon instances. All tools and harnesses query the unified daemon via `SYSTEM_ONE_URL` / `HARDTRUTH_URL` (`http://127.0.0.1:49281`, or `http://host.docker.internal:49281` from containers).
 2. **Single Shared Ledger & Key Ring:**
    All execution records are appended to a single machine-wide hash chain (`~/.hardtruth/daemon_ledger.jsonl`) protected by a single HMAC key (`~/.hardtruth/daemon_hmac.key`) and API token (`~/.hardtruth/daemon_api.key`). Multiple harnesses share this source of truth without stepping on each other's session state.
 3. **Chained Git Hooks:**
@@ -221,8 +221,12 @@ HardTruth is designed to live harmoniously on machines running multiple develope
 
 This repository carries two code lines:
 
-- **Python v2 (installed by `install.sh`):** `client/` (hooks, AST checker, harness adapters), `daemon/` (`app.py`, `ledger.py`, `tier2_runner.py`), `docker/` (daemon image), and `hardtruth-gate/` (Rust thin client for the Python daemon). This is the code everything in this README describes, and what runs under `~/.hardtruth/lib`.
-- **Rust v0.2.0 (`hardtruthd` / `hardtruth-gate`):** `Cargo.toml` and `src/` at the root. `install.sh` does not build or install it. Its design and build notes are in [docs/RUST_V0_2_0.md](./docs/RUST_V0_2_0.md).
+- **Python v2 / v2.1 (installed by `install.sh`):**
+  - `client/`: lifecycle hooks (`hardtruth_hook.py`), AST stub checker (`ast_checker.py`), client helpers, and harness adapters under `client/adapters/` (`amuse/`, `muse/`, `pi/`).
+  - `daemon/`: FastAPI + `tasksource/ModernBERT-base-nli` verification daemon (`app.py`), HMAC-chained ledger (`ledger.py`), and sandboxed Tier 2 test runner (`tier2_runner.py`).
+  - `docker/`: daemon container (`Dockerfile`, `docker-compose.yml`) and sealed Python Tier 2 runner image (`Dockerfile.tier2-python`).
+  - `hardtruth-gate/`: standalone Rust hook wrapper crate.
+- **Rust v0.2.0 (`hardtruthd` / `hardtruth-gate`):** `Cargo.toml` and `src/` at the root (`~/.local/bin/hardtruthd` + UDS thin client `~/.local/bin/hardtruth-gate`). See [docs/RUST_V0_2_0.md](./docs/RUST_V0_2_0.md).
 
 ---
 
@@ -236,14 +240,22 @@ pip install -r requirements.txt
 ```
 
 ### 2. Start Verification Daemon
-Start locally:
+Start natively on macOS/Linux (default LaunchAgent / host port `49281`):
 ```bash
-python3 daemon/app.py
+PYTHONPATH="$(pwd)" uvicorn daemon.app:app --host 127.0.0.1 --port 49281
 ```
-Or with Docker Compose:
+Or with Docker Compose (`127.0.0.1:49281 -> 8000`):
 ```bash
 docker compose -f docker/docker-compose.yml up --build -d
 ```
+
+#### Sealed Tier 2 Python Container & Session-Start Snapshots
+- **Sealed pytest container (`HARDTRUTH_TIER2_PYTHON_IMAGE`):** Build `docker/Dockerfile.tier2-python` (`docker build -t hardtruth-tier2-python:latest -f docker/Dockerfile.tier2-python docker`) and set `HARDTRUTH_TIER2_PYTHON_IMAGE=hardtruth-tier2-python:latest` on the daemon so Python `pytest` suites verify inside `--network none` read-only containers without exposing host subprocess execution.
+- **Per-worktree & in-workspace session-start snapshots:** `SessionStart` hashes a per-worktree manifest (`head` + `refs/stash`) and registers its SHA-256 once with the daemon (`SESSION_SNAPSHOT_NS`). Targets outside the workspace always fail closed without a snapshot; targets inside the workspace use the snapshot when present (or opt into strict fail-closed enforcement with `HARDTRUTH_REQUIRE_SESSION_SNAPSHOT=1`).
+
+#### Harness Adapters (`amuse/`, `muse/`, `pi/`)
+- **Amuse (`client/adapters/amuse/`):** Two-layer guard combining [hardtruth.ts](./client/adapters/amuse/hardtruth.ts) in the containerized Amuse agent loop (`AMUSE_HARDTRUTH_URL=http://host.docker.internal:49281`) and [executor_guard.py](./client/adapters/amuse/executor_guard.py) inside the Mac host terminal bridge (`:8124`). See [client/adapters/amuse/README.md](./client/adapters/amuse/README.md).
+- **Muse & Pi:** See [client/adapters/muse/README.md](./client/adapters/muse/README.md) and [client/adapters/pi/README.md](./client/adapters/pi/README.md).
 
 #### Daemon API Authentication (Round 7)
 All state-changing daemon endpoints (`/v1/ledger/record`, `/v1/session/baseline`,
@@ -274,11 +286,7 @@ The hook already sends the token on premise/baseline reads; a token-less hook
 degrades gracefully to its local ledger.
 
 #### NLI Cold-Start Preload (Round 8)
-The Docker image preloads `cross-encoder/nli-deberta-v3-small` at build time and
-the daemon warms the model in a background thread at startup, so the first
-`/v1/verify-claim` in a fresh container is fast and `/health` reports
-`nli_loaded: true` shortly after boot. Trade-off: image size grows by roughly the
-model size (~500MB).
+The Docker image preloads `tasksource/ModernBERT-base-nli` at build time (configurable via `HARDTRUTH_NLI_MODEL`) and the daemon initializes it with a startup contradiction/entailment canary self-test, preventing inverted label indices before serving `/v1/verify-claim` or `/v1/verify-claims`.
 
 #### Test Ledger Isolation & Purge (Round 8)
 Test runs no longer pollute the physical ledger:
